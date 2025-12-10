@@ -1,0 +1,56 @@
+name: "llm"
+backend: "python"
+
+input [
+  {
+    name: "PROMPT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "MAX_NEW_TOKENS"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "TEMPERATURE"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "TOP_P"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "TEXT_CHUNK"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "FINISHED"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  { kind: KIND_GPU }
+]
+
+max_batch_size: 0
+
+model_transaction_policy {
+  decoupled: true
+}
+
+parameters: {
+  key: "model_path"
+  value: { string_value: "/local_models/llm_model" }
+}

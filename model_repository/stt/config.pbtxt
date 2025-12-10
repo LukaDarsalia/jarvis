@@ -1,0 +1,25 @@
+name: "stt"
+backend: "python"
+
+input [
+  {
+    name: "AUDIO_PCM"
+    data_type: TYPE_FP32
+    dims: [ -1 ]  # 1D variable-length audio
+  }
+]
+
+output [
+  {
+    name: "TRANSCRIPT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  { kind: KIND_GPU }   # ensure model loads on GPU
+]
+
+# Optional: increase max batch size if you want batching
+max_batch_size: 0

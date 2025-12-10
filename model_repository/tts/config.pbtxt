@@ -1,0 +1,119 @@
+name: "tts"
+backend: "python"
+
+max_batch_size: 0
+
+input [
+  {
+    name: "TEXTS"
+    data_type: TYPE_STRING
+    dims: [ -1 ]   # list of text chunks
+  },
+  {
+    name: "BACKBONE_TEMPERATURE"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "BACKBONE_TOP_P"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "DEPTH_TEMPERATURE"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "DEPTH_TOP_P"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "START"
+    data_type: TYPE_BOOL
+    dims: [1]
+    optional: true
+  },
+  {
+    name: "END"
+    data_type: TYPE_BOOL
+    dims: [1]
+    optional: true
+  },
+  {
+    name: "CORRID"
+    data_type: TYPE_INT64
+    dims: [1]
+  },
+  {
+    name: "TARGET_SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [1]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "AUDIO_FRAME"
+    data_type: TYPE_FP32
+    dims: [ -1 ]     # streamed chunk
+  }
+]
+
+sequence_batching {
+  max_sequence_idle_microseconds: 120000000  # 120 seconds
+
+  control_input [
+    {
+      name: "START"
+      control [
+        {
+          kind: CONTROL_SEQUENCE_START
+          bool_false_true: [ false, true ]
+        }
+      ]
+    },
+    {
+      name: "END"
+      control [
+        {
+          kind: CONTROL_SEQUENCE_END
+          bool_false_true: [ false, true ]
+        }
+      ]
+    }
+  ]
+}
+
+
+model_transaction_policy {
+  decoupled: true
+}
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+  }
+]
+
+parameters: {
+  key: "model_path"
+  value: { string_value: "/local_models/tts_model" }
+}
+
+parameters: {
+  key: "reference_audio_path"
+  value: { string_value: "/local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav" }
+}
+
+parameters: {
+  key: "reference_json_path"
+  value: { string_value: "/local_models/tts_model/georgian-csm-1b/context_text_for_inference.json" }
+}
