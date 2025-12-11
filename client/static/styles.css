@@ -230,9 +230,317 @@ body::before {
 .main-content {
     flex: 1;
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     overflow: hidden;
     gap: var(--spacing-md);
+}
+
+/* ===== Video Container ===== */
+.video-container {
+    flex: 0 0 400px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-xl);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+    min-width: 0;
+}
+
+@media (max-width: 1024px) {
+    .main-content {
+        flex-direction: column;
+    }
+    
+    .video-container {
+        flex: 0 0 300px;
+    }
+}
+
+.video-wrapper {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    background: var(--bg-primary);
+    overflow: hidden;
+}
+
+#videoCanvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: none;
+}
+
+.video-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--spacing-md);
+    color: var(--text-muted);
+    padding: var(--spacing-xl);
+}
+
+.video-placeholder svg {
+    width: 64px;
+    height: 64px;
+    opacity: 0.5;
+}
+
+.video-placeholder p {
+    font-size: 0.875rem;
+    text-align: center;
+}
+
+.video-placeholder.hidden {
+    display: none;
+}
+
+/* ===== Content Wrapper (Avatar + Chat) ===== */
+.content-wrapper {
+    flex: 1;
+    display: flex;
+    gap: var(--spacing-lg);
+    overflow: hidden;
+}
+
+/* ===== Avatar Container ===== */
+.avatar-container {
+    width: 320px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.avatar-frame {
+    background: var(--bg-secondary);
+    border-radius: var(--radius-xl);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.avatar-video-wrapper {
+    position: relative;
+    aspect-ratio: 1;
+    background: var(--bg-tertiary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.avatar-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transition: opacity var(--transition-fast);
+}
+
+.avatar-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-tertiary);
+    gap: var(--spacing-md);
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+}
+
+.avatar-loading.hidden {
+    display: none;
+}
+
+.avatar-spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid var(--border-light);
+    border-top-color: var(--accent-primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.avatar-status {
+    position: absolute;
+    bottom: var(--spacing-sm);
+    left: var(--spacing-sm);
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    border-radius: var(--radius-full);
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.avatar-status .status-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: background var(--transition-fast);
+}
+
+.avatar-status.ready .status-indicator,
+.avatar-status .status-indicator.ready {
+    background: var(--success);
+}
+
+.avatar-status.speaking .status-indicator,
+.avatar-status .status-indicator.speaking {
+    background: var(--accent-primary);
+    animation: pulse 1s infinite;
+}
+
+.avatar-status.unavailable .status-indicator,
+.avatar-status .status-indicator.unavailable {
+    background: var(--warning);
+}
+
+.avatar-status.error .status-indicator,
+.avatar-status .status-indicator.error {
+    background: var(--error);
+}
+
+.avatar-info {
+    padding: var(--spacing-md);
+    border-top: 1px solid var(--border-subtle);
+}
+
+.avatar-name {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin-bottom: var(--spacing-xs);
+}
+
+.avatar-metrics {
+    display: flex;
+    gap: var(--spacing-md);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.avatar-metrics .video-fps {
+    color: var(--accent-primary);
+}
+
+.avatar-metrics .video-frames {
+    color: var(--success);
+}
+
+/* Avatar Toggle Switch */
+.avatar-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-sm);
+    padding-top: var(--spacing-sm);
+    border-top: 1px solid var(--border-subtle);
+}
+
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+    flex-shrink: 0;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--bg-tertiary);
+    transition: 0.3s;
+    border-radius: 22px;
+    border: 1px solid var(--border-subtle);
+}
+
+.toggle-slider:before {
+    position: absolute;
+    content: "";
+    height: 16px;
+    width: 16px;
+    left: 2px;
+    bottom: 2px;
+    background-color: var(--text-muted);
+    transition: 0.3s;
+    border-radius: 50%;
+}
+
+input:checked + .toggle-slider {
+    background-color: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
+input:checked + .toggle-slider:before {
+    transform: translateX(18px);
+    background-color: white;
+}
+
+input:focus + .toggle-slider {
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+}
+
+.toggle-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+/* Avatar disabled state */
+.avatar-container.disabled {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+.avatar-container.disabled .avatar-frame {
+    filter: grayscale(0.5);
+}
+
+/* Speaking animation for avatar container */
+.avatar-container.speaking .avatar-frame {
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+    border-color: var(--accent-primary);
+}
+
+.avatar-container.speaking .avatar-video-wrapper::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border: 2px solid var(--accent-primary);
+    border-radius: 0;
+    opacity: 0;
+    animation: avatarGlow 2s infinite;
+}
+
+@keyframes avatarGlow {
+    0%, 100% { opacity: 0; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.02); }
 }
 
 /* ===== Chat Container ===== */
@@ -939,6 +1247,35 @@ body::before {
     border-color: var(--accent-primary);
 }
 
+.setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--spacing-md);
+}
+
+.buffer-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md);
+    margin-top: var(--spacing-sm);
+    flex-wrap: wrap;
+}
+
+.buffer-controls input[type="number"] {
+    width: 120px;
+    padding: var(--spacing-sm);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-light);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+.setting-hint {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
 .settings-footer {
     display: flex;
     justify-content: flex-end;
@@ -984,6 +1321,26 @@ body::before {
 }
 
 /* ===== Responsive ===== */
+@media (max-width: 1024px) {
+    .content-wrapper {
+        flex-direction: column;
+    }
+    
+    .avatar-container {
+        width: 100%;
+        max-width: 400px;
+        align-self: center;
+    }
+    
+    .avatar-video-wrapper {
+        aspect-ratio: 16/9;
+    }
+    
+    .chat-container {
+        min-height: 300px;
+    }
+}
+
 @media (max-width: 768px) {
     .app-container {
         padding: 0 var(--spacing-sm);
@@ -1004,6 +1361,26 @@ body::before {
     
     .mode-btn span {
         display: none;
+    }
+    
+    .avatar-container {
+        max-width: 280px;
+    }
+    
+    .avatar-video-wrapper {
+        aspect-ratio: 1;
+    }
+    
+    .avatar-info {
+        padding: var(--spacing-sm);
+    }
+    
+    .avatar-name {
+        font-size: 0.75rem;
+    }
+    
+    .avatar-metrics {
+        font-size: 0.625rem;
     }
     
     .metrics-content {
@@ -1033,3 +1410,18 @@ body::before {
     }
 }
 
+@media (max-width: 480px) {
+    .avatar-container {
+        max-width: 220px;
+    }
+    
+    .avatar-status {
+        font-size: 0.625rem;
+        padding: 2px var(--spacing-xs);
+    }
+    
+    .avatar-status .status-indicator {
+        width: 6px;
+        height: 6px;
+    }
+}

@@ -19,6 +19,48 @@ class VoiceAssistant {
         this.isPlaying = false;
         this.currentPlaybackNode = null;
         
+        // Video/Avatar
+        this.videoEnabled = false;
+        this.videoFrameQueue = [];
+        this.isDisplayingVideo = false;
+        this.videoStartTime = null;
+        this.idleFrame = null;
+        this.lastFrameIndex = -1;
+        this.totalFramesReceived = 0;
+        this.videoFps = 25;  // Target FPS
+        this.videoFrameInterval = 1000 / 25;  // 40ms per frame
+        this.videoDisplayTimer = null;
+        this.musetalkEnabled = true;  // MuseTalk toggle state
+        this.videoComplete = false;   // Set when server signals video_complete
+        
+        // Synced A/V playback
+        this.syncedQueue = [];  // Queue of {audio, frame} pairs
+        this.isSyncedPlayback = false;
+        this.recordedSyncedFrames = []; // Stored synced A/V for replay
+        this.loopFrames = [];          // Stored loopable frames to play between generations
+        this.frameReplayTimer = null;
+        this.isReplayingAV = false;
+        this.isLoopingFrames = false;
+        // Per-message media store for replays
+        this.messageMedia = new WeakMap();
+        this.frameReplayTimer = null;
+        this.isReplayingAV = false;
+        
+        // Adaptive buffering
+        this.bufferConfig = {
+            buffer_ms: 160,           // Target buffer size in ms (default: 4 frames)
+            frame_buffer: 4,          // Number of frames to buffer before playback
+            tts_rtf_mean: 0,
+            tts_rtf_std: 0,
+            is_calibrated: false,
+            buffer_source: 'adaptive',
+            manual_buffer_ms: null,
+        };
+        this.isBuffering = false;      // Whether we're waiting for buffer to fill
+        this.bufferStartTime = null;   // When we started buffering
+        this.playbackStutters = 0;     // Count of buffer underruns
+        this.lastBufferUpdate = 0;     // Timestamp of last buffer config update
+        
         // State
         this.currentMode = 'voice_to_voice';
         this.isGenerating = false;
@@ -47,6 +89,9 @@ class VoiceAssistant {
                 backbone_top_p: 0.9,
                 depth_temperature: 0.8,
                 depth_top_p: 0.9
+            },
+            buffer: {
+                manual_buffer_ms: null
             }
         };
         
@@ -72,6 +117,16 @@ class VoiceAssistant {
             
             // Mode
             modeBtns: document.querySelectorAll('.mode-btn'),
+            
+            // Avatar/Video
+            avatarContainer: document.getElementById('avatarContainer'),
+            avatarImage: document.getElementById('avatarImage'),
+            avatarLoading: document.getElementById('avatarLoading'),
+            avatarStatus: document.getElementById('avatarStatus'),
+            avatarMetrics: document.getElementById('avatarMetrics'),
+            videoFps: document.getElementById('videoFps'),
+            videoFrames: document.getElementById('videoFrames'),
+            musetalkToggle: document.getElementById('musetalkToggle'),
             
             // Chat
             chatMessages: document.getElementById('chatMessages'),
@@ -126,6 +181,9 @@ class VoiceAssistant {
             ttsDepthTempValue: document.getElementById('ttsDepthTempValue'),
             ttsDepthTopP: document.getElementById('ttsDepthTopP'),
             ttsDepthTopPValue: document.getElementById('ttsDepthTopPValue'),
+            bufferSize: document.getElementById('bufferSize'),
+            bufferAutoToggle: document.getElementById('bufferAutoToggle'),
+            bufferCurrent: document.getElementById('bufferCurrent'),
         };
     }
     
@@ -168,6 +226,22 @@ class VoiceAssistant {
         this.bindSlider('ttsBackboneTopP', 'ttsBackboneTopPValue');
         this.bindSlider('ttsDepthTemp', 'ttsDepthTempValue');
         this.bindSlider('ttsDepthTopP', 'ttsDepthTopPValue');
+        if (this.elements.bufferAutoToggle) {
+            this.elements.bufferAutoToggle.addEventListener('change', () => this.toggleBufferMode());
+        }
+        if (this.elements.bufferSize) {
+            this.elements.bufferSize.addEventListener('input', () => {
+                const val = parseFloat(this.elements.bufferSize.value);
+                this.config.buffer.manual_buffer_ms = isNaN(val) ? null : val;
+            });
+        }
+        
+        // MuseTalk toggle
+        if (this.elements.musetalkToggle) {
+            this.elements.musetalkToggle.addEventListener('change', (e) => {
+                this.toggleMuseTalk(e.target.checked);
+            });
+        }
     }
     
     bindSlider(sliderId, valueId) {
@@ -230,6 +304,39 @@ class VoiceAssistant {
                 console.log('TTS cache ready');
             },
             
+            'musetalk_ready': () => {
+                console.log('MuseTalk ready:', data.success);
+                if (data.success) {
+                    this.videoEnabled = true;
+                    this.updateAvatarStatus('ready', 'მზადაა');
+
+                    // Show idle frame if available
+                    if (data.idle_frame) {
+                        this.idleFrame = data.idle_frame;
+                        this.displayFrame(data.idle_frame);
+                    }
+                    
+                    // Update buffer config from server
+                    if (data.buffer_config) {
+                        this.updateBufferConfig(data.buffer_config);
+                    }
+
+                    // Hide loading indicator
+                    if (this.elements.avatarLoading) {
+                        this.elements.avatarLoading.classList.add('hidden');
+                    }
+                } else {
+                    this.videoEnabled = false;
+                    this.updateAvatarStatus('unavailable', 'მიუწვდომელია');
+                    console.log('MuseTalk not available:', data.reason);
+                }
+            },
+            
+            'buffer_config': () => {
+                // Handle buffer config updates from server
+                this.updateBufferConfig(data);
+            },
+            
             'mode_changed': () => {
                 console.log('Mode changed to:', data.mode);
             },
@@ -258,6 +365,12 @@ class VoiceAssistant {
                 this.currentAssistantMessage = this.addMessage('assistant', '', true);
                 this.wordsSpoken = [];
                 this.currentTTSAudioChunks = [];
+                
+                // Reset video state
+                this.videoFrameQueue = [];
+                this.totalFramesReceived = 0;
+                this.lastFrameIndex = -1;
+                this.videoStartTime = null;
             },
             
             'llm_token': () => {
@@ -273,10 +386,31 @@ class VoiceAssistant {
             },
             
             'tts_start': () => {
-                console.log('TTS starting for:', data.text);
+                console.log('TTS starting:', data.text ? data.text.substring(0, 50) : '');
                 this.currentTTSText = data.text;
                 this.currentTTSAudioChunks = [];
+                this.videoComplete = false;
+                this.recordedSyncedFrames = [];
+                // Stop any idle/loop playback so new frames can take over
+                this.stopFrameReplay();
                 
+                // Update buffer config from server if provided
+                if (data.buffer_config) {
+                    this.updateBufferConfig(data.buffer_config);
+                }
+                
+                // Reset playback state
+                this.playbackStutters = 0;
+
+                // Check if video is enabled for this session
+                if (data.video_enabled) {
+                    this.updateAvatarStatus('speaking', 'საუბრობს');
+                    // Don't start playback yet - wait for buffer to fill
+                this.isBuffering = true;
+                this.bufferStartTime = performance.now();
+                console.log(`Adaptive buffer: waiting for ${this.bufferConfig.frame_buffer} frames (${this.bufferConfig.buffer_ms}ms)`);
+            }
+
                 // In TTS-only mode, show user message and prepare audio message
                 if (this.currentMode === 'tts_only') {
                     this.isGenerating = true;
@@ -285,6 +419,12 @@ class VoiceAssistant {
                     this.addMessage('user', data.text);
                     // Create audio message placeholder
                     this.currentTTSMessage = this.addAudioMessage();
+
+                    // Reset video state
+                    this.videoFrameQueue = [];
+                    this.totalFramesReceived = 0;
+                    this.lastFrameIndex = -1;
+                    this.videoStartTime = null;
                 }
             },
             
@@ -303,10 +443,71 @@ class VoiceAssistant {
                 }
             },
             
+            'video_frame': () => {
+                this.handleVideoFrame(data);
+            },
+            
+            'synced_av_frame': () => {
+                // Handle synchronized audio+video frame
+                this.handleSyncedAVFrame(data);
+            },
+            
+            'video_complete': () => {
+                console.log('Video complete, total frames:', this.totalFramesReceived);
+                this.videoComplete = true;
+
+                const haveFrames = this.syncedQueue.length > 0 || (this.recordedSyncedFrames && this.recordedSyncedFrames.length > 0);
+                if (this.isBuffering && haveFrames) {
+                    console.log(`Generation finished with ${this.syncedQueue.length} queued frames; starting fallback playback.`);
+                    this.isBuffering = false;
+                    // Prefer smooth replay using recorded frames/audio when available
+                    if (this.recordedSyncedFrames && this.recordedSyncedFrames.length > 0) {
+                        this.playRecordedAV();
+                    } else {
+                        this.startSyncedPlayback();
+                    }
+                    return;
+                }
+
+                // If already playing or draining, let it finish
+                if (this.isSyncedPlayback || this.syncedQueue.length > 0) {
+                    return;
+                }
+
+                // Nothing to play; stop immediately
+                this.stopVideoPlayback();
+                this.updateAvatarStatus('ready', 'მზადაა');
+                
+                // Show idle frame after a short delay
+                setTimeout(() => {
+                    if (this.idleFrame && !this.isDisplayingVideo) {
+                        this.displayFrame(this.idleFrame);
+                    }
+                }, 500);
+
+                // Save last frames for looping between generations
+                const maxLoopFrames = 60; // about 2.4s at 25fps
+                if (this.recordedSyncedFrames && this.recordedSyncedFrames.length > 0) {
+                    this.loopFrames = this.recordedSyncedFrames.slice(-maxLoopFrames);
+                }
+                // Start looping previous clip if available
+                if (!this.isGenerating && this.loopFrames.length > 0) {
+                    this.startFrameReplay(this.loopFrames, true);
+                }
+            },
+            
+            'musetalk_toggled': () => {
+                console.log('MuseTalk toggled:', data.enabled);
+                this.musetalkEnabled = data.enabled;
+                this.updateMuseTalkToggleUI();
+            },
+            
             'error': () => {
                 console.error('Server error:', data.message);
                 this.hideStopButton();
                 this.isGenerating = false;
+                this.stopVideoPlayback();
+                this.updateAvatarStatus('error', 'შეცდომა');
             },
             
             'conversation_cleared': () => {
@@ -531,11 +732,439 @@ class VoiceAssistant {
         this.isPlaying = false;
     }
     
+    // ============ Video/Avatar ============
+    
+    handleVideoFrame(data) {
+        if (!data.frame) return;
+        
+        this.totalFramesReceived++;
+        
+        // Queue frame for display
+        this.videoFrameQueue.push({
+            frame: data.frame,
+            frameIndex: data.frame_index,
+            timestampMs: data.timestamp_ms,
+        });
+        
+        // Update metrics
+        this.updateVideoMetrics(data);
+        
+        // Start video playback if not already running
+        if (!this.isDisplayingVideo) {
+            this.startVideoPlayback();
+        }
+    }
+    
+    handleSyncedAVFrame(data) {
+        /**
+         * Handle synchronized audio+video frame.
+         * Each frame contains 40ms of audio paired with its video frame.
+         * We play them together to ensure lip sync.
+         * 
+         * Adaptive buffering: Wait for buffer to fill before starting playback
+         * to ensure smooth playback without stutters.
+         */
+        if (!data.frame && !data.audio) return;
+        
+        this.totalFramesReceived++;
+        const isTtsOnly = this.currentMode === 'tts_only';
+        let decodedAudio = null;
+        if (data.audio) {
+            decodedAudio = this.decodeAudioBase64(data.audio);
+            if (decodedAudio && isTtsOnly) {
+                // Store audio for replay/UI in TTS-only mode
+                this.currentTTSAudioChunks.push(decodedAudio);
+            }
+        }
+        // Record frames/audio for potential replay/fallback even if not TTS-only
+        if (data.frame || data.audio) {
+            this.recordedSyncedFrames.push({
+                audio: data.audio,
+                audioFloat: decodedAudio,
+                frame: data.frame,
+                frameIndex: data.frame_index,
+                timestampMs: data.timestamp_ms,
+                word: data.word || '',
+            });
+        }
+        
+        // Queue the synced pair
+        this.syncedQueue.push({
+            audio: data.audio,
+            frame: data.frame,
+            frameIndex: data.frame_index,
+            timestampMs: data.timestamp_ms,
+            word: data.word || '',
+            // Include metrics for display when this frame is played
+            rtf: data.rtf,
+            generation_time_ms: data.generation_time_ms,
+            audio_duration_ms: data.audio_duration_ms,
+            receivedAt: performance.now(),
+        });
+        
+        // Update video metrics (FPS, frame count)
+        if (data.frame_index !== undefined) {
+            this.updateVideoMetrics(data);
+        }
+        
+        // Update TTS metrics if present
+        if (data.rtf !== undefined) {
+            this.updateMetrics(data);
+        }
+        
+        // Update avatar status
+        if (!this.isDisplayingVideo && this.videoEnabled) {
+            this.updateAvatarStatus('speaking', 'საუბრობს');
+        }
+        
+        // Adaptive buffering: Wait for buffer to fill before starting playback
+        if (this.isBuffering) {
+            const targetFrames = Number.isFinite(this.bufferConfig.frame_buffer) ? this.bufferConfig.frame_buffer : 4;
+            
+            if (this.syncedQueue.length >= targetFrames) {
+                // Buffer is full, start playback
+                const bufferTime = performance.now() - this.bufferStartTime;
+                console.log(`Buffer filled: ${this.syncedQueue.length} frames in ${bufferTime.toFixed(0)}ms, starting playback`);
+                this.isBuffering = false;
+                this.startSyncedPlayback();
+            }
+        } else if (!this.isSyncedPlayback) {
+            // Not buffering and not playing - start immediately (shouldn't normally happen)
+            this.startSyncedPlayback();
+        }
+    }
+    
+    startSyncedPlayback() {
+        if (this.isSyncedPlayback) return;
+        
+        this.isSyncedPlayback = true;
+        this.isDisplayingVideo = true;
+        this.videoStartTime = performance.now();
+        this.isBuffering = false;
+        
+        const playNextSyncedFrame = () => {
+            if (!this.isSyncedPlayback) return;
+            
+            if (this.syncedQueue.length > 0) {
+                // Stop any idle/loop replay as soon as real frames start
+                if (this.isReplayingAV) {
+                    this.stopFrameReplay();
+                }
+
+                const syncedData = this.syncedQueue.shift();
+                
+                // Play audio immediately
+                if (syncedData.audio) {
+                    this.playSyncedAudio(syncedData.audio);
+                }
+                
+                // Display video frame immediately
+                if (syncedData.frame) {
+                    this.displayFrame(syncedData.frame);
+                    this.lastFrameIndex = syncedData.frameIndex;
+                }
+                
+                // Update TTS metrics if available
+                if (syncedData.rtf !== undefined) {
+                    this.updateMetrics({
+                        rtf: syncedData.rtf,
+                        generation_time_ms: syncedData.generation_time_ms,
+                        audio_duration_ms: syncedData.audio_duration_ms,
+                        word: syncedData.word,
+                    });
+                }
+                
+                // Handle word highlighting
+                if (syncedData.word) {
+                    this.wordsSpoken.push(syncedData.word);
+                    // Highlight word in message if in voice modes
+                    if (this.currentAssistantMessage && this.currentMode !== 'tts_only') {
+                        this.highlightWord(syncedData.word);
+                    }
+                    // Update TTS message progress in TTS-only mode
+                    if (this.currentMode === 'tts_only' && this.currentTTSMessage) {
+                        this.updateTTSMessageProgress(syncedData.word);
+                    }
+                }
+            } else {
+                // Buffer underrun - no frames available
+                if (this.videoComplete) {
+                    // Nothing more coming; stop cleanly
+                    this.stopVideoPlayback();
+                    this.updateAvatarStatus('ready', 'მზადაა');
+                    if (this.idleFrame && !this.isDisplayingVideo) {
+                        this.displayFrame(this.idleFrame);
+                    }
+                    return;
+                } else {
+                    this.playbackStutters++;
+                    if (this.playbackStutters % 5 === 1) {
+                        console.warn(`Buffer underrun #${this.playbackStutters}, queue empty`);
+                    }
+                }
+            }
+            
+            // Schedule next frame at 25 FPS (40ms intervals)
+            this.videoDisplayTimer = setTimeout(() => {
+                requestAnimationFrame(playNextSyncedFrame);
+            }, this.videoFrameInterval);
+        };
+        
+        requestAnimationFrame(playNextSyncedFrame);
+    }
+    
+    updateBufferConfig(config) {
+        /**
+         * Update adaptive buffer configuration from server.
+         * The server calculates optimal buffer size based on:
+         * - TTS RTF (real-time factor)
+         * - Network latency statistics
+         * - Generation speed measurements
+         */
+        if (!config) return;
+        
+        const oldConfig = { ...this.bufferConfig };
+        
+        if (config.buffer_ms !== undefined) {
+            this.bufferConfig.buffer_ms = Number(config.buffer_ms);
+        }
+        if (config.frame_buffer !== undefined) {
+            this.bufferConfig.frame_buffer = Number(config.frame_buffer);
+        }
+        if (config.tts_rtf_mean !== undefined) {
+            this.bufferConfig.tts_rtf_mean = config.tts_rtf_mean;
+        }
+        if (config.tts_rtf_std !== undefined) {
+            this.bufferConfig.tts_rtf_std = config.tts_rtf_std;
+        }
+        if (config.buffer_source !== undefined) {
+            this.bufferConfig.buffer_source = config.buffer_source;
+        }
+        if (config.manual_buffer_ms !== undefined) {
+            this.bufferConfig.manual_buffer_ms = config.manual_buffer_ms === null ? null : Number(config.manual_buffer_ms);
+            if (this.config.buffer) {
+                this.config.buffer.manual_buffer_ms = this.bufferConfig.manual_buffer_ms;
+            }
+        }
+        if (config.is_calibrated !== undefined) {
+            this.bufferConfig.is_calibrated = config.is_calibrated;
+        }
+        
+        // Log if config changed significantly
+        if (Math.abs(oldConfig.buffer_ms - this.bufferConfig.buffer_ms) > 10 ||
+            oldConfig.frame_buffer !== this.bufferConfig.frame_buffer) {
+            const source = this.bufferConfig.buffer_source || 'adaptive';
+            const bufferVal = Number.isFinite(this.bufferConfig.buffer_ms) ? this.bufferConfig.buffer_ms : 0;
+            const frameVal = Number.isFinite(this.bufferConfig.frame_buffer) ? this.bufferConfig.frame_buffer : 0;
+            console.log(`Buffer config updated (${source}): ${bufferVal.toFixed(0)}ms, ${frameVal} frames`);
+            console.log(`  TTS RTF: ${this.bufferConfig.tts_rtf_mean.toFixed(3)} ± ${this.bufferConfig.tts_rtf_std.toFixed(3)}`);
+        }
+        
+        this.lastBufferUpdate = performance.now();
+        this.renderBufferHint();
+    }
+    
+    playSyncedAudio(audioBase64) {
+        /**
+         * Play a single 40ms audio chunk immediately.
+         * This is synchronized with video frame display.
+         */
+        if (!this.audioContext || !audioBase64) return;
+        
+        try {
+            const float32 = this.decodeAudioBase64(audioBase64);
+            if (!float32) return;
+            
+            // Create audio buffer (40ms at 24kHz = 960 samples)
+            const audioBuffer = this.audioContext.createBuffer(1, float32.length, 24000);
+            audioBuffer.getChannelData(0).set(float32);
+            
+            // Play immediately
+            const source = this.audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(this.audioContext.destination);
+            source.start();
+            
+            // Store for potential cleanup
+            this.currentPlaybackNode = source;
+        } catch (e) {
+            console.error('Failed to play synced audio:', e);
+        }
+    }
+
+    decodeAudioBase64(audioBase64) {
+        try {
+            const binaryString = atob(audioBase64);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return new Float32Array(bytes.buffer);
+        } catch (e) {
+            console.error('Failed to decode audio base64:', e);
+            return null;
+        }
+    }
+    
+    stopSyncedPlayback() {
+        this.isSyncedPlayback = false;
+        this.isDisplayingVideo = false;
+        this.isBuffering = false;
+        this.isReplayingAV = false;
+        this.isLoopingFrames = false;
+        
+        if (this.videoDisplayTimer) {
+            clearTimeout(this.videoDisplayTimer);
+            this.videoDisplayTimer = null;
+        }
+        if (this.frameReplayTimer) {
+            clearTimeout(this.frameReplayTimer);
+            this.frameReplayTimer = null;
+        }
+        
+        // Log playback stats
+        if (this.playbackStutters > 0) {
+            console.log(`Playback ended with ${this.playbackStutters} stutters`);
+        }
+        
+        // Clear remaining synced data
+        this.syncedQueue = [];
+    }
+    
+    toggleMuseTalk(enabled) {
+        /**
+         * Toggle MuseTalk on/off.
+         * Sends message to server and updates local state.
+         */
+        this.musetalkEnabled = enabled;
+        this.sendMessage('toggle_musetalk', { enabled });
+        this.updateMuseTalkToggleUI();
+        console.log('MuseTalk toggled:', enabled);
+    }
+    
+    updateMuseTalkToggleUI() {
+        /**
+         * Update the toggle switch UI to reflect current state.
+         */
+        const toggle = document.getElementById('musetalkToggle');
+        if (toggle) {
+            toggle.checked = this.musetalkEnabled;
+        }
+        
+        // Update avatar container visibility/opacity
+        if (this.elements.avatarContainer) {
+            if (this.musetalkEnabled) {
+                this.elements.avatarContainer.classList.remove('disabled');
+            } else {
+                this.elements.avatarContainer.classList.add('disabled');
+            }
+        }
+    }
+    
+    displayFrame(frameBase64) {
+        if (!this.elements.avatarImage) return;
+        
+        try {
+            this.elements.avatarImage.src = `data:image/jpeg;base64,${frameBase64}`;
+        } catch (e) {
+            console.error('Failed to display frame:', e);
+        }
+    }
+    
+    startVideoPlayback() {
+        if (this.isDisplayingVideo) return;
+        
+        this.isDisplayingVideo = true;
+        this.videoStartTime = performance.now();
+        
+        // Use requestAnimationFrame for smooth playback
+        const displayNextFrame = () => {
+            if (!this.isDisplayingVideo) return;
+            
+            if (this.videoFrameQueue.length > 0) {
+                const frameData = this.videoFrameQueue.shift();
+                this.displayFrame(frameData.frame);
+                this.lastFrameIndex = frameData.frameIndex;
+            }
+            
+            // Schedule next frame at 25 FPS (40ms intervals)
+            this.videoDisplayTimer = setTimeout(() => {
+                requestAnimationFrame(displayNextFrame);
+            }, this.videoFrameInterval);
+        };
+        
+        requestAnimationFrame(displayNextFrame);
+    }
+    
+    stopVideoPlayback() {
+        this.isDisplayingVideo = false;
+        this.isSyncedPlayback = false;
+        this.isBuffering = false;
+        
+        if (this.videoDisplayTimer) {
+            clearTimeout(this.videoDisplayTimer);
+            this.videoDisplayTimer = null;
+        }
+        
+        // Log playback stats
+        if (this.playbackStutters > 0) {
+            console.log(`Video playback ended with ${this.playbackStutters} buffer underruns`);
+        }
+        
+        // Clear remaining frames
+        this.videoFrameQueue = [];
+        this.syncedQueue = [];
+    }
+    
+    updateAvatarStatus(status, text) {
+        if (!this.elements.avatarStatus) return;
+        
+        const statusIndicator = this.elements.avatarStatus.querySelector('.status-indicator');
+        const statusText = this.elements.avatarStatus.querySelector('.status-text');
+        
+        // Remove all status classes
+        this.elements.avatarStatus.classList.remove('ready', 'speaking', 'unavailable', 'error');
+        this.elements.avatarStatus.classList.add(status);
+        
+        if (statusIndicator) {
+            statusIndicator.classList.remove('ready', 'speaking', 'unavailable', 'error');
+            statusIndicator.classList.add(status);
+        }
+        
+        if (statusText) {
+            statusText.textContent = text;
+        }
+        
+        // Add speaking animation class to avatar container
+        if (this.elements.avatarContainer) {
+            if (status === 'speaking') {
+                this.elements.avatarContainer.classList.add('speaking');
+            } else {
+                this.elements.avatarContainer.classList.remove('speaking');
+            }
+        }
+    }
+    
+    updateVideoMetrics(data) {
+        // Calculate effective FPS
+        const elapsed = (performance.now() - (this.videoStartTime || performance.now())) / 1000;
+        const effectiveFps = elapsed > 0 ? (this.totalFramesReceived / elapsed).toFixed(1) : 0;
+        
+        if (this.elements.videoFps) {
+            this.elements.videoFps.textContent = `${effectiveFps} FPS`;
+        }
+        
+        if (this.elements.videoFrames) {
+            this.elements.videoFrames.textContent = `${data.frames_generated || this.totalFramesReceived} კადრი`;
+        }
+    }
+    
     // Play stored audio (for clickable audio messages)
     async playStoredAudio(audioChunks) {
         if (!audioChunks || audioChunks.length === 0) return;
         
         this.stopAudioPlayback();
+        this.stopSyncedPlayback();
         
         if (this.audioContext.state === 'suspended') {
             await this.audioContext.resume();
@@ -560,6 +1189,85 @@ class VoiceAssistant {
         source.start();
         
         this.currentPlaybackNode = source;
+    }
+
+    playRecordedAV(framesOverride = null) {
+        // Replay stored synced audio+video frames (used in TTS-only mode and as fallback)
+        const frames = framesOverride || this.recordedSyncedFrames;
+        if (!frames || frames.length === 0) return;
+        
+        // Reset playback state
+        this.stopSyncedPlayback();
+        this.stopAudioPlayback();
+        this.syncedQueue = frames.map(frame => ({ ...frame }));
+        this.isBuffering = false;
+        this.videoComplete = true; // no more frames will arrive
+        this.isSyncedPlayback = false;
+        this.isDisplayingVideo = false;
+        this.playbackStutters = 0;
+        this.totalFramesReceived = frames.length;
+        this.lastFrameIndex = -1;
+        this.videoStartTime = performance.now();
+
+        // Extract audio floats for smooth continuous playback
+        const audioChunks = frames
+            .map(f => f.audioFloat)
+            .filter(Boolean);
+        if (audioChunks.length > 0) {
+            this.playStoredAudio(audioChunks);
+        }
+
+        // Replay frames based on their timestamps to stay in sync with audio
+        this.startFrameReplay(frames, false);
+    }
+
+    startFrameReplay(frames, loop = false) {
+        if (!frames || frames.length === 0) return;
+
+        this.isReplayingAV = true;
+        this.isLoopingFrames = loop;
+        let index = 0;
+        let start = performance.now();
+
+        const step = () => {
+            if (!this.isReplayingAV) {
+                return;
+            }
+
+            const frame = frames[index];
+            if (frame && frame.frame) {
+                this.displayFrame(frame.frame);
+                this.lastFrameIndex = frame.frameIndex;
+            }
+
+            index += 1;
+
+            if (index >= frames.length) {
+                if (loop) {
+                    index = 0;
+                    start = performance.now();
+                } else {
+                    this.frameReplayTimer = null;
+                    return;
+                }
+            }
+
+            const nextTs = frames[index]?.timestampMs ?? (index * 40);
+            const elapsed = performance.now() - start;
+            const delay = Math.max(0, nextTs - elapsed);
+            this.frameReplayTimer = setTimeout(step, delay);
+        };
+
+        step();
+    }
+
+    stopFrameReplay() {
+        this.isReplayingAV = false;
+        this.isLoopingFrames = false;
+        if (this.frameReplayTimer) {
+            clearTimeout(this.frameReplayTimer);
+            this.frameReplayTimer = null;
+        }
     }
     
     // ============ UI Updates ============
@@ -630,18 +1338,30 @@ class VoiceAssistant {
     }
     
     updateMetrics(data) {
-        this.elements.rtfValue.textContent = data.rtf.toFixed(3);
-        this.elements.genTimeValue.textContent = `${data.generation_time_ms.toFixed(0)} ms`;
-        this.elements.audioDurValue.textContent = `${data.audio_duration_ms.toFixed(0)} ms`;
-        this.elements.currentWordValue.textContent = data.word || '-';
+        // Only update metrics if they are present in the data
+        if (data.rtf !== undefined && this.elements.rtfValue) {
+            this.elements.rtfValue.textContent = data.rtf.toFixed(3);
+            
+            const rtfEl = this.elements.rtfValue;
+            if (data.rtf < 1) {
+                rtfEl.style.color = 'var(--success)';
+            } else if (data.rtf < 1.5) {
+                rtfEl.style.color = 'var(--warning)';
+            } else {
+                rtfEl.style.color = 'var(--error)';
+            }
+        }
         
-        const rtfEl = this.elements.rtfValue;
-        if (data.rtf < 1) {
-            rtfEl.style.color = 'var(--success)';
-        } else if (data.rtf < 1.5) {
-            rtfEl.style.color = 'var(--warning)';
-        } else {
-            rtfEl.style.color = 'var(--error)';
+        if (data.generation_time_ms !== undefined && this.elements.genTimeValue) {
+            this.elements.genTimeValue.textContent = `${data.generation_time_ms.toFixed(0)} ms`;
+        }
+        
+        if (data.audio_duration_ms !== undefined && this.elements.audioDurValue) {
+            this.elements.audioDurValue.textContent = `${data.audio_duration_ms.toFixed(0)} ms`;
+        }
+        
+        if (this.elements.currentWordValue) {
+            this.elements.currentWordValue.textContent = data.word || '-';
         }
     }
     
@@ -727,12 +1447,19 @@ class VoiceAssistant {
     finalizeTTSMessage() {
         if (!this.currentTTSMessage) return;
         
-        const playBtn = this.currentTTSMessage.querySelector('.play-btn');
-        const statusEl = this.currentTTSMessage.querySelector('.audio-status');
-        const wordEl = this.currentTTSMessage.querySelector('.audio-word');
+        const messageEl = this.currentTTSMessage;
+        const playBtn = messageEl.querySelector('.play-btn');
+        const statusEl = messageEl.querySelector('.audio-status');
+        const wordEl = messageEl.querySelector('.audio-word');
         
         // Store audio chunks in the button's dataset
         const audioChunks = [...this.currentTTSAudioChunks];
+        const framesForMessage = [...this.recordedSyncedFrames];
+        // Persist media for this message so replays use the right content later
+        this.messageMedia.set(messageEl, {
+            audioChunks,
+            frames: framesForMessage,
+        });
         
         if (audioChunks.length > 0) {
             playBtn.disabled = false;
@@ -748,14 +1475,23 @@ class VoiceAssistant {
             playBtn.addEventListener('click', async () => {
                 const playIcon = playBtn.querySelector('.play-icon');
                 const pauseIcon = playBtn.querySelector('.pause-icon');
+                const media = this.messageMedia.get(messageEl) || { audioChunks: [], frames: [] };
+                const storedAudio = media.audioChunks || [];
+                const storedFrames = media.frames || [];
                 
                 if (isPlaying) {
                     this.stopAudioPlayback();
+                    this.stopSyncedPlayback();
                     isPlaying = false;
                     playIcon.classList.remove('hidden');
                     pauseIcon.classList.add('hidden');
                 } else {
-                    await this.playStoredAudio(audioChunks);
+                    const hasFrames = storedFrames && storedFrames.length > 0 && this.musetalkEnabled;
+                    if (hasFrames) {
+                        this.playRecordedAV(storedFrames);
+                    } else {
+                        await this.playStoredAudio(storedAudio);
+                    }
                     isPlaying = true;
                     playIcon.classList.add('hidden');
                     pauseIcon.classList.remove('hidden');
@@ -849,8 +1585,10 @@ class VoiceAssistant {
     stopGeneration() {
         this.sendMessage('stop_generation', {});
         this.stopAudioPlayback();
+        this.stopVideoPlayback();
         this.hideStopButton();
         this.isGenerating = false;
+        this.updateAvatarStatus('ready', 'მზადაა');
     }
     
     sendTextInput() {
@@ -901,6 +1639,43 @@ class VoiceAssistant {
         this.elements.ttsDepthTempValue.textContent = this.config.tts.depth_temperature;
         this.elements.ttsDepthTopP.value = this.config.tts.depth_top_p;
         this.elements.ttsDepthTopPValue.textContent = this.config.tts.depth_top_p;
+        
+        this.updateBufferSettingUI();
+    }
+    
+    updateBufferSettingUI() {
+        const manualValue = this.config.buffer?.manual_buffer_ms;
+        const auto = manualValue === null || manualValue === undefined;
+        
+        if (this.elements.bufferAutoToggle) {
+            this.elements.bufferAutoToggle.checked = auto;
+        }
+        if (this.elements.bufferSize) {
+            this.elements.bufferSize.disabled = auto;
+            const fallback = Number.isFinite(this.bufferConfig.buffer_ms) ? Math.round(this.bufferConfig.buffer_ms) : 0;
+            this.elements.bufferSize.value = auto ? fallback : manualValue ?? fallback;
+        }
+        this.renderBufferHint();
+    }
+    
+    renderBufferHint() {
+        if (!this.elements.bufferCurrent) return;
+        const bufferValue = Number.isFinite(this.bufferConfig.buffer_ms) ? this.bufferConfig.buffer_ms : 0;
+        const source = this.bufferConfig.buffer_source || 'adaptive';
+        this.elements.bufferCurrent.textContent = `ამჟამინდელი ბუფერი: ${bufferValue.toFixed(0)} ms (${source})`;
+    }
+    
+    toggleBufferMode() {
+        const auto = this.elements.bufferAutoToggle?.checked ?? true;
+        if (this.elements.bufferSize) {
+            this.elements.bufferSize.disabled = auto;
+        }
+        if (auto) {
+            this.config.buffer.manual_buffer_ms = null;
+        } else if (this.elements.bufferSize) {
+            const val = parseFloat(this.elements.bufferSize.value);
+            this.config.buffer.manual_buffer_ms = isNaN(val) ? null : val;
+        }
     }
     
     async saveSettings() {
@@ -917,6 +1692,14 @@ class VoiceAssistant {
         this.config.tts.depth_temperature = parseFloat(this.elements.ttsDepthTemp.value);
         this.config.tts.depth_top_p = parseFloat(this.elements.ttsDepthTopP.value);
         
+        const autoBuffer = this.elements.bufferAutoToggle?.checked ?? true;
+        if (autoBuffer) {
+            this.config.buffer.manual_buffer_ms = null;
+        } else {
+            const manualVal = parseFloat(this.elements.bufferSize?.value ?? '');
+            this.config.buffer.manual_buffer_ms = isNaN(manualVal) ? null : manualVal;
+        }
+        
         localStorage.setItem('voiceAssistantConfig', JSON.stringify(this.config));
         
         try {
@@ -927,7 +1710,19 @@ class VoiceAssistant {
             });
             
             if (response.ok) {
+                const updated = await response.json();
                 console.log('Settings saved');
+                if (updated?.buffer) {
+                    this.config.buffer.manual_buffer_ms = updated.buffer.manual_buffer_ms ?? this.config.buffer.manual_buffer_ms;
+                    this.bufferConfig.buffer_source = updated.buffer.buffer_source || this.bufferConfig.buffer_source;
+                    this.updateBufferConfig({
+                        buffer_ms: updated.buffer.current_buffer_ms,
+                        frame_buffer: updated.buffer.frame_buffer,
+                        buffer_source: updated.buffer.buffer_source,
+                        manual_buffer_ms: updated.buffer.manual_buffer_ms,
+                    });
+                    this.updateBufferSettingUI();
+                }
             }
         } catch (e) {
             console.error('Failed to save settings:', e);
@@ -953,6 +1748,9 @@ class VoiceAssistant {
                 backbone_top_p: 0.9,
                 depth_temperature: 0.8,
                 depth_top_p: 0.9
+            },
+            buffer: {
+                manual_buffer_ms: null
             }
         };
         
@@ -970,12 +1768,24 @@ class VoiceAssistant {
             }
         }
         
+        this.loadSettingsToUI();
+        
         fetch('/config')
             .then(res => res.json())
             .then(serverConfig => {
                 if (serverConfig.vad) this.config.vad = { ...this.config.vad, ...serverConfig.vad };
                 if (serverConfig.llm) this.config.llm = { ...this.config.llm, ...serverConfig.llm };
                 if (serverConfig.tts) this.config.tts = { ...this.config.tts, ...serverConfig.tts };
+                if (serverConfig.buffer) {
+                    this.config.buffer = { ...this.config.buffer, manual_buffer_ms: serverConfig.buffer.manual_buffer_ms ?? this.config.buffer.manual_buffer_ms };
+                    this.updateBufferConfig({
+                        buffer_ms: serverConfig.buffer.current_buffer_ms,
+                        frame_buffer: serverConfig.buffer.frame_buffer,
+                        buffer_source: serverConfig.buffer.buffer_source,
+                        manual_buffer_ms: serverConfig.buffer.manual_buffer_ms,
+                    });
+                }
+                this.loadSettingsToUI();
             })
             .catch(e => console.log('Could not load server config:', e));
     }

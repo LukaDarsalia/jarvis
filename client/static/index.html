@@ -64,50 +64,84 @@
 
         <!-- Main Content -->
         <main class="main-content">
-            <!-- Chat Container -->
-            <div class="chat-container" id="chatContainer">
-                <div class="chat-messages" id="chatMessages">
-                    <div class="welcome-message">
-                        <div class="welcome-icon">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                                <circle cx="12" cy="12" r="10"/>
-                                <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
-                                <line x1="9" y1="9" x2="9.01" y2="9"/>
-                                <line x1="15" y1="9" x2="15.01" y2="9"/>
-                            </svg>
+            <!-- Content wrapper for avatar + chat layout -->
+            <div class="content-wrapper">
+                <!-- Avatar Container -->
+                <div class="avatar-container" id="avatarContainer">
+                    <div class="avatar-frame">
+                        <div class="avatar-video-wrapper">
+                            <img id="avatarImage" class="avatar-image" alt="Avatar" />
+                            <div class="avatar-loading" id="avatarLoading">
+                                <div class="avatar-spinner"></div>
+                                <span>ავატარის ჩატვირთვა...</span>
+                            </div>
+                            <div class="avatar-status" id="avatarStatus">
+                                <span class="status-indicator"></span>
+                                <span class="status-text">მოლოდინი</span>
+                            </div>
                         </div>
-                        <h2>გამარჯობა!</h2>
-                        <p>მე ვარ თქვენი ციფრული ასისტენტი. როგორ შემიძლია დაგეხმაროთ?</p>
+                        <div class="avatar-info">
+                            <div class="avatar-name">ციფრული ასისტენტი</div>
+                            <div class="avatar-metrics" id="avatarMetrics">
+                                <span class="video-fps" id="videoFps">- FPS</span>
+                                <span class="video-frames" id="videoFrames">0 კადრი</span>
+                            </div>
+                            <div class="avatar-toggle">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="musetalkToggle" checked>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="toggle-label">ავატარი</span>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
-                <!-- RTF Metrics Panel -->
-                <div class="metrics-panel" id="metricsPanel">
-                    <div class="metrics-header">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M3 3v18h18"/>
-                            <path d="M18 17V9"/>
-                            <path d="M13 17V5"/>
-                            <path d="M8 17v-3"/>
-                        </svg>
-                        <span>TTS მეტრიკები</span>
+                <!-- Chat Container -->
+                <div class="chat-container" id="chatContainer">
+                    <div class="chat-messages" id="chatMessages">
+                        <div class="welcome-message">
+                            <div class="welcome-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
+                                    <line x1="9" y1="9" x2="9.01" y2="9"/>
+                                    <line x1="15" y1="9" x2="15.01" y2="9"/>
+                                </svg>
+                            </div>
+                            <h2>გამარჯობა!</h2>
+                            <p>მე ვარ თქვენი ციფრული ასისტენტი. როგორ შემიძლია დაგეხმაროთ?</p>
+                        </div>
                     </div>
-                    <div class="metrics-content">
-                        <div class="metric">
-                            <span class="metric-label">RTF</span>
-                            <span class="metric-value" id="rtfValue">-</span>
+
+                    <!-- RTF Metrics Panel -->
+                    <div class="metrics-panel" id="metricsPanel">
+                        <div class="metrics-header">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M3 3v18h18"/>
+                                <path d="M18 17V9"/>
+                                <path d="M13 17V5"/>
+                                <path d="M8 17v-3"/>
+                            </svg>
+                            <span>TTS მეტრიკები</span>
                         </div>
-                        <div class="metric">
-                            <span class="metric-label">გენერაცია</span>
-                            <span class="metric-value" id="genTimeValue">- ms</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">აუდიო</span>
-                            <span class="metric-value" id="audioDurValue">- ms</span>
-                        </div>
-                        <div class="metric current-word">
-                            <span class="metric-label">მიმდინარე სიტყვა</span>
-                            <span class="metric-value" id="currentWordValue">-</span>
+                        <div class="metrics-content">
+                            <div class="metric">
+                                <span class="metric-label">RTF</span>
+                                <span class="metric-value" id="rtfValue">-</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">გენერაცია</span>
+                                <span class="metric-value" id="genTimeValue">- ms</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">აუდიო</span>
+                                <span class="metric-value" id="audioDurValue">- ms</span>
+                            </div>
+                            <div class="metric current-word">
+                                <span class="metric-label">მიმდინარე სიტყვა</span>
+                                <span class="metric-value" id="currentWordValue">-</span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -258,6 +292,36 @@
                             <span class="setting-value" id="ttsDepthTopPValue">0.9</span>
                         </div>
                     </div>
+
+                    <!-- Buffer / Sync Settings -->
+                    <div class="settings-section">
+                        <h3>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M3 3v18h18"/>
+                                <path d="M18 17V9"/>
+                                <path d="M13 17V5"/>
+                                <path d="M8 17v-3"/>
+                            </svg>
+                            ბუფერი (აუდიო/ვიდეო სინქი)
+                        </h3>
+                        <div class="setting-item full-width buffer-setting">
+                            <div class="setting-row">
+                                <label for="bufferSize">ბუფერის ზომა (ms)</label>
+                                <div class="buffer-toggle">
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" id="bufferAutoToggle" checked>
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                    <span class="toggle-label">ავტომატური (კალიბრაციით)</span>
+                                </div>
+                            </div>
+                            <div class="buffer-controls">
+                                <input type="number" id="bufferSize" min="0" max="2000" step="10" value="0" disabled>
+                                <span class="setting-hint">გამორთე ავტომატური რეჟიმი რომ მიუთითო საკუთარი ბუფერი (ms)</span>
+                            </div>
+                            <div class="setting-hint" id="bufferCurrent">ამჟამინდელი ბუფერი: - ms</div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="settings-footer">
@@ -272,4 +336,3 @@
     <script src="/static/app.js"></script>
 </body>
 </html>
-

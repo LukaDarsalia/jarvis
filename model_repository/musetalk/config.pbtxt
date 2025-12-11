@@ -1,0 +1,155 @@
+name: "musetalk"
+backend: "python"
+
+max_batch_size: 0
+
+input [
+  {
+    name: "AUDIO_CHUNK"
+    data_type: TYPE_FP32
+    dims: [ -1 ]   # audio chunk samples
+    optional: true
+  },
+  {
+    name: "START"
+    data_type: TYPE_BOOL
+    dims: [1]
+    optional: true
+  },
+  {
+    name: "END"
+    data_type: TYPE_BOOL
+    dims: [1]
+    optional: true
+  },
+  {
+    name: "CORRID"
+    data_type: TYPE_INT64
+    dims: [1]
+  },
+  {
+    name: "AVATAR_ID"
+    data_type: TYPE_STRING
+    dims: [1]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "VIDEO_FRAME"
+    data_type: TYPE_UINT8
+    dims: [ -1 ]     # JPEG-encoded video frame bytes
+  },
+  {
+    name: "FRAME_INDEX"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "TIMESTAMP_MS"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+sequence_batching {
+  max_sequence_idle_microseconds: 120000000  # 120 seconds
+
+  control_input [
+    {
+      name: "START"
+      control [
+        {
+          kind: CONTROL_SEQUENCE_START
+          bool_false_true: [ false, true ]
+        }
+      ]
+    },
+    {
+      name: "END"
+      control [
+        {
+          kind: CONTROL_SEQUENCE_END
+          bool_false_true: [ false, true ]
+        }
+      ]
+    }
+  ]
+}
+
+model_transaction_policy {
+  decoupled: true
+}
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+  }
+]
+
+parameters: {
+  key: "unet_model_path"
+  value: { string_value: "/local_models/musetalk_model/musetalkV15/unet.pth" }
+}
+
+parameters: {
+  key: "unet_config"
+  value: { string_value: "/local_models/musetalk_model/musetalkV15/musetalk.json" }
+}
+
+parameters: {
+  key: "vae_type"
+  value: { string_value: "sd-vae" }
+}
+
+parameters: {
+  key: "vae_model_path"
+  value: { string_value: "/local_models/musetalk_model/sd-vae" }
+}
+
+parameters: {
+  key: "whisper_dir"
+  value: { string_value: "/local_models/musetalk_model/whisper" }
+}
+
+parameters: {
+  key: "avatar_root"
+  value: { string_value: "/local_models/musetalk_model/testing_avatar_creation/v15/avatars" }
+}
+
+parameters: {
+  key: "default_avatar_id"
+  value: { string_value: "default" }
+}
+
+parameters: {
+  key: "face_parse_resnet_path"
+  value: { string_value: "/local_models/musetalk_model/face-parse-bisent/resnet18-5c106cde.pth" }
+}
+
+parameters: {
+  key: "face_parse_model_path"
+  value: { string_value: "/local_models/musetalk_model/face-parse-bisent/79999_iter.pth" }
+}
+
+parameters: {
+  key: "fps"
+  value: { string_value: "25" }
+}
+
+parameters: {
+  key: "batch_size"
+  value: { string_value: "1" }
+}
+
+parameters: {
+  key: "audio_padding_left"
+  value: { string_value: "2" }
+}
+
+parameters: {
+  key: "audio_padding_right"
+  value: { string_value: "2" }
+}

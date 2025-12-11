@@ -3,6 +3,7 @@ Triton Client for Voice Assistant Pipeline
 Handles VAD, STT, LLM, and TTS model interactions
 """
 
+import math
 import numpy as np
 import tritonclient.grpc as grpc_client
 from tritonclient.utils import InferenceServerException
@@ -51,6 +52,275 @@ class TTSMetrics:
     audio_duration_ms: float = 0
     rtf: float = 0
     words_generated: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MuseTalkParams:
+    """MuseTalk configuration parameters"""
+    avatar_id: str = "default"
+    fps: int = 25
+
+
+@dataclass
+class MuseTalkMetrics:
+    """MuseTalk performance metrics"""
+    frame_index: int = 0
+    timestamp_ms: float = 0
+    frames_generated: int = 0
+    generation_time_ms: float = 0
+
+
+class StreamingMetrics:
+    """
+    Tracks generation timing statistics for adaptive buffering.
+    
+    Maintains rolling windows of generation times and calculates
+    optimal buffer sizes based on mean + k*std to handle jitter.
+    """
+    
+    def __init__(self, window_size: int = 50, k_std: float = 1.645):
+        """
+        Args:
+            window_size: Number of samples to keep in rolling window
+            k_std: Number of standard deviations to add to mean for buffer calculation
+                  (1.645 ~= one-sided 95% confidence)
+        """
+        self.window_size = window_size
+        self.k_std = k_std
+        
+        # Rolling windows for different metrics
+        self._llm_tokens_per_sec: List[float] = []
+        self._tts_rtf: List[float] = []  # Real-time factor (< 1 means faster than real-time)
+        self._musetalk_fps: List[float] = []
+        self._network_latency_ms: List[float] = []
+        
+        # Calibration results
+        self._is_calibrated = False
+        self._calibration_llm_tokens_per_sec: float = 0
+        self._calibration_tts_rtf: float = 0
+        self._calibration_musetalk_fps: float = 0
+        
+        # Manual override for buffer size (ms)
+        self._manual_buffer_ms: Optional[float] = None
+        
+        # Lock for thread safety
+        self._lock = threading.Lock()
+    
+    def _add_sample(self, samples: List[float], value: float):
+        """Add a sample to a rolling window"""
+        samples.append(value)
+        if len(samples) > self.window_size:
+            samples.pop(0)
+    
+    def _calc_stats(self, samples: List[float]) -> Tuple[float, float]:
+        """Calculate mean and std of samples"""
+        if not samples:
+            return 0.0, 0.0
+        mean = sum(samples) / len(samples)
+        if len(samples) < 2:
+            return mean, 0.0
+        variance = sum((x - mean) ** 2 for x in samples) / (len(samples) - 1)
+        std = variance ** 0.5
+        return mean, std
+    
+    def record_llm_generation(self, tokens: int, duration_sec: float):
+        """Record LLM token generation timing"""
+        if duration_sec > 0 and tokens > 0:
+            tokens_per_sec = tokens / duration_sec
+            with self._lock:
+                self._add_sample(self._llm_tokens_per_sec, tokens_per_sec)
+    
+    def record_tts_generation(self, audio_duration_ms: float, generation_time_ms: float):
+        """Record TTS generation timing"""
+        if generation_time_ms > 0 and audio_duration_ms > 0:
+            rtf = generation_time_ms / audio_duration_ms
+            with self._lock:
+                self._add_sample(self._tts_rtf, rtf)
+    
+    def record_musetalk_generation(self, frames: int, duration_sec: float):
+        """Record MuseTalk frame generation timing"""
+        if duration_sec > 0 and frames > 0:
+            fps = frames / duration_sec
+            with self._lock:
+                self._add_sample(self._musetalk_fps, fps)
+    
+    def record_network_latency(self, latency_ms: float):
+        """Record network round-trip latency"""
+        if latency_ms > 0:
+            with self._lock:
+                self._add_sample(self._network_latency_ms, latency_ms)
+
+    def set_manual_buffer_ms(self, buffer_ms: Optional[float]):
+        """Set or clear a manual buffer override (ms)"""
+        with self._lock:
+            if buffer_ms is None:
+                self._manual_buffer_ms = None
+                logger.info("Cleared manual buffer override; using adaptive buffer.")
+            else:
+                self._manual_buffer_ms = max(0.0, float(buffer_ms))
+                logger.info(f"Manual buffer override set to {self._manual_buffer_ms:.1f} ms")
+    
+    def get_llm_stats(self) -> Tuple[float, float]:
+        """Get LLM tokens/sec mean and std"""
+        with self._lock:
+            return self._calc_stats(self._llm_tokens_per_sec)
+    
+    def get_tts_stats(self) -> Tuple[float, float]:
+        """Get TTS RTF mean and std"""
+        with self._lock:
+            return self._calc_stats(self._tts_rtf)
+    
+    def get_musetalk_stats(self) -> Tuple[float, float]:
+        """Get MuseTalk FPS mean and std"""
+        with self._lock:
+            return self._calc_stats(self._musetalk_fps)
+    
+    def get_network_stats(self) -> Tuple[float, float]:
+        """Get network latency mean and std in ms"""
+        with self._lock:
+            return self._calc_stats(self._network_latency_ms)
+
+    def _compute_buffer_components(self) -> dict:
+        """
+        Compute buffer size and contributing components using 95% (one-sided) confidence.
+        Returns a dict so we can log the breakdown without recalculating.
+        """
+        # Expectation is 40ms frames (25 FPS) and 80ms TTS/MuseTalk processing chunks
+        target_frame_ms = 40.0
+        tts_chunk_ms = 80.0
+
+        tts_mean, tts_std = self._calc_stats(self._tts_rtf)
+        net_mean, net_std = self._calc_stats(self._network_latency_ms)
+        musetalk_mean, musetalk_std = self._calc_stats(self._musetalk_fps)
+
+        # Fallbacks if we have no data yet
+        if musetalk_mean == 0:
+            musetalk_mean = 25.0  # default target FPS
+        if musetalk_std == 0 and musetalk_mean > 0:
+            musetalk_std = 1.0  # small jitter baseline
+
+        worst_case_rtf = max(0.0, tts_mean + self.k_std * tts_std) if tts_mean > 0 else 0.0
+        tts_overage_ms = 0.0
+        if worst_case_rtf > 0:
+            tts_overage_ms = max(0.0, (tts_chunk_ms * worst_case_rtf) - tts_chunk_ms)
+
+        # Lower FPS is worse, so subtract std
+        worst_case_fps = max(0.0, musetalk_mean - self.k_std * musetalk_std) if musetalk_mean > 0 else 0.0
+        musetalk_overage_ms = 0.0
+        if worst_case_fps > 0:
+            musetalk_frame_ms = 1000.0 / worst_case_fps
+            musetalk_overage_ms = max(0.0, (musetalk_frame_ms - target_frame_ms) * 2)  # 2 frames per 80ms audio
+
+        # Always keep a modest baseline for network/scheduling jitter even if we lack stats
+        network_buffer_ms = max(0.0, net_mean + self.k_std * net_std) if net_mean > 0 else 40.0
+
+        auto_buffer_ms = max(0.0, tts_overage_ms + musetalk_overage_ms + network_buffer_ms)
+
+        buffer_ms = self._manual_buffer_ms if self._manual_buffer_ms is not None else auto_buffer_ms
+        buffer_source = "manual" if self._manual_buffer_ms is not None else "adaptive"
+
+        return {
+            "buffer_ms": buffer_ms,
+            "buffer_source": buffer_source,
+            "tts_overage_ms": tts_overage_ms,
+            "worst_case_rtf": worst_case_rtf,
+            "musetalk_overage_ms": musetalk_overage_ms,
+            "worst_case_fps": worst_case_fps,
+            "network_buffer_ms": network_buffer_ms,
+            "tts_mean": tts_mean,
+            "tts_std": tts_std,
+            "musetalk_mean": musetalk_mean,
+            "musetalk_std": musetalk_std,
+            "network_mean": net_mean,
+            "network_std": net_std,
+            "manual_buffer_ms": self._manual_buffer_ms,
+        }
+
+    def calculate_optimal_buffer_ms(self) -> float:
+        """Calculate optimal buffer size in milliseconds."""
+        with self._lock:
+            components = self._compute_buffer_components()
+            if components["buffer_ms"] <= 0:
+                logger.warning(
+                    "Adaptive buffer computed as 0ms; check calibration data. "
+                    f"Components: {components}"
+                )
+            return components["buffer_ms"]
+    
+    def calculate_optimal_frame_buffer(self) -> int:
+        """
+        Calculate optimal number of video frames to buffer.
+        
+        Returns:
+            Number of frames to buffer before starting playback
+        """
+        buffer_ms = self.calculate_optimal_buffer_ms()
+        return max(0, int(math.ceil(buffer_ms / 40.0)))  # 40ms per frame @25fps
+    
+    def set_calibration_results(
+        self,
+        llm_tokens_per_sec: float,
+        tts_rtf: float,
+        musetalk_fps: float,
+        llm_samples: Optional[List[float]] = None,
+        tts_samples: Optional[List[float]] = None,
+        musetalk_samples: Optional[List[float]] = None,
+    ):
+        """Set calibration results from initial measurement and seed rolling windows."""
+        with self._lock:
+            if llm_samples is None and llm_tokens_per_sec > 0:
+                llm_samples = [llm_tokens_per_sec]
+            if tts_samples is None and tts_rtf > 0:
+                tts_samples = [tts_rtf]
+            if musetalk_samples is None and musetalk_fps > 0:
+                musetalk_samples = [musetalk_fps]
+
+            if llm_samples:
+                self._llm_tokens_per_sec = llm_samples[-self.window_size:]
+                self._calibration_llm_tokens_per_sec = sum(llm_samples) / len(llm_samples)
+            if tts_samples:
+                self._tts_rtf = tts_samples[-self.window_size:]
+                self._calibration_tts_rtf = sum(tts_samples) / len(tts_samples)
+            if musetalk_samples:
+                self._musetalk_fps = musetalk_samples[-self.window_size:]
+                self._calibration_musetalk_fps = sum(musetalk_samples) / len(musetalk_samples)
+
+            if llm_samples or tts_samples or musetalk_samples:
+                self._is_calibrated = True
+    
+    @property
+    def is_calibrated(self) -> bool:
+        return self._is_calibrated
+    
+    def get_buffer_config(self) -> dict:
+        """Get current buffer configuration as a dictionary"""
+        with self._lock:
+            components = self._compute_buffer_components()
+            llm_mean, llm_std = self._calc_stats(self._llm_tokens_per_sec)
+            frame_buffer = max(0, int(math.ceil(components["buffer_ms"] / 40.0)))
+            calibrated = self._is_calibrated
+        
+        return {
+            "buffer_ms": round(components["buffer_ms"], 1),
+            "frame_buffer": frame_buffer,
+            "buffer_source": components["buffer_source"],
+            "manual_buffer_ms": components["manual_buffer_ms"],
+            "tts_rtf_mean": round(components["tts_mean"], 3),
+            "tts_rtf_std": round(components["tts_std"], 3),
+            "worst_case_rtf": round(components["worst_case_rtf"], 3),
+            "musetalk_fps_mean": round(components["musetalk_mean"], 1),
+            "musetalk_fps_std": round(components["musetalk_std"], 1),
+            "worst_case_fps": round(components["worst_case_fps"], 1) if components["worst_case_fps"] else 0.0,
+            "network_latency_mean_ms": round(components["network_mean"], 1),
+            "network_latency_std_ms": round(components["network_std"], 1),
+            "network_buffer_ms": round(components["network_buffer_ms"], 1),
+            "tts_overage_ms": round(components["tts_overage_ms"], 1),
+            "musetalk_overage_ms": round(components["musetalk_overage_ms"], 1),
+            "llm_tokens_per_sec_mean": round(llm_mean, 2),
+            "llm_tokens_per_sec_std": round(llm_std, 2),
+            "k_std": self.k_std,
+            "is_calibrated": calibrated,
+        }
 
 
 class TTSSession:
@@ -291,6 +561,12 @@ class TTSSession:
                         return
                 
                 word_audio_index += 1
+                if metrics.audio_duration_ms > 0:
+                    logger.info(
+                        f"TTS chunk {i} ({expected_word}): "
+                        f"{metrics.audio_duration_ms:.1f}ms audio in "
+                        f"{metrics.generation_time_ms:.1f}ms (RTF {metrics.rtf:.3f})"
+                    )
                 
         except Exception as e:
             logger.error(f"TTS session {self.session_id} generate error: {e}")
@@ -385,6 +661,337 @@ class TTSSession:
         return False
 
 
+class MuseTalkSession:
+    """
+    Manages a persistent MuseTalk session with Triton.
+    
+    Similar to TTSSession, maintains a gRPC stream for the entire
+    sequence lifecycle (sequence_start -> audio chunks -> sequence_end).
+    """
+    
+    def __init__(self, triton_url: str, session_id: int, musetalk_params: MuseTalkParams):
+        self.triton_url = triton_url
+        self.session_id = session_id
+        self.musetalk_params = musetalk_params
+        
+        self._client: Optional[grpc_client.InferenceServerClient] = None
+        self._result_queue: Optional[queue.Queue] = None
+        self._is_initialized = False
+        self._is_closed = False
+        self._lock = threading.Lock()
+        self._frames_received = 0
+        self._first_frame: Optional[bytes] = None  # Store first/idle frame
+        
+    def _callback(self, result, error):
+        """Callback for stream responses"""
+        if self._result_queue is not None:
+            if error:
+                self._result_queue.put(("error", error))
+            else:
+                self._result_queue.put(("result", result))
+    
+    def initialize(self, timeout: float = 60.0) -> bool:
+        """
+        Initialize the MuseTalk session and load avatar.
+        
+        Returns:
+            True if initialization was successful
+        """
+        with self._lock:
+            if self._is_closed:
+                logger.warning(f"Cannot initialize closed MuseTalk session {self.session_id}")
+                return False
+            
+            if self._is_initialized:
+                logger.info(f"MuseTalk session {self.session_id} already initialized")
+                return True
+            
+            try:
+                logger.info(f"MuseTalk session {self.session_id} initializing with avatar '{self.musetalk_params.avatar_id}'...")
+                
+                # Create client and start stream
+                self._result_queue = queue.Queue()
+                self._client = grpc_client.InferenceServerClient(url=self.triton_url)
+                self._client.start_stream(callback=self._callback)
+                
+                # Send init request
+                avatar_id_bytes = np.array([self.musetalk_params.avatar_id.encode("utf-8")], dtype=object)
+                
+                inputs = [
+                    grpc_client.InferInput("START", [1], "BOOL"),
+                    grpc_client.InferInput("CORRID", [1], "INT64"),
+                    grpc_client.InferInput("AVATAR_ID", [1], "BYTES"),
+                    grpc_client.InferInput("AUDIO_CHUNK", [0], "FP32"),  # Empty audio for init
+                ]
+                inputs[0].set_data_from_numpy(np.array([True], dtype=bool))
+                inputs[1].set_data_from_numpy(np.array([self.session_id], dtype=np.int64))
+                inputs[2].set_data_from_numpy(avatar_id_bytes)
+                inputs[3].set_data_from_numpy(np.array([], dtype=np.float32))
+                
+                outputs = [
+                    grpc_client.InferRequestedOutput("VIDEO_FRAME"),
+                    grpc_client.InferRequestedOutput("FRAME_INDEX"),
+                    grpc_client.InferRequestedOutput("TIMESTAMP_MS"),
+                ]
+                
+                self._client.async_stream_infer(
+                    model_name="musetalk",
+                    inputs=inputs,
+                    outputs=outputs,
+                    sequence_id=self.session_id,
+                    sequence_start=True,
+                    sequence_end=False,
+                    enable_empty_final_response=True,
+                )
+                
+                # Wait for response (should get initial/idle frame)
+                try:
+                    msg_type, data = self._result_queue.get(timeout=timeout)
+                    
+                    if msg_type == "error":
+                        logger.error(f"MuseTalk session {self.session_id} init error: {data}")
+                        self._cleanup_stream()
+                        return False
+                    
+                    # Try to get the initial frame (sent as final response on START)
+                    try:
+                        frame_data = data.as_numpy("VIDEO_FRAME")
+                        if frame_data is not None and len(frame_data) > 0:
+                            self._first_frame = frame_data.tobytes()
+                            logger.info(f"Received initial frame ({len(self._first_frame)} bytes)")
+                    except Exception as e:
+                        logger.debug(f"No initial frame: {e}")
+                    
+                    self._is_initialized = True
+                    logger.info(f"MuseTalk session {self.session_id} initialized successfully")
+                    return True
+                    
+                except queue.Empty:
+                    logger.warning(f"Timeout waiting for MuseTalk init response for session {self.session_id}")
+                    self._cleanup_stream()
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"MuseTalk session {self.session_id} init failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self._cleanup_stream()
+                return False
+    
+    def send_audio_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        on_frame: Optional[Callable[[bytes, int, float, MuseTalkMetrics], None]] = None,
+    ) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
+        """
+        Send an audio chunk and receive any generated video frames.
+        
+        Args:
+            audio_chunk: Audio samples at 24kHz as float32
+            on_frame: Optional callback for each frame
+            
+        Yields:
+            Tuple of (frame_jpeg_bytes, frame_index, timestamp_ms, metrics)
+        """
+        with self._lock:
+            if self._is_closed:
+                logger.error(f"Cannot send audio on closed MuseTalk session {self.session_id}")
+                return
+            
+            if not self._is_initialized:
+                logger.error(f"MuseTalk session {self.session_id} not initialized")
+                return
+        
+        metrics = MuseTalkMetrics()
+        start_time = time.time()
+        
+        try:
+            audio_chunk = np.asarray(audio_chunk, dtype=np.float32)
+            
+            inputs = [
+                grpc_client.InferInput("AUDIO_CHUNK", list(audio_chunk.shape), "FP32"),
+                grpc_client.InferInput("CORRID", [1], "INT64"),
+            ]
+            inputs[0].set_data_from_numpy(audio_chunk)
+            inputs[1].set_data_from_numpy(np.array([self.session_id], dtype=np.int64))
+            
+            outputs = [
+                grpc_client.InferRequestedOutput("VIDEO_FRAME"),
+                grpc_client.InferRequestedOutput("FRAME_INDEX"),
+                grpc_client.InferRequestedOutput("TIMESTAMP_MS"),
+            ]
+            
+            self._client.async_stream_infer(
+                model_name="musetalk",
+                inputs=inputs,
+                outputs=outputs,
+                sequence_id=self.session_id,
+                sequence_start=False,
+                sequence_end=False,
+                enable_empty_final_response=True,
+            )
+            
+            # Collect frames
+            while True:
+                try:
+                    msg_type, data = self._result_queue.get(timeout=60.0)
+                    
+                    if msg_type == "error":
+                        logger.error(f"MuseTalk Error: {data}")
+                        return
+                    
+                    response = data.get_response()
+                    
+                    # Check for final response
+                    if response.parameters.get("triton_final_response").bool_param:
+                        break
+                    
+                    frame_data = data.as_numpy("VIDEO_FRAME")
+                    frame_index = int(data.as_numpy("FRAME_INDEX")[0])
+                    timestamp_ms = float(data.as_numpy("TIMESTAMP_MS")[0])
+                    
+                    if len(frame_data) > 0:
+                        self._frames_received += 1
+                        frame_bytes = frame_data.tobytes()
+                        
+                        # Update metrics
+                        elapsed = time.time() - start_time
+                        metrics.frame_index = frame_index
+                        metrics.timestamp_ms = timestamp_ms
+                        metrics.frames_generated = self._frames_received
+                        metrics.generation_time_ms = elapsed * 1000
+                        
+                        if on_frame:
+                            on_frame(frame_bytes, frame_index, timestamp_ms, metrics)
+                        
+                        yield frame_bytes, frame_index, timestamp_ms, metrics
+                        
+                except queue.Empty:
+                    logger.warning("Timeout waiting for MuseTalk frame")
+                    return
+                    
+        except Exception as e:
+            logger.error(f"MuseTalk session {self.session_id} audio processing error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def close(self, timeout: float = 10.0) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
+        """
+        Close the MuseTalk session, receiving any final frames.
+        
+        Yields:
+            Any remaining frames
+        """
+        with self._lock:
+            if self._is_closed:
+                return
+            
+            if self._client is None:
+                self._is_closed = True
+                return
+            
+            try:
+                logger.info(f"Closing MuseTalk session {self.session_id}...")
+                
+                # Send end request
+                inputs = [
+                    grpc_client.InferInput("END", [1], "BOOL"),
+                    grpc_client.InferInput("CORRID", [1], "INT64"),
+                    grpc_client.InferInput("AUDIO_CHUNK", [0], "FP32"),
+                ]
+                inputs[0].set_data_from_numpy(np.array([True], dtype=bool))
+                inputs[1].set_data_from_numpy(np.array([self.session_id], dtype=np.int64))
+                inputs[2].set_data_from_numpy(np.array([], dtype=np.float32))
+                
+                outputs = [
+                    grpc_client.InferRequestedOutput("VIDEO_FRAME"),
+                    grpc_client.InferRequestedOutput("FRAME_INDEX"),
+                    grpc_client.InferRequestedOutput("TIMESTAMP_MS"),
+                ]
+                
+                self._client.async_stream_infer(
+                    model_name="musetalk",
+                    inputs=inputs,
+                    outputs=outputs,
+                    sequence_id=self.session_id,
+                    sequence_start=False,
+                    sequence_end=True,
+                    enable_empty_final_response=True,
+                )
+                
+                metrics = MuseTalkMetrics()
+                start_time = time.time()
+                
+                # Collect any remaining frames
+                while True:
+                    try:
+                        msg_type, data = self._result_queue.get(timeout=timeout)
+                        
+                        if msg_type == "error":
+                            logger.warning(f"MuseTalk session {self.session_id} end error: {data}")
+                            break
+                        
+                        response = data.get_response()
+                        
+                        if response.parameters.get("triton_final_response").bool_param:
+                            break
+                        
+                        frame_data = data.as_numpy("VIDEO_FRAME")
+                        frame_index = int(data.as_numpy("FRAME_INDEX")[0])
+                        timestamp_ms = float(data.as_numpy("TIMESTAMP_MS")[0])
+                        
+                        if len(frame_data) > 0:
+                            self._frames_received += 1
+                            frame_bytes = frame_data.tobytes()
+                            
+                            elapsed = time.time() - start_time
+                            metrics.frame_index = frame_index
+                            metrics.timestamp_ms = timestamp_ms
+                            metrics.frames_generated = self._frames_received
+                            metrics.generation_time_ms = elapsed * 1000
+                            
+                            yield frame_bytes, frame_index, timestamp_ms, metrics
+                            
+                    except queue.Empty:
+                        logger.warning("Timeout waiting for MuseTalk end response")
+                        break
+                
+                logger.info(f"MuseTalk session {self.session_id} ended, {self._frames_received} total frames")
+                
+            except Exception as e:
+                logger.error(f"Error ending MuseTalk session {self.session_id}: {e}")
+            finally:
+                self._cleanup_stream()
+                self._is_closed = True
+                self._is_initialized = False
+    
+    def _cleanup_stream(self):
+        """Clean up the gRPC stream"""
+        if self._client is not None:
+            try:
+                self._client.stop_stream()
+            except Exception as e:
+                logger.debug(f"Error stopping stream: {e}")
+            self._client = None
+        self._result_queue = None
+    
+    @property
+    def is_initialized(self) -> bool:
+        return self._is_initialized
+    
+    @property
+    def is_closed(self) -> bool:
+        return self._is_closed
+    
+    @property
+    def first_frame(self) -> Optional[bytes]:
+        return self._first_frame
+    
+    @property
+    def frames_received(self) -> int:
+        return self._frames_received
+
+
 class TritonVoiceClient:
     """Client for the Voice Assistant Triton pipeline"""
     
@@ -393,12 +1000,14 @@ class TritonVoiceClient:
         triton_url: str = "localhost:8001",
         vad_params: Optional[VADParams] = None,
         llm_params: Optional[LLMParams] = None,
-        tts_params: Optional[TTSParams] = None
+        tts_params: Optional[TTSParams] = None,
+        musetalk_params: Optional[MuseTalkParams] = None,
     ):
         self.triton_url = triton_url
         self.vad_params = vad_params or VADParams()
         self.llm_params = llm_params or LLMParams()
         self.tts_params = tts_params or TTSParams()
+        self.musetalk_params = musetalk_params or MuseTalkParams()
         
         # Create Triton client
         self.client = grpc_client.InferenceServerClient(url=triton_url)
@@ -416,6 +1025,14 @@ class TritonVoiceClient:
         self._tts_session_lock = threading.Lock()
         self._active_tts_sessions: dict[int, TTSSession] = {}
         
+        # MuseTalk session management
+        self._musetalk_session_counter = 1000
+        self._musetalk_session_lock = threading.Lock()
+        self._active_musetalk_sessions: dict[int, MuseTalkSession] = {}
+        
+        # Streaming metrics for adaptive buffering
+        self.streaming_metrics = StreamingMetrics()
+        
         logger.info(f"TritonVoiceClient initialized with URL: {triton_url}")
     
     def check_health(self) -> bool:
@@ -428,7 +1045,7 @@ class TritonVoiceClient:
     
     def check_models_ready(self) -> dict:
         """Check if all models are ready"""
-        models = ["vad", "stt", "llm", "tts"]
+        models = ["vad", "stt", "llm", "tts", "musetalk"]
         status = {}
         for model in models:
             try:
@@ -437,7 +1054,174 @@ class TritonVoiceClient:
                 logger.error(f"Model {model} check failed: {e}")
                 status[model] = False
         return status
+
+    # =========== Calibration Methods ===========
     
+    def calibrate_generation_speed(
+        self,
+        test_prompt: str = "გამარჯობა, როგორ ხარ?",
+        tts_session_id: Optional[int] = None,
+        musetalk_session_id: Optional[int] = None,
+        num_samples: int = 3,
+    ) -> dict:
+        """
+        Calibrate generation speeds for adaptive buffering.
+        
+        Measures the actual generation speed of LLM, TTS, and MuseTalk
+        to calculate optimal buffer sizes. Excludes initialization time.
+        
+        Args:
+            test_prompt: Short test prompt for LLM
+            tts_session_id: TTS session to use (must be already initialized)
+            musetalk_session_id: MuseTalk session to use (must be already initialized)
+            num_samples: Number of samples to collect for each measurement
+            
+        Returns:
+            Dictionary with calibration results and recommended buffer config
+        """
+        logger.info(f"Starting generation speed calibration (samples={num_samples})...")
+        
+        results = {
+            "llm_tokens_per_sec": 0.0,
+            "llm_tokens_per_sec_std": 0.0,
+            "tts_rtf": 0.0,
+            "tts_rtf_std": 0.0,
+            "musetalk_fps": 0.0,
+            "musetalk_fps_std": 0.0,
+            "samples_collected": 0,
+            "buffer_config": {},
+        }
+        
+        llm_samples: List[float] = []
+        tts_samples: List[float] = []
+        musetalk_samples: List[float] = []
+        
+        def _mean_std(samples: List[float]) -> Tuple[float, float]:
+            if not samples:
+                return 0.0, 0.0
+            mean = sum(samples) / len(samples)
+            if len(samples) < 2:
+                return mean, 0.0
+            variance = sum((x - mean) ** 2 for x in samples) / (len(samples) - 1)
+            return mean, variance ** 0.5
+        
+        try:
+            # Calibrate LLM speed
+            logger.info(f"Calibrating LLM generation speed with prompt '{test_prompt}'")
+            for i in range(num_samples):
+                token_count = 0
+                start_time = None
+                
+                for token in self.generate_llm_stream(test_prompt):
+                    if start_time is None:
+                        # Skip initialization time - start timing from first token
+                        start_time = time.time()
+                    token_count += 1
+                
+                if start_time and token_count > 1:
+                    duration = time.time() - start_time
+                    tokens_per_sec = (token_count - 1) / duration if duration > 0 else 0
+                    if tokens_per_sec > 0:
+                        llm_samples.append(tokens_per_sec)
+                        logger.info(
+                            f"[Calibration] LLM sample {i+1}: {token_count} tokens in {duration*1000:.0f}ms "
+                            f"({tokens_per_sec:.1f} tok/s)"
+                        )
+            
+            results["llm_tokens_per_sec"], results["llm_tokens_per_sec_std"] = _mean_std(llm_samples)
+            
+            # Calibrate TTS speed (if session provided)
+            if tts_session_id is not None:
+                logger.info("Calibrating TTS generation speed...")
+                test_texts = ["გამარჯობა", "როგორ ხარ", "კარგად ვარ"]
+                
+                for i, text in enumerate(test_texts[:num_samples]):
+                    final_metrics: Optional[TTSMetrics] = None
+                    for _, _, metrics in self.generate_tts_stream([text], session_id=tts_session_id):
+                        if metrics.audio_duration_ms > 0 and metrics.generation_time_ms > 0:
+                            final_metrics = metrics
+                    
+                    if final_metrics and final_metrics.audio_duration_ms > 0:
+                        rtf = final_metrics.generation_time_ms / final_metrics.audio_duration_ms
+                        tts_samples.append(rtf)
+                        logger.info(
+                            f"[Calibration] TTS sample {i+1} '{text}': "
+                            f"{final_metrics.audio_duration_ms:.1f}ms audio in "
+                            f"{final_metrics.generation_time_ms:.1f}ms (RTF {rtf:.3f})"
+                        )
+            
+            results["tts_rtf"], results["tts_rtf_std"] = _mean_std(tts_samples)
+            
+            # Calibrate MuseTalk speed (if session provided)
+            if musetalk_session_id is not None:
+                logger.info("Calibrating MuseTalk generation speed...")
+                # Generate some test audio chunks
+                chunk_size = 1920  # 80ms at 24kHz
+                test_audio = np.zeros(chunk_size, dtype=np.float32)
+                
+                for i in range(num_samples):
+                    start_time = time.time()
+                    frame_count = 0
+                    
+                    for frame_bytes, frame_idx, timestamp_ms, metrics in self.send_musetalk_audio(
+                        test_audio, session_id=musetalk_session_id
+                    ):
+                        frame_count += 1
+                    
+                    duration = time.time() - start_time
+                    if duration > 0 and frame_count > 0:
+                        fps = frame_count / duration
+                        musetalk_samples.append(fps)
+                        logger.info(
+                            f"[Calibration] MuseTalk sample {i+1}: "
+                            f"{frame_count} frames in {duration*1000:.0f}ms ({fps:.1f} FPS)"
+                        )
+            
+            results["musetalk_fps"], results["musetalk_fps_std"] = _mean_std(musetalk_samples)
+            
+            # Update streaming metrics with calibration results
+            results["samples_collected"] = len(llm_samples) + len(tts_samples) + len(musetalk_samples)
+            
+            self.streaming_metrics.set_calibration_results(
+                llm_tokens_per_sec=results["llm_tokens_per_sec"],
+                tts_rtf=results["tts_rtf"],
+                musetalk_fps=results["musetalk_fps"] if results["musetalk_fps"] > 0 else 25.0,
+                llm_samples=llm_samples,
+                tts_samples=tts_samples,
+                musetalk_samples=musetalk_samples if musetalk_samples else [25.0],
+            )
+            
+            results["buffer_config"] = self.streaming_metrics.get_buffer_config()
+            logger.info(
+                "Calibration complete. "
+                f"RTF {results['tts_rtf']:.3f}±{results['tts_rtf_std']:.3f}, "
+                f"MuseTalk {results['musetalk_fps']:.1f}±{results['musetalk_fps_std']:.1f} FPS, "
+                f"LLM {results['llm_tokens_per_sec']:.1f} tok/s"
+            )
+            logger.info(
+                "Buffer breakdown (95%%): "
+                f"buffer {results['buffer_config']['buffer_ms']:.0f}ms "
+                f"({results['buffer_config'].get('buffer_source','adaptive')}) | "
+                f"TTS overage {results['buffer_config'].get('tts_overage_ms', 0):.0f}ms | "
+                f"MuseTalk overage {results['buffer_config'].get('musetalk_overage_ms', 0):.0f}ms | "
+                f"network {results['buffer_config'].get('network_buffer_ms', 0):.0f}ms"
+            )
+            
+        except Exception as e:
+            logger.error(f"Calibration error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        return results
+    
+    def get_buffer_config(self) -> dict:
+        """Get current adaptive buffer configuration"""
+        return self.streaming_metrics.get_buffer_config()
+    
+    def set_manual_buffer_ms(self, buffer_ms: Optional[float]):
+        """Manually override adaptive buffer size (ms). Pass None to return to adaptive."""
+        self.streaming_metrics.set_manual_buffer_ms(buffer_ms)
+
     # =========== VAD Methods ===========
     
     def process_vad_chunk(self, audio_chunk: np.ndarray) -> Tuple[bool, float, bool]:
@@ -545,28 +1329,32 @@ class TritonVoiceClient:
     def generate_llm_stream(self, prompt: str, on_token: Optional[Callable[[str], None]] = None) -> Generator[str, None, None]:
         """Stream LLM generation token by token"""
         prompt_bytes = np.array([prompt.encode("utf-8")], dtype=object)
-        
+
         inputs = [
             grpc_client.InferInput("PROMPT", [1], "BYTES"),
             grpc_client.InferInput("MAX_NEW_TOKENS", [1], "INT32"),
             grpc_client.InferInput("TEMPERATURE", [1], "FP32"),
             grpc_client.InferInput("TOP_P", [1], "FP32"),
         ]
-        
+
         inputs[0].set_data_from_numpy(prompt_bytes)
         inputs[1].set_data_from_numpy(np.array([self.llm_params.max_new_tokens], dtype=np.int32))
         inputs[2].set_data_from_numpy(np.array([self.llm_params.temperature], dtype=np.float32))
         inputs[3].set_data_from_numpy(np.array([self.llm_params.top_p], dtype=np.float32))
-        
+
         outputs = [
             grpc_client.InferRequestedOutput("TEXT_CHUNK"),
             grpc_client.InferRequestedOutput("FINISHED"),
         ]
-        
+
         full_response = ""
         result_queue = queue.Queue()
         stream_done = threading.Event()
         
+        # Track generation timing for metrics (excluding initialization)
+        first_token_time = None
+        token_count = 0
+
         def callback(result, error):
             if error:
                 result_queue.put(("error", str(error)))
@@ -575,21 +1363,21 @@ class TritonVoiceClient:
                 result_queue.put(("result", result))
             else:
                 stream_done.set()
-        
+
         stream_client = grpc_client.InferenceServerClient(url=self.triton_url)
         stream_client.start_stream(callback=callback)
-        
+
         try:
             stream_client.async_stream_infer(
                 model_name="llm",
                 inputs=inputs,
                 outputs=outputs,
             )
-            
+
             while not stream_done.is_set():
                 try:
                     msg_type, data = result_queue.get(timeout=1.0)
-                    
+
                     if msg_type == "error":
                         logger.error(f"LLM stream error: {data}")
                         break
@@ -598,15 +1386,20 @@ class TritonVoiceClient:
                             chunk = data.as_numpy("TEXT_CHUNK")[0]
                             if isinstance(chunk, bytes):
                                 chunk = chunk.decode("utf-8")
-                            
+
                             finished = bool(data.as_numpy("FINISHED")[0])
-                            
+
                             if chunk:
+                                # Start timing from first token (excludes initialization)
+                                if first_token_time is None:
+                                    first_token_time = time.time()
+                                token_count += 1
+                                
                                 full_response += chunk
                                 if on_token:
                                     on_token(chunk)
                                 yield chunk
-                            
+
                             if finished:
                                 break
                         except Exception as e:
@@ -616,7 +1409,17 @@ class TritonVoiceClient:
                     continue
         finally:
             stream_client.stop_stream()
-        
+            
+            # Record LLM metrics for adaptive buffering (excluding first token as it includes init time)
+            if first_token_time is not None and token_count > 1:
+                duration = time.time() - first_token_time
+                self.streaming_metrics.record_llm_generation(token_count - 1, duration)
+                tokens_per_sec = (token_count - 1) / duration if duration > 0 else 0
+                logger.info(
+                    f"LLM stream completed: {token_count} tokens in {duration*1000:.0f}ms "
+                    f"({tokens_per_sec:.1f} tok/s)"
+                )
+
         logger.info(f"LLM generation complete: {len(full_response)} chars")
     
     # =========== TTS Methods ===========
@@ -787,14 +1590,23 @@ class TritonVoiceClient:
         logger.info(f"Split into {len(text)} chunks: {text}")
         logger.info(f"=" * 60)
         
-        yield from session.generate(
+        # Wrap generator to record metrics
+        for audio, word, metrics in session.generate(
             text_chunks=text,
             temperature=temperature,
             top_p=top_p,
             decoder_temperature=decoder_temperature,
             decoder_top_p=decoder_top_p,
             on_audio=on_audio,
-        )
+        ):
+            # Record TTS metrics for adaptive buffering
+            if metrics.audio_duration_ms > 0 and metrics.generation_time_ms > 0:
+                self.streaming_metrics.record_tts_generation(
+                    audio_duration_ms=metrics.audio_duration_ms,
+                    generation_time_ms=metrics.generation_time_ms
+                )
+            
+            yield audio, word, metrics
         
         logger.info(f"=" * 60)
         logger.info(f"TTS SESSION {session_id} COMPLETE")
@@ -831,6 +1643,162 @@ class TritonVoiceClient:
             return np.concatenate(audio_chunks), final_metrics
         
         return np.array([], dtype=np.float32), final_metrics
+    
+    # =========== MuseTalk Methods ===========
+    
+    def _get_next_musetalk_session_id(self) -> int:
+        """Get a unique session ID for MuseTalk"""
+        with self._musetalk_session_lock:
+            self._musetalk_session_counter += 1
+            return self._musetalk_session_counter
+    
+    def create_musetalk_session(self, avatar_id: Optional[str] = None) -> MuseTalkSession:
+        """
+        Create a new MuseTalk session.
+        
+        Args:
+            avatar_id: Optional avatar ID, uses default if not provided
+            
+        Returns:
+            A new MuseTalkSession instance (not yet initialized)
+        """
+        session_id = self._get_next_musetalk_session_id()
+        params = MuseTalkParams(
+            avatar_id=avatar_id or self.musetalk_params.avatar_id,
+            fps=self.musetalk_params.fps
+        )
+        session = MuseTalkSession(self.triton_url, session_id, params)
+        
+        with self._musetalk_session_lock:
+            self._active_musetalk_sessions[session_id] = session
+        
+        return session
+    
+    def get_musetalk_session(self, session_id: int) -> Optional[MuseTalkSession]:
+        """Get an existing MuseTalk session by ID"""
+        with self._musetalk_session_lock:
+            return self._active_musetalk_sessions.get(session_id)
+    
+    def close_musetalk_session(self, session_id: int) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
+        """
+        Close and cleanup a MuseTalk session.
+        
+        Args:
+            session_id: The session ID to close
+            
+        Yields:
+            Any remaining frames from the session
+        """
+        with self._musetalk_session_lock:
+            session = self._active_musetalk_sessions.pop(session_id, None)
+        
+        if session is not None:
+            yield from session.close()
+    
+    def init_musetalk_session(self, session_id: int, avatar_id: Optional[str] = None) -> bool:
+        """
+        Initialize a MuseTalk session with avatar.
+        
+        Args:
+            session_id: Unique session identifier
+            avatar_id: Avatar ID to load (uses default if not provided)
+            
+        Returns:
+            True if session initialized successfully
+        """
+        # Check for existing session and close it
+        existing = self.get_musetalk_session(session_id)
+        if existing is not None:
+            logger.info(f"Closing existing MuseTalk session {session_id} before reinitializing")
+            list(existing.close())  # Consume generator
+            with self._musetalk_session_lock:
+                self._active_musetalk_sessions.pop(session_id, None)
+        
+        # Create new session
+        params = MuseTalkParams(
+            avatar_id=avatar_id or self.musetalk_params.avatar_id,
+            fps=self.musetalk_params.fps
+        )
+        session = MuseTalkSession(self.triton_url, session_id, params)
+        success = session.initialize()
+        
+        if success:
+            with self._musetalk_session_lock:
+                self._active_musetalk_sessions[session_id] = session
+        
+        return success
+    
+    def end_musetalk_session(self, session_id: int) -> List[Tuple[bytes, int, float, MuseTalkMetrics]]:
+        """
+        End a MuseTalk session and get remaining frames.
+        
+        Args:
+            session_id: The session ID to end
+            
+        Returns:
+            List of remaining frames
+        """
+        return list(self.close_musetalk_session(session_id))
+    
+    def send_musetalk_audio(
+        self,
+        audio_chunk: np.ndarray,
+        session_id: int,
+        on_frame: Optional[Callable[[bytes, int, float, MuseTalkMetrics], None]] = None,
+    ) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
+        """
+        Send audio chunk to MuseTalk session and receive video frames.
+        
+        Args:
+            audio_chunk: Audio samples at 24kHz as float32
+            session_id: Session ID (must be initialized)
+            on_frame: Optional callback for each frame
+            
+        Yields:
+            Tuple of (frame_jpeg_bytes, frame_index, timestamp_ms, metrics)
+        """
+        session = self.get_musetalk_session(session_id)
+        
+        if session is None:
+            logger.error(f"MuseTalk session {session_id} not found")
+            return
+        
+        if not session.is_initialized:
+            logger.error(f"MuseTalk session {session_id} not initialized")
+            return
+        
+        if session.is_closed:
+            logger.error(f"MuseTalk session {session_id} is closed")
+            return
+        
+        # Track frame generation for metrics
+        start_time = time.time()
+        frame_count = 0
+        
+        for frame_bytes, frame_idx, timestamp_ms, metrics in session.send_audio_chunk(audio_chunk, on_frame=on_frame):
+            frame_count += 1
+            yield frame_bytes, frame_idx, timestamp_ms, metrics
+        
+        # Record MuseTalk metrics for adaptive buffering
+        if frame_count > 0:
+            duration = time.time() - start_time
+            if duration > 0:
+                self.streaming_metrics.record_musetalk_generation(frame_count, duration)
+    
+    def get_musetalk_idle_frame(self, session_id: int) -> Optional[bytes]:
+        """
+        Get the idle/first frame from a MuseTalk session.
+        
+        Args:
+            session_id: Session ID
+            
+        Returns:
+            JPEG bytes of the idle frame, or None if not available
+        """
+        session = self.get_musetalk_session(session_id)
+        if session is not None:
+            return session.first_frame
+        return None
 
 
 class ConversationManager:
