@@ -336,6 +336,9 @@ class TTSSession:
     - Session cleanup
     """
     
+    # Sessions older than this are considered stale and should be refreshed
+    MAX_IDLE_SECONDS = 300  # 5 minutes
+    
     def __init__(self, triton_url: str, session_id: int, tts_params: TTSParams):
         self.triton_url = triton_url
         self.session_id = session_id
@@ -346,6 +349,17 @@ class TTSSession:
         self._is_initialized = False
         self._is_closed = False
         self._lock = threading.Lock()
+        self._last_used: float = time.time()  # Track last usage time
+        
+    @property
+    def is_stale(self) -> bool:
+        """Check if session has been idle too long and may be invalid."""
+        return (time.time() - self._last_used) > self.MAX_IDLE_SECONDS
+    
+    @property
+    def idle_seconds(self) -> float:
+        """Get seconds since last use."""
+        return time.time() - self._last_used
         
     def _callback(self, result, error):
         """Callback for stream responses"""
@@ -455,6 +469,9 @@ class TTSSession:
             if not self._is_initialized:
                 logger.error(f"Session {self.session_id} not initialized, cannot generate")
                 return
+            
+            # Update last used time
+            self._last_used = time.time()
         
         metrics = TTSMetrics()
         start_time = time.time()
@@ -661,335 +678,8 @@ class TTSSession:
         return False
 
 
-class MuseTalkSession:
-    """
-    Manages a persistent MuseTalk session with Triton.
-    
-    Similar to TTSSession, maintains a gRPC stream for the entire
-    sequence lifecycle (sequence_start -> audio chunks -> sequence_end).
-    """
-    
-    def __init__(self, triton_url: str, session_id: int, musetalk_params: MuseTalkParams):
-        self.triton_url = triton_url
-        self.session_id = session_id
-        self.musetalk_params = musetalk_params
-        
-        self._client: Optional[grpc_client.InferenceServerClient] = None
-        self._result_queue: Optional[queue.Queue] = None
-        self._is_initialized = False
-        self._is_closed = False
-        self._lock = threading.Lock()
-        self._frames_received = 0
-        self._first_frame: Optional[bytes] = None  # Store first/idle frame
-        
-    def _callback(self, result, error):
-        """Callback for stream responses"""
-        if self._result_queue is not None:
-            if error:
-                self._result_queue.put(("error", error))
-            else:
-                self._result_queue.put(("result", result))
-    
-    def initialize(self, timeout: float = 60.0) -> bool:
-        """
-        Initialize the MuseTalk session and load avatar.
-        
-        Returns:
-            True if initialization was successful
-        """
-        with self._lock:
-            if self._is_closed:
-                logger.warning(f"Cannot initialize closed MuseTalk session {self.session_id}")
-                return False
-            
-            if self._is_initialized:
-                logger.info(f"MuseTalk session {self.session_id} already initialized")
-                return True
-            
-            try:
-                logger.info(f"MuseTalk session {self.session_id} initializing with avatar '{self.musetalk_params.avatar_id}'...")
-                
-                # Create client and start stream
-                self._result_queue = queue.Queue()
-                self._client = grpc_client.InferenceServerClient(url=self.triton_url)
-                self._client.start_stream(callback=self._callback)
-                
-                # Send init request
-                avatar_id_bytes = np.array([self.musetalk_params.avatar_id.encode("utf-8")], dtype=object)
-                
-                inputs = [
-                    grpc_client.InferInput("START", [1], "BOOL"),
-                    grpc_client.InferInput("CORRID", [1], "INT64"),
-                    grpc_client.InferInput("AVATAR_ID", [1], "BYTES"),
-                    grpc_client.InferInput("AUDIO_CHUNK", [0], "FP32"),  # Empty audio for init
-                ]
-                inputs[0].set_data_from_numpy(np.array([True], dtype=bool))
-                inputs[1].set_data_from_numpy(np.array([self.session_id], dtype=np.int64))
-                inputs[2].set_data_from_numpy(avatar_id_bytes)
-                inputs[3].set_data_from_numpy(np.array([], dtype=np.float32))
-                
-                outputs = [
-                    grpc_client.InferRequestedOutput("VIDEO_FRAME"),
-                    grpc_client.InferRequestedOutput("FRAME_INDEX"),
-                    grpc_client.InferRequestedOutput("TIMESTAMP_MS"),
-                ]
-                
-                self._client.async_stream_infer(
-                    model_name="musetalk",
-                    inputs=inputs,
-                    outputs=outputs,
-                    sequence_id=self.session_id,
-                    sequence_start=True,
-                    sequence_end=False,
-                    enable_empty_final_response=True,
-                )
-                
-                # Wait for response (should get initial/idle frame)
-                try:
-                    msg_type, data = self._result_queue.get(timeout=timeout)
-                    
-                    if msg_type == "error":
-                        logger.error(f"MuseTalk session {self.session_id} init error: {data}")
-                        self._cleanup_stream()
-                        return False
-                    
-                    # Try to get the initial frame (sent as final response on START)
-                    try:
-                        frame_data = data.as_numpy("VIDEO_FRAME")
-                        if frame_data is not None and len(frame_data) > 0:
-                            self._first_frame = frame_data.tobytes()
-                            logger.info(f"Received initial frame ({len(self._first_frame)} bytes)")
-                    except Exception as e:
-                        logger.debug(f"No initial frame: {e}")
-                    
-                    self._is_initialized = True
-                    logger.info(f"MuseTalk session {self.session_id} initialized successfully")
-                    return True
-                    
-                except queue.Empty:
-                    logger.warning(f"Timeout waiting for MuseTalk init response for session {self.session_id}")
-                    self._cleanup_stream()
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"MuseTalk session {self.session_id} init failed: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                self._cleanup_stream()
-                return False
-    
-    def send_audio_chunk(
-        self,
-        audio_chunk: np.ndarray,
-        on_frame: Optional[Callable[[bytes, int, float, MuseTalkMetrics], None]] = None,
-    ) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
-        """
-        Send an audio chunk and receive any generated video frames.
-        
-        Args:
-            audio_chunk: Audio samples at 24kHz as float32
-            on_frame: Optional callback for each frame
-            
-        Yields:
-            Tuple of (frame_jpeg_bytes, frame_index, timestamp_ms, metrics)
-        """
-        with self._lock:
-            if self._is_closed:
-                logger.error(f"Cannot send audio on closed MuseTalk session {self.session_id}")
-                return
-            
-            if not self._is_initialized:
-                logger.error(f"MuseTalk session {self.session_id} not initialized")
-                return
-        
-        metrics = MuseTalkMetrics()
-        start_time = time.time()
-        
-        try:
-            audio_chunk = np.asarray(audio_chunk, dtype=np.float32)
-            
-            inputs = [
-                grpc_client.InferInput("AUDIO_CHUNK", list(audio_chunk.shape), "FP32"),
-                grpc_client.InferInput("CORRID", [1], "INT64"),
-            ]
-            inputs[0].set_data_from_numpy(audio_chunk)
-            inputs[1].set_data_from_numpy(np.array([self.session_id], dtype=np.int64))
-            
-            outputs = [
-                grpc_client.InferRequestedOutput("VIDEO_FRAME"),
-                grpc_client.InferRequestedOutput("FRAME_INDEX"),
-                grpc_client.InferRequestedOutput("TIMESTAMP_MS"),
-            ]
-            
-            self._client.async_stream_infer(
-                model_name="musetalk",
-                inputs=inputs,
-                outputs=outputs,
-                sequence_id=self.session_id,
-                sequence_start=False,
-                sequence_end=False,
-                enable_empty_final_response=True,
-            )
-            
-            # Collect frames
-            while True:
-                try:
-                    msg_type, data = self._result_queue.get(timeout=60.0)
-                    
-                    if msg_type == "error":
-                        logger.error(f"MuseTalk Error: {data}")
-                        return
-                    
-                    response = data.get_response()
-                    
-                    # Check for final response
-                    if response.parameters.get("triton_final_response").bool_param:
-                        break
-                    
-                    frame_data = data.as_numpy("VIDEO_FRAME")
-                    frame_index = int(data.as_numpy("FRAME_INDEX")[0])
-                    timestamp_ms = float(data.as_numpy("TIMESTAMP_MS")[0])
-                    
-                    if len(frame_data) > 0:
-                        self._frames_received += 1
-                        frame_bytes = frame_data.tobytes()
-                        
-                        # Update metrics
-                        elapsed = time.time() - start_time
-                        metrics.frame_index = frame_index
-                        metrics.timestamp_ms = timestamp_ms
-                        metrics.frames_generated = self._frames_received
-                        metrics.generation_time_ms = elapsed * 1000
-                        
-                        if on_frame:
-                            on_frame(frame_bytes, frame_index, timestamp_ms, metrics)
-                        
-                        yield frame_bytes, frame_index, timestamp_ms, metrics
-                        
-                except queue.Empty:
-                    logger.warning("Timeout waiting for MuseTalk frame")
-                    return
-                    
-        except Exception as e:
-            logger.error(f"MuseTalk session {self.session_id} audio processing error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-    
-    def close(self, timeout: float = 10.0) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
-        """
-        Close the MuseTalk session, receiving any final frames.
-        
-        Yields:
-            Any remaining frames
-        """
-        with self._lock:
-            if self._is_closed:
-                return
-            
-            if self._client is None:
-                self._is_closed = True
-                return
-            
-            try:
-                logger.info(f"Closing MuseTalk session {self.session_id}...")
-                
-                # Send end request
-                inputs = [
-                    grpc_client.InferInput("END", [1], "BOOL"),
-                    grpc_client.InferInput("CORRID", [1], "INT64"),
-                    grpc_client.InferInput("AUDIO_CHUNK", [0], "FP32"),
-                ]
-                inputs[0].set_data_from_numpy(np.array([True], dtype=bool))
-                inputs[1].set_data_from_numpy(np.array([self.session_id], dtype=np.int64))
-                inputs[2].set_data_from_numpy(np.array([], dtype=np.float32))
-                
-                outputs = [
-                    grpc_client.InferRequestedOutput("VIDEO_FRAME"),
-                    grpc_client.InferRequestedOutput("FRAME_INDEX"),
-                    grpc_client.InferRequestedOutput("TIMESTAMP_MS"),
-                ]
-                
-                self._client.async_stream_infer(
-                    model_name="musetalk",
-                    inputs=inputs,
-                    outputs=outputs,
-                    sequence_id=self.session_id,
-                    sequence_start=False,
-                    sequence_end=True,
-                    enable_empty_final_response=True,
-                )
-                
-                metrics = MuseTalkMetrics()
-                start_time = time.time()
-                
-                # Collect any remaining frames
-                while True:
-                    try:
-                        msg_type, data = self._result_queue.get(timeout=timeout)
-                        
-                        if msg_type == "error":
-                            logger.warning(f"MuseTalk session {self.session_id} end error: {data}")
-                            break
-                        
-                        response = data.get_response()
-                        
-                        if response.parameters.get("triton_final_response").bool_param:
-                            break
-                        
-                        frame_data = data.as_numpy("VIDEO_FRAME")
-                        frame_index = int(data.as_numpy("FRAME_INDEX")[0])
-                        timestamp_ms = float(data.as_numpy("TIMESTAMP_MS")[0])
-                        
-                        if len(frame_data) > 0:
-                            self._frames_received += 1
-                            frame_bytes = frame_data.tobytes()
-                            
-                            elapsed = time.time() - start_time
-                            metrics.frame_index = frame_index
-                            metrics.timestamp_ms = timestamp_ms
-                            metrics.frames_generated = self._frames_received
-                            metrics.generation_time_ms = elapsed * 1000
-                            
-                            yield frame_bytes, frame_index, timestamp_ms, metrics
-                            
-                    except queue.Empty:
-                        logger.warning("Timeout waiting for MuseTalk end response")
-                        break
-                
-                logger.info(f"MuseTalk session {self.session_id} ended, {self._frames_received} total frames")
-                
-            except Exception as e:
-                logger.error(f"Error ending MuseTalk session {self.session_id}: {e}")
-            finally:
-                self._cleanup_stream()
-                self._is_closed = True
-                self._is_initialized = False
-    
-    def _cleanup_stream(self):
-        """Clean up the gRPC stream"""
-        if self._client is not None:
-            try:
-                self._client.stop_stream()
-            except Exception as e:
-                logger.debug(f"Error stopping stream: {e}")
-            self._client = None
-        self._result_queue = None
-    
-    @property
-    def is_initialized(self) -> bool:
-        return self._is_initialized
-    
-    @property
-    def is_closed(self) -> bool:
-        return self._is_closed
-    
-    @property
-    def first_frame(self) -> Optional[bytes]:
-        return self._first_frame
-    
-    @property
-    def frames_received(self) -> int:
-        return self._frames_received
+# MuseTalkSession class removed - MuseTalk is now stateless
+# Use TritonVoiceClient.generate_musetalk_frames() directly
 
 
 class TritonVoiceClient:
@@ -1024,11 +714,6 @@ class TritonVoiceClient:
         self._tts_session_counter = 100
         self._tts_session_lock = threading.Lock()
         self._active_tts_sessions: dict[int, TTSSession] = {}
-        
-        # MuseTalk session management
-        self._musetalk_session_counter = 1000
-        self._musetalk_session_lock = threading.Lock()
-        self._active_musetalk_sessions: dict[int, MuseTalkSession] = {}
         
         # Streaming metrics for adaptive buffering
         self.streaming_metrics = StreamingMetrics()
@@ -1482,6 +1167,28 @@ class TritonVoiceClient:
         with self._tts_session_lock:
             return self._active_tts_sessions.get(session_id)
     
+    def is_tts_session_stale(self, session_id: int) -> bool:
+        """
+        Check if a TTS session is stale (idle for too long).
+        
+        Args:
+            session_id: The session ID to check
+            
+        Returns:
+            True if session is stale or doesn't exist
+        """
+        session = self.get_tts_session(session_id)
+        if session is None:
+            return True
+        if session.is_closed:
+            return True
+        if not session.is_initialized:
+            return True
+        if session.is_stale:
+            logger.warning(f"TTS session {session_id} is stale (idle for {session.idle_seconds:.1f}s)")
+            return True
+        return False
+    
     def close_tts_session(self, session_id: int) -> bool:
         """
         Close and cleanup a TTS session.
@@ -1573,22 +1280,18 @@ class TritonVoiceClient:
         session = self.get_tts_session(session_id)
         
         if session is None:
-            logger.error(f"TTS session {session_id} not found. Did you call init_tts_session first?")
+            logger.error(f"[TTS_STREAM] Session {session_id} not found. Did you call init_tts_session first?")
             return
         
         if not session.is_initialized:
-            logger.error(f"TTS session {session_id} not initialized")
+            logger.error(f"[TTS_STREAM] Session {session_id} not initialized. is_initialized={session.is_initialized}")
             return
         
         if session.is_closed:
-            logger.error(f"TTS session {session_id} is already closed")
+            logger.error(f"[TTS_STREAM] Session {session_id} is already closed. is_closed={session.is_closed}")
             return
         
-        logger.info(f"=" * 60)
-        logger.info(f"TTS SESSION {session_id}")
-        logger.info(f"Full text: '{' '.join(text)}'")
-        logger.info(f"Split into {len(text)} chunks: {text}")
-        logger.info(f"=" * 60)
+        logger.info(f"[TTS_STREAM] Session {session_id}: text='{' '.join(text)}', chunks={len(text)}")
         
         # Wrap generator to record metrics
         for audio, word, metrics in session.generate(
@@ -1608,9 +1311,7 @@ class TritonVoiceClient:
             
             yield audio, word, metrics
         
-        logger.info(f"=" * 60)
-        logger.info(f"TTS SESSION {session_id} COMPLETE")
-        logger.info(f"=" * 60)
+        logger.info(f"[TTS_STREAM] Session {session_id} COMPLETE")
     
     def synthesize_text(self, text: str) -> Tuple[np.ndarray, TTSMetrics]:
         """
@@ -1644,160 +1345,162 @@ class TritonVoiceClient:
         
         return np.array([], dtype=np.float32), final_metrics
     
-    # =========== MuseTalk Methods ===========
+    # =========== MuseTalk Methods (Stateless) ===========
     
-    def _get_next_musetalk_session_id(self) -> int:
-        """Get a unique session ID for MuseTalk"""
-        with self._musetalk_session_lock:
-            self._musetalk_session_counter += 1
-            return self._musetalk_session_counter
-    
-    def create_musetalk_session(self, avatar_id: Optional[str] = None) -> MuseTalkSession:
-        """
-        Create a new MuseTalk session.
-        
-        Args:
-            avatar_id: Optional avatar ID, uses default if not provided
-            
-        Returns:
-            A new MuseTalkSession instance (not yet initialized)
-        """
-        session_id = self._get_next_musetalk_session_id()
-        params = MuseTalkParams(
-            avatar_id=avatar_id or self.musetalk_params.avatar_id,
-            fps=self.musetalk_params.fps
-        )
-        session = MuseTalkSession(self.triton_url, session_id, params)
-        
-        with self._musetalk_session_lock:
-            self._active_musetalk_sessions[session_id] = session
-        
-        return session
-    
-    def get_musetalk_session(self, session_id: int) -> Optional[MuseTalkSession]:
-        """Get an existing MuseTalk session by ID"""
-        with self._musetalk_session_lock:
-            return self._active_musetalk_sessions.get(session_id)
-    
-    def close_musetalk_session(self, session_id: int) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
-        """
-        Close and cleanup a MuseTalk session.
-        
-        Args:
-            session_id: The session ID to close
-            
-        Yields:
-            Any remaining frames from the session
-        """
-        with self._musetalk_session_lock:
-            session = self._active_musetalk_sessions.pop(session_id, None)
-        
-        if session is not None:
-            yield from session.close()
-    
-    def init_musetalk_session(self, session_id: int, avatar_id: Optional[str] = None) -> bool:
-        """
-        Initialize a MuseTalk session with avatar.
-        
-        Args:
-            session_id: Unique session identifier
-            avatar_id: Avatar ID to load (uses default if not provided)
-            
-        Returns:
-            True if session initialized successfully
-        """
-        # Check for existing session and close it
-        existing = self.get_musetalk_session(session_id)
-        if existing is not None:
-            logger.info(f"Closing existing MuseTalk session {session_id} before reinitializing")
-            list(existing.close())  # Consume generator
-            with self._musetalk_session_lock:
-                self._active_musetalk_sessions.pop(session_id, None)
-        
-        # Create new session
-        params = MuseTalkParams(
-            avatar_id=avatar_id or self.musetalk_params.avatar_id,
-            fps=self.musetalk_params.fps
-        )
-        session = MuseTalkSession(self.triton_url, session_id, params)
-        success = session.initialize()
-        
-        if success:
-            with self._musetalk_session_lock:
-                self._active_musetalk_sessions[session_id] = session
-        
-        return success
-    
-    def end_musetalk_session(self, session_id: int) -> List[Tuple[bytes, int, float, MuseTalkMetrics]]:
-        """
-        End a MuseTalk session and get remaining frames.
-        
-        Args:
-            session_id: The session ID to end
-            
-        Returns:
-            List of remaining frames
-        """
-        return list(self.close_musetalk_session(session_id))
-    
-    def send_musetalk_audio(
+    def generate_musetalk_frames(
         self,
-        audio_chunk: np.ndarray,
-        session_id: int,
+        audio: np.ndarray,
+        frame_index: int = 0,
         on_frame: Optional[Callable[[bytes, int, float, MuseTalkMetrics], None]] = None,
+        timeout: float = 60.0,
     ) -> Generator[Tuple[bytes, int, float, MuseTalkMetrics], None, None]:
         """
-        Send audio chunk to MuseTalk session and receive video frames.
+        Generate video frames from audio (stateless).
+        
+        Sends complete audio to MuseTalk and receives all generated frames.
+        The model is stateless - each call processes the audio independently.
         
         Args:
-            audio_chunk: Audio samples at 24kHz as float32
-            session_id: Session ID (must be initialized)
+            audio: Complete audio samples at 24kHz as float32
+            frame_index: Starting frame index in avatar cycle (for video continuity)
             on_frame: Optional callback for each frame
+            timeout: Timeout for waiting for frames
             
         Yields:
             Tuple of (frame_jpeg_bytes, frame_index, timestamp_ms, metrics)
         """
-        session = self.get_musetalk_session(session_id)
-        
-        if session is None:
-            logger.error(f"MuseTalk session {session_id} not found")
+        if audio is None or len(audio) == 0:
+            logger.error("MuseTalk: Audio is required and must not be empty")
             return
         
-        if not session.is_initialized:
-            logger.error(f"MuseTalk session {session_id} not initialized")
-            return
+        audio_duration_s = len(audio) / 24000  # 24kHz
+        logger.info(f"MuseTalk: Processing {audio_duration_s:.3f}s audio, start_frame_index={frame_index}")
         
-        if session.is_closed:
-            logger.error(f"MuseTalk session {session_id} is closed")
-            return
-        
-        # Track frame generation for metrics
+        metrics = MuseTalkMetrics()
         start_time = time.time()
-        frame_count = 0
+        frames_received = 0
         
-        for frame_bytes, frame_idx, timestamp_ms, metrics in session.send_audio_chunk(audio_chunk, on_frame=on_frame):
-            frame_count += 1
-            yield frame_bytes, frame_idx, timestamp_ms, metrics
+        result_queue: queue.Queue = queue.Queue()
         
-        # Record MuseTalk metrics for adaptive buffering
-        if frame_count > 0:
-            duration = time.time() - start_time
-            if duration > 0:
-                self.streaming_metrics.record_musetalk_generation(frame_count, duration)
-    
-    def get_musetalk_idle_frame(self, session_id: int) -> Optional[bytes]:
+        def callback(result, error):
+            if error:
+                result_queue.put(("error", error))
+            else:
+                result_queue.put(("result", result))
+        
+        try:
+            # Create client and start stream for this request
+            client = grpc_client.InferenceServerClient(url=self.triton_url)
+            client.start_stream(callback=callback)
+            
+            audio = np.asarray(audio, dtype=np.float32)
+            
+            inputs = [
+                grpc_client.InferInput("AUDIO", list(audio.shape), "FP32"),
+                grpc_client.InferInput("FRAME_INDEX", [1], "INT32"),
+            ]
+            inputs[0].set_data_from_numpy(audio)
+            inputs[1].set_data_from_numpy(np.array([frame_index], dtype=np.int32))
+            
+            outputs = [
+                grpc_client.InferRequestedOutput("VIDEO_FRAME"),
+                grpc_client.InferRequestedOutput("FRAME_INDEX"),
+                grpc_client.InferRequestedOutput("TIMESTAMP_MS"),
+            ]
+            
+            client.async_stream_infer(
+                model_name="musetalk",
+                inputs=inputs,
+                outputs=outputs,
+                enable_empty_final_response=True,
+            )
+            
+            # Collect all frames
+            while True:
+                try:
+                    msg_type, data = result_queue.get(timeout=timeout)
+                    
+                    if msg_type == "error":
+                        logger.error(f"MuseTalk error: {data}")
+                        break
+                    
+                    response = data.get_response()
+                    
+                    # Check for final response
+                    if response.parameters.get("triton_final_response").bool_param:
+                        break
+                    
+                    frame_data = data.as_numpy("VIDEO_FRAME")
+                    output_frame_index = int(data.as_numpy("FRAME_INDEX")[0])
+                    timestamp_ms = float(data.as_numpy("TIMESTAMP_MS")[0])
+                    
+                    if len(frame_data) > 0:
+                        frames_received += 1
+                        frame_bytes = frame_data.tobytes()
+                        
+                        # Update metrics
+                        elapsed = time.time() - start_time
+                        metrics.frame_index = output_frame_index
+                        metrics.timestamp_ms = timestamp_ms
+                        metrics.frames_generated = frames_received
+                        metrics.generation_time_ms = elapsed * 1000
+                        
+                        if on_frame:
+                            on_frame(frame_bytes, output_frame_index, timestamp_ms, metrics)
+                        
+                        yield frame_bytes, output_frame_index, timestamp_ms, metrics
+                        
+                except queue.Empty:
+                    logger.warning("Timeout waiting for MuseTalk frame")
+                    break
+            
+            # Record metrics for adaptive buffering
+            if frames_received > 0:
+                duration = time.time() - start_time
+                if duration > 0:
+                    self.streaming_metrics.record_musetalk_generation(frames_received, duration)
+            
+            logger.info(f"MuseTalk: Generated {frames_received} frames in {time.time() - start_time:.3f}s")
+            
+        except Exception as e:
+            logger.error(f"MuseTalk generation error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            try:
+                client.stop_stream()
+            except Exception:
+                pass
+
+    def get_musetalk_idle_frame(self, timeout: float = 30.0) -> Optional[bytes]:
         """
-        Get the idle/first frame from a MuseTalk session.
+        Get a single idle frame from MuseTalk (stateless).
+        
+        Generates one frame with minimal silent audio to get the avatar's idle pose.
+        This is used to display the avatar before any speech is generated.
         
         Args:
-            session_id: Session ID
+            timeout: Timeout for waiting for the frame
             
         Returns:
-            JPEG bytes of the idle frame, or None if not available
+            JPEG bytes of the idle frame, or None if failed
         """
-        session = self.get_musetalk_session(session_id)
-        if session is not None:
-            return session.first_frame
+        # Generate minimal audio (240ms of silence - minimum required)
+        # 24kHz * 0.24s = 5760 samples
+        silent_audio = np.zeros(5760, dtype=np.float32)
+        
+        try:
+            for frame_bytes, frame_idx, timestamp_ms, metrics in self.generate_musetalk_frames(
+                audio=silent_audio,
+                frame_index=0,
+                timeout=timeout,
+            ):
+                # Return first frame only
+                logger.info(f"MuseTalk: Got idle frame ({len(frame_bytes)} bytes)")
+                return frame_bytes
+        except Exception as e:
+            logger.error(f"Failed to get MuseTalk idle frame: {e}")
+        
         return None
 
 

@@ -1,6 +1,7 @@
 import os
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 import torch
@@ -28,6 +29,7 @@ class GenerationState:
     eos: torch.Tensor
     cache_pos: torch.Tensor
     has_active_text: bool       # True if currently generating for a chunk
+    last_activity_time: float = field(default_factory=time.time)  # Track last activity
 
 
 class TTSGenerator:
@@ -49,6 +51,7 @@ class TTSGenerator:
         reference_audio_path: Optional[str] = None,
         reference_json_path: Optional[str] = None,
         max_concurrent_sessions: int = 4,
+        idle_timeout_seconds: float = 300.0,  # 5 minutes default
     ):
         self.device = device
         self.temperature = temperature
@@ -56,6 +59,7 @@ class TTSGenerator:
         self.decoder_temperature = decoder_temperature
         self.decoder_top_p = decoder_top_p
         self.max_concurrent_sessions = max_concurrent_sessions
+        self.idle_timeout_seconds = idle_timeout_seconds
 
         # Torch settings
         torch.set_grad_enabled(False)
@@ -95,6 +99,68 @@ class TTSGenerator:
         # Sessions
         self.sessions: Dict[int, GenerationState] = {}
         self.session_lock = threading.Lock()
+        
+        # Start idle session cleanup thread
+        self._cleanup_thread_stop = threading.Event()
+        self._cleanup_thread = threading.Thread(target=self._idle_session_cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
+
+    def _idle_session_cleanup_loop(self):
+        """Background thread to clean up idle sessions."""
+        while not self._cleanup_thread_stop.is_set():
+            try:
+                self._cleanup_idle_sessions()
+            except Exception as e:
+                print(f"[TTSGenerator] Error in idle cleanup: {e}")
+            # Check every 30 seconds
+            self._cleanup_thread_stop.wait(30.0)
+
+    def _cleanup_idle_sessions(self):
+        """Remove sessions that have been idle for too long."""
+        current_time = time.time()
+        sessions_to_remove = []
+        
+        with self.session_lock:
+            for session_id, state in self.sessions.items():
+                idle_time = current_time - state.last_activity_time
+                if idle_time > self.idle_timeout_seconds:
+                    sessions_to_remove.append(session_id)
+        
+        for session_id in sessions_to_remove:
+            print(f"[TTSGenerator] Cleaning up idle session {session_id} (idle for >{self.idle_timeout_seconds}s)")
+            self.end_session(session_id)
+    
+    def cleanup_all_sessions(self):
+        """Remove all active sessions."""
+        with self.session_lock:
+            session_ids = list(self.sessions.keys())
+        
+        for session_id in session_ids:
+            print(f"[TTSGenerator] Cleaning up session {session_id}")
+            self.end_session(session_id)
+    
+    def get_session_info(self) -> Dict[str, Any]:
+        """Get information about all active sessions."""
+        current_time = time.time()
+        info = {
+            "active_sessions": [],
+            "total_count": 0,
+            "max_sessions": self.max_concurrent_sessions,
+        }
+        
+        with self.session_lock:
+            info["total_count"] = len(self.sessions)
+            for session_id, state in self.sessions.items():
+                idle_time = current_time - state.last_activity_time
+                info["active_sessions"].append({
+                    "session_id": session_id,
+                    "idle_seconds": round(idle_time, 1),
+                    "frames_generated": len(state.frames),
+                    "queue_length": len(state.input_queue),
+                    "has_active_text": state.has_active_text,
+                })
+        
+        return info
 
     def save_model(self, save_dir: str = "saved_csm_model"):
         os.makedirs(save_dir, exist_ok=True)
@@ -160,6 +226,8 @@ class TTSGenerator:
         with self.session_lock:
             if session_id not in self.sessions:
                 return False
+            # Update activity time
+            self.sessions[session_id].last_activity_time = time.time()
 
         new_inputs: List[Dict[str, Any]] = []
         for text in texts:
@@ -180,6 +248,7 @@ class TTSGenerator:
             if session_id not in self.sessions:
                 return False
             self.sessions[session_id].input_queue.extend(new_inputs)
+            self.sessions[session_id].last_activity_time = time.time()
 
         return True
 
@@ -338,6 +407,9 @@ class TTSGenerator:
             if session_id not in self.sessions:
                 return True
             state = self.sessions[session_id]
+            # Update activity time
+            state.last_activity_time = time.time()
+            
         steps_taken = 0
         if temperature:
             self.temperature = temperature

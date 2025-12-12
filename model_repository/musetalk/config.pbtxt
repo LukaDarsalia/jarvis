@@ -5,31 +5,13 @@ max_batch_size: 0
 
 input [
   {
-    name: "AUDIO_CHUNK"
+    name: "AUDIO"
     data_type: TYPE_FP32
-    dims: [ -1 ]   # audio chunk samples
-    optional: true
+    dims: [ -1 ]   # complete audio samples (24kHz)
   },
   {
-    name: "START"
-    data_type: TYPE_BOOL
-    dims: [1]
-    optional: true
-  },
-  {
-    name: "END"
-    data_type: TYPE_BOOL
-    dims: [1]
-    optional: true
-  },
-  {
-    name: "CORRID"
-    data_type: TYPE_INT64
-    dims: [1]
-  },
-  {
-    name: "AVATAR_ID"
-    data_type: TYPE_STRING
+    name: "FRAME_INDEX"
+    data_type: TYPE_INT32
     dims: [1]
     optional: true
   }
@@ -52,31 +34,6 @@ output [
     dims: [ 1 ]
   }
 ]
-
-sequence_batching {
-  max_sequence_idle_microseconds: 120000000  # 120 seconds
-
-  control_input [
-    {
-      name: "START"
-      control [
-        {
-          kind: CONTROL_SEQUENCE_START
-          bool_false_true: [ false, true ]
-        }
-      ]
-    },
-    {
-      name: "END"
-      control [
-        {
-          kind: CONTROL_SEQUENCE_END
-          bool_false_true: [ false, true ]
-        }
-      ]
-    }
-  ]
-}
 
 model_transaction_policy {
   decoupled: true
@@ -141,7 +98,7 @@ parameters: {
 
 parameters: {
   key: "batch_size"
-  value: { string_value: "1" }
+  value: { string_value: "4" }
 }
 
 parameters: {

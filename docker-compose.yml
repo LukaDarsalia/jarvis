@@ -24,3 +24,15 @@ services:
       --model-repository=/models
       --strict-model-config=false
       --log-verbose=1
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      - triton
+    environment:
+      - TRITON_URL=triton:8001
+    restart: unless-stopped

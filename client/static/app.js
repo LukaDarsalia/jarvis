@@ -5,6 +5,9 @@
 
 class VoiceAssistant {
     constructor() {
+        // Debug logging toggle
+        this.DEBUG = true;
+        
         // WebSocket
         this.ws = null;
         this.connectionId = null;
@@ -100,6 +103,29 @@ class VoiceAssistant {
         
         // Initialize
         this.init();
+    }
+    
+    // Debug logging helper
+    log(...args) {
+        if (this.DEBUG) {
+            console.log(`[VA ${new Date().toISOString().substr(11, 12)}]`, ...args);
+        }
+    }
+    
+    logState(context) {
+        if (this.DEBUG) {
+            console.log(`[VA STATE @ ${context}]`, {
+                isBuffering: this.isBuffering,
+                isSyncedPlayback: this.isSyncedPlayback,
+                isDisplayingVideo: this.isDisplayingVideo,
+                isGenerating: this.isGenerating,
+                videoComplete: this.videoComplete,
+                syncedQueueLen: this.syncedQueue.length,
+                audioQueueLen: this.audioQueue.length,
+                recordedFramesLen: this.recordedSyncedFrames.length,
+                bufferConfig: this.bufferConfig,
+            });
+        }
     }
     
     async init() {
@@ -273,7 +299,7 @@ class VoiceAssistant {
             this.isConnected = false;
             this.updateConnectionStatus('disconnected');
             // Reconnect after 3 seconds
-            setTimeout(() => this.connect(), 3000);
+            setTimeout(() => this.connect(), 10000);
         };
         
         this.ws.onerror = (error) => {
@@ -292,20 +318,23 @@ class VoiceAssistant {
     }
     
     handleMessage(data) {
+        this.log(`[WS MSG] type=${data.type}`, data.type === 'synced_av_frame' ? `frame=${data.frame_index}` : data);
+        
         const handlers = {
             'connected': () => {
                 this.isConnected = true;
                 this.connectionId = data.connection_id;
-                console.log('Connected with ID:', this.connectionId);
+                this.log('[WS] Connected with ID:', this.connectionId);
                 this.sendMessage('set_mode', { mode: this.currentMode });
             },
             
             'tts_cache_ready': () => {
-                console.log('TTS cache ready');
+                this.log('[TTS] Cache ready, session:', data.session_id, 'success:', data.success);
             },
             
             'musetalk_ready': () => {
-                console.log('MuseTalk ready:', data.success);
+                this.log('[MUSETALK] Ready:', data.success, 'session:', data.session_id);
+                this.logState('musetalk_ready');
                 if (data.success) {
                     this.videoEnabled = true;
                     this.updateAvatarStatus('ready', 'მზადაა');
@@ -352,7 +381,12 @@ class VoiceAssistant {
             
             'stt_complete': () => {
                 this.addMessage('user', data.text);
-                this.setVadStatusText('დააჭირეთ მიკროფონს საუბრის დასაწყებად');
+                // Only reset status text if not still recording
+                if (this.isRecording) {
+                    this.setVadStatusText('მოსმენა...');
+                } else {
+                    this.setVadStatusText('დააჭირეთ მიკროფონს საუბრის დასაწყებად');
+                }
             },
             
             'user_message': () => {
@@ -361,6 +395,7 @@ class VoiceAssistant {
             
             'llm_start': () => {
                 this.isGenerating = true;
+                this.setSendButtonEnabled(false);  // Disable send button during generation
                 this.showStopButton();
                 this.currentAssistantMessage = this.addMessage('assistant', '', true);
                 this.wordsSpoken = [];
@@ -371,6 +406,9 @@ class VoiceAssistant {
                 this.totalFramesReceived = 0;
                 this.lastFrameIndex = -1;
                 this.videoStartTime = null;
+                
+                // Show loading status during TTS/MuseTalk initialization
+                this.updateAvatarStatus('loading', 'იტვირთება...');
             },
             
             'llm_token': () => {
@@ -386,7 +424,9 @@ class VoiceAssistant {
             },
             
             'tts_start': () => {
-                console.log('TTS starting:', data.text ? data.text.substring(0, 50) : '');
+                this.log('[TTS] Starting, text:', data.text ? data.text.substring(0, 50) : '(empty)', 'video_enabled:', data.video_enabled);
+                this.logState('tts_start_begin');
+                
                 this.currentTTSText = data.text;
                 this.currentTTSAudioChunks = [];
                 this.videoComplete = false;
@@ -396,6 +436,7 @@ class VoiceAssistant {
                 
                 // Update buffer config from server if provided
                 if (data.buffer_config) {
+                    this.log('[BUFFER] Config from tts_start:', data.buffer_config);
                     this.updateBufferConfig(data.buffer_config);
                 }
                 
@@ -406,10 +447,13 @@ class VoiceAssistant {
                 if (data.video_enabled) {
                     this.updateAvatarStatus('speaking', 'საუბრობს');
                     // Don't start playback yet - wait for buffer to fill
-                this.isBuffering = true;
-                this.bufferStartTime = performance.now();
-                console.log(`Adaptive buffer: waiting for ${this.bufferConfig.frame_buffer} frames (${this.bufferConfig.buffer_ms}ms)`);
-            }
+                    this.isBuffering = true;
+                    this.bufferStartTime = performance.now();
+                    this.log(`[BUFFER] Started buffering, waiting for ${this.bufferConfig.frame_buffer} frames (${this.bufferConfig.buffer_ms}ms)`);
+                } else {
+                    this.log('[BUFFER] Video NOT enabled, isBuffering stays:', this.isBuffering);
+                }
+                this.logState('tts_start_end');
 
                 // In TTS-only mode, show user message and prepare audio message
                 if (this.currentMode === 'tts_only') {
@@ -433,9 +477,11 @@ class VoiceAssistant {
             },
             
             'tts_complete': () => {
-                console.log('TTS complete');
+                this.log('[TTS] Complete');
+                this.logState('tts_complete');
                 this.hideStopButton();
                 this.isGenerating = false;
+                this.setSendButtonEnabled(true);  // Re-enable send button
                 
                 // Finalize audio message in TTS-only mode
                 if (this.currentMode === 'tts_only' && this.currentTTSMessage) {
@@ -453,12 +499,15 @@ class VoiceAssistant {
             },
             
             'video_complete': () => {
-                console.log('Video complete, total frames:', this.totalFramesReceived);
+                this.log('[VIDEO] Complete, total frames received:', this.totalFramesReceived);
+                this.logState('video_complete_begin');
                 this.videoComplete = true;
 
                 const haveFrames = this.syncedQueue.length > 0 || (this.recordedSyncedFrames && this.recordedSyncedFrames.length > 0);
+                this.log('[VIDEO] haveFrames:', haveFrames, 'isBuffering:', this.isBuffering, 'isSyncedPlayback:', this.isSyncedPlayback);
+                
                 if (this.isBuffering && haveFrames) {
-                    console.log(`Generation finished with ${this.syncedQueue.length} queued frames; starting fallback playback.`);
+                    this.log(`[BUFFER] Generation finished while buffering with ${this.syncedQueue.length} queued frames; starting fallback playback`);
                     this.isBuffering = false;
                     // Prefer smooth replay using recorded frames/audio when available
                     if (this.recordedSyncedFrames && this.recordedSyncedFrames.length > 0) {
@@ -503,9 +552,11 @@ class VoiceAssistant {
             },
             
             'error': () => {
-                console.error('Server error:', data.message);
+                this.log('[ERROR] Server error:', data.message);
+                this.logState('error');
                 this.hideStopButton();
                 this.isGenerating = false;
+                this.setSendButtonEnabled(true);  // Re-enable send button on error
                 this.stopVideoPlayback();
                 this.updateAvatarStatus('error', 'შეცდომა');
             },
@@ -525,7 +576,10 @@ class VoiceAssistant {
     
     sendMessage(type, payload = {}) {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.log('[WS SEND]', type, payload);
             this.ws.send(JSON.stringify({ type, ...payload }));
+        } else {
+            this.log('[WS SEND FAILED] WebSocket not open, type:', type);
         }
     }
     
@@ -576,14 +630,45 @@ class VoiceAssistant {
             const bufferSize = 512;
             const processor = recordingContext.createScriptProcessor(bufferSize, 1, 1);
             
+            // Audio batching: accumulate frames before sending
+            // 512 samples @ 16kHz = 32ms per frame
+            // Batch 5 frames = 160ms = ~6 packets/sec instead of ~31/sec
+            const BATCH_SIZE = 5;
+            const MAX_BUFFERED_AMOUNT = 256 * 1024;  // 256KB backpressure limit
+            let audioBatch = [];
+            
             processor.onaudioprocess = (e) => {
                 if (!this.isRecording) return;
                 
                 const inputData = e.inputBuffer.getChannelData(0);
                 const audioData = new Float32Array(inputData);
                 
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(audioData.buffer);
+                // Accumulate audio frames
+                audioBatch.push(audioData);
+                
+                // Send when batch is full
+                if (audioBatch.length >= BATCH_SIZE) {
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        // Backpressure check - don't send if socket is backed up
+                        if (this.ws.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                            // Drop this batch to prevent backlog spiral
+                            this.log('[AUDIO] Dropping batch - socket backed up:', this.ws.bufferedAmount);
+                            audioBatch = [];
+                            return;
+                        }
+                        
+                        // Concatenate batch into single buffer
+                        const totalSamples = audioBatch.reduce((sum, arr) => sum + arr.length, 0);
+                        const combined = new Float32Array(totalSamples);
+                        let offset = 0;
+                        for (const chunk of audioBatch) {
+                            combined.set(chunk, offset);
+                            offset += chunk.length;
+                        }
+                        
+                        this.ws.send(combined.buffer);
+                    }
+                    audioBatch = [];
                 }
             };
             
@@ -595,6 +680,12 @@ class VoiceAssistant {
             this.audioSource = source;
             this.isRecording = true;
             
+            // Notify server that recording started (for TTS pre-initialization)
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ type: 'recording_start' }));
+                this.log('[WS SEND] recording_start');
+            }
+            
             console.log('Recording started');
         } catch (e) {
             console.error('Failed to start recording:', e);
@@ -604,6 +695,12 @@ class VoiceAssistant {
     
     stopRecording() {
         this.isRecording = false;
+        
+        // Notify server that recording stopped
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'recording_stop' }));
+            this.log('[WS SEND] recording_stop');
+        }
         
         if (this.audioProcessor) {
             this.audioProcessor.disconnect();
@@ -764,9 +861,17 @@ class VoiceAssistant {
          * Adaptive buffering: Wait for buffer to fill before starting playback
          * to ensure smooth playback without stutters.
          */
-        if (!data.frame && !data.audio) return;
+        if (!data.frame && !data.audio) {
+            this.log('[SYNC FRAME] Skipped - no frame or audio');
+            return;
+        }
         
         this.totalFramesReceived++;
+        
+        // Log every 10th frame to avoid spam
+        if (this.totalFramesReceived % 10 === 1 || this.totalFramesReceived <= 5) {
+            this.log(`[SYNC FRAME] #${data.frame_index} received, total: ${this.totalFramesReceived}, queue: ${this.syncedQueue.length}, buffering: ${this.isBuffering}, playing: ${this.isSyncedPlayback}`);
+        }
         const isTtsOnly = this.currentMode === 'tts_only';
         let decodedAudio = null;
         if (data.audio) {
@@ -824,34 +929,54 @@ class VoiceAssistant {
             if (this.syncedQueue.length >= targetFrames) {
                 // Buffer is full, start playback
                 const bufferTime = performance.now() - this.bufferStartTime;
-                console.log(`Buffer filled: ${this.syncedQueue.length} frames in ${bufferTime.toFixed(0)}ms, starting playback`);
+                this.log(`[BUFFER] Full! ${this.syncedQueue.length}/${targetFrames} frames in ${bufferTime.toFixed(0)}ms, starting playback`);
                 this.isBuffering = false;
                 this.startSyncedPlayback();
+            } else {
+                // Still buffering
+                if (this.syncedQueue.length % 2 === 0) {
+                    this.log(`[BUFFER] Filling: ${this.syncedQueue.length}/${targetFrames} frames`);
+                }
             }
         } else if (!this.isSyncedPlayback) {
             // Not buffering and not playing - start immediately (shouldn't normally happen)
+            this.log(`[BUFFER] WARNING: Not buffering and not playing! Starting immediate playback. queue=${this.syncedQueue.length}`);
+            this.logState('immediate_playback_fallback');
             this.startSyncedPlayback();
         }
     }
     
     startSyncedPlayback() {
-        if (this.isSyncedPlayback) return;
+        if (this.isSyncedPlayback) {
+            this.log('[PLAYBACK] Already playing, skipping startSyncedPlayback');
+            return;
+        }
+        
+        this.log('[PLAYBACK] Starting synced playback, queue:', this.syncedQueue.length);
+        this.logState('startSyncedPlayback');
         
         this.isSyncedPlayback = true;
         this.isDisplayingVideo = true;
         this.videoStartTime = performance.now();
         this.isBuffering = false;
         
+        let framesPlayed = 0;
+        
         const playNextSyncedFrame = () => {
-            if (!this.isSyncedPlayback) return;
+            if (!this.isSyncedPlayback) {
+                this.log('[PLAYBACK] Stopped, exiting playNextSyncedFrame');
+                return;
+            }
             
             if (this.syncedQueue.length > 0) {
                 // Stop any idle/loop replay as soon as real frames start
                 if (this.isReplayingAV) {
+                    this.log('[PLAYBACK] Stopping frame replay for real frames');
                     this.stopFrameReplay();
                 }
 
                 const syncedData = this.syncedQueue.shift();
+                framesPlayed++;
                 
                 // Play audio immediately
                 if (syncedData.audio) {
@@ -886,10 +1011,15 @@ class VoiceAssistant {
                         this.updateTTSMessageProgress(syncedData.word);
                     }
                 }
+                // Log every 25th frame (about once per second)
+                if (framesPlayed % 25 === 0) {
+                    this.log(`[PLAYBACK] Played ${framesPlayed} frames, queue: ${this.syncedQueue.length}, videoComplete: ${this.videoComplete}`);
+                }
             } else {
                 // Buffer underrun - no frames available
                 if (this.videoComplete) {
                     // Nothing more coming; stop cleanly
+                    this.log(`[PLAYBACK] Complete! Played ${framesPlayed} frames total, stutters: ${this.playbackStutters}`);
                     this.stopVideoPlayback();
                     this.updateAvatarStatus('ready', 'მზადაა');
                     if (this.idleFrame && !this.isDisplayingVideo) {
@@ -899,7 +1029,7 @@ class VoiceAssistant {
                 } else {
                     this.playbackStutters++;
                     if (this.playbackStutters % 5 === 1) {
-                        console.warn(`Buffer underrun #${this.playbackStutters}, queue empty`);
+                        this.log(`[PLAYBACK] Buffer underrun #${this.playbackStutters}, queue empty, waiting for more frames`);
                     }
                 }
             }
@@ -921,8 +1051,12 @@ class VoiceAssistant {
          * - Network latency statistics
          * - Generation speed measurements
          */
-        if (!config) return;
+        if (!config) {
+            this.log('[BUFFER CONFIG] Received null config, ignoring');
+            return;
+        }
         
+        this.log('[BUFFER CONFIG] Updating:', config);
         const oldConfig = { ...this.bufferConfig };
         
         if (config.buffer_ms !== undefined) {
@@ -1007,6 +1141,9 @@ class VoiceAssistant {
     }
     
     stopSyncedPlayback() {
+        this.log('[PLAYBACK] Stopping synced playback, queue remaining:', this.syncedQueue.length);
+        this.logState('stopSyncedPlayback');
+        
         this.isSyncedPlayback = false;
         this.isDisplayingVideo = false;
         this.isBuffering = false;
@@ -1024,11 +1161,15 @@ class VoiceAssistant {
         
         // Log playback stats
         if (this.playbackStutters > 0) {
-            console.log(`Playback ended with ${this.playbackStutters} stutters`);
+            this.log(`[PLAYBACK] Ended with ${this.playbackStutters} stutters`);
         }
         
         // Clear remaining synced data
+        const remainingFrames = this.syncedQueue.length;
         this.syncedQueue = [];
+        if (remainingFrames > 0) {
+            this.log(`[PLAYBACK] Cleared ${remainingFrames} remaining frames from queue`);
+        }
     }
     
     toggleMuseTalk(enabled) {
@@ -1097,6 +1238,9 @@ class VoiceAssistant {
     }
     
     stopVideoPlayback() {
+        this.log('[VIDEO] Stopping video playback');
+        this.logState('stopVideoPlayback');
+        
         this.isDisplayingVideo = false;
         this.isSyncedPlayback = false;
         this.isBuffering = false;
@@ -1108,12 +1252,18 @@ class VoiceAssistant {
         
         // Log playback stats
         if (this.playbackStutters > 0) {
-            console.log(`Video playback ended with ${this.playbackStutters} buffer underruns`);
+            this.log(`[VIDEO] Playback ended with ${this.playbackStutters} buffer underruns`);
         }
         
         // Clear remaining frames
+        const remainingVideo = this.videoFrameQueue.length;
+        const remainingSynced = this.syncedQueue.length;
         this.videoFrameQueue = [];
         this.syncedQueue = [];
+        
+        if (remainingVideo > 0 || remainingSynced > 0) {
+            this.log(`[VIDEO] Cleared ${remainingVideo} video frames, ${remainingSynced} synced frames`);
+        }
     }
     
     updateAvatarStatus(status, text) {
@@ -1194,7 +1344,12 @@ class VoiceAssistant {
     playRecordedAV(framesOverride = null) {
         // Replay stored synced audio+video frames (used in TTS-only mode and as fallback)
         const frames = framesOverride || this.recordedSyncedFrames;
-        if (!frames || frames.length === 0) return;
+        if (!frames || frames.length === 0) {
+            this.log('[REPLAY] No frames to replay');
+            return;
+        }
+        
+        this.log('[REPLAY] Starting recorded AV playback, frames:', frames.length);
         
         // Reset playback state
         this.stopSyncedPlayback();
@@ -1222,8 +1377,12 @@ class VoiceAssistant {
     }
 
     startFrameReplay(frames, loop = false) {
-        if (!frames || frames.length === 0) return;
+        if (!frames || frames.length === 0) {
+            this.log('[FRAME REPLAY] No frames to replay');
+            return;
+        }
 
+        this.log('[FRAME REPLAY] Starting, frames:', frames.length, 'loop:', loop);
         this.isReplayingAV = true;
         this.isLoopingFrames = loop;
         let index = 0;
@@ -1262,6 +1421,9 @@ class VoiceAssistant {
     }
 
     stopFrameReplay() {
+        if (this.isReplayingAV || this.frameReplayTimer) {
+            this.log('[FRAME REPLAY] Stopping');
+        }
         this.isReplayingAV = false;
         this.isLoopingFrames = false;
         if (this.frameReplayTimer) {
@@ -1314,14 +1476,20 @@ class VoiceAssistant {
         indicator.classList.remove('speaking', 'processing');
         statusEl.classList.remove('speaking', 'processing');
         
+        // Map server VAD statuses to display text
         const statusTexts = {
             'listening': 'მოსმენა...',
+            'speech_start': 'საუბარი...',
+            'speech_continue': 'საუბარი...',
             'speaking': 'საუბარი...',
             'utterance_complete': 'დამუშავება...',
             'processing': 'ტრანსკრიფცია...'
         };
         
-        if (status === 'speaking') {
+        // Treat speech_start and speech_continue as speaking
+        const isSpeaking = status === 'speaking' || status === 'speech_start' || status === 'speech_continue';
+        
+        if (isSpeaking) {
             indicator.classList.add('speaking');
             statusEl.classList.add('speaking');
         } else if (status === 'processing' || status === 'utterance_complete') {
@@ -1588,16 +1756,37 @@ class VoiceAssistant {
         this.stopVideoPlayback();
         this.hideStopButton();
         this.isGenerating = false;
+        this.setSendButtonEnabled(true);  // Re-enable send button
         this.updateAvatarStatus('ready', 'მზადაა');
     }
     
     sendTextInput() {
         const text = this.elements.textArea.value.trim();
-        if (!text || this.isGenerating) return;
+        if (!text) return;
+        
+        // Check if we can send (not generating)
+        if (this.isGenerating) {
+            this.log('[SEND] Blocked - already generating');
+            return;
+        }
+        
+        // Disable send button while processing
+        this.setSendButtonEnabled(false);
         
         this.sendMessage('text_input', { text });
         this.elements.textArea.value = '';
         this.autoResizeTextarea();
+    }
+    
+    setSendButtonEnabled(enabled) {
+        if (this.elements.sendBtn) {
+            this.elements.sendBtn.disabled = !enabled;
+            if (enabled) {
+                this.elements.sendBtn.classList.remove('disabled');
+            } else {
+                this.elements.sendBtn.classList.add('disabled');
+            }
+        }
     }
     
     autoResizeTextarea() {

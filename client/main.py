@@ -6,8 +6,11 @@ WebSocket-based streaming for VAD, STT, LLM, and TTS
 import asyncio
 import json
 import logging
+import os
 import time
 import base64
+import sys
+import signal
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -29,7 +32,6 @@ from triton_client import (
     TTSSession,
     MuseTalkParams,
     MuseTalkMetrics,
-    MuseTalkSession,
 )
 
 # Configure logging
@@ -38,6 +40,15 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Global exception handler to catch uncaught exceptions
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical("Uncaught exception!", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = global_exception_handler
 
 # Global state
 triton_client: Optional[TritonVoiceClient] = None
@@ -70,15 +81,264 @@ def _split_text_for_streaming( text: str, append_empty_stings:bool = True) -> Li
         result.extend(["", ""])
     return result
 
+
+async def run_tts_with_musetalk(
+    state: "ConnectionState",
+    tts_input_queue: Queue,
+    musetalk_available: bool,
+):
+    """
+    Shared TTS + MuseTalk synchronization logic.
+    
+    Consumes text chunks from tts_input_queue, generates audio via TTS,
+    optionally generates video frames via MuseTalk, and sends synced 
+    audio+video frames to the client.
+    
+    NOTE: MuseTalk is now stateless - we accumulate all TTS audio first,
+    then generate all video frames at once.
+    
+    Args:
+        state: The connection state
+        tts_input_queue: Queue of text chunks (list of strings). Send None to terminate.
+        musetalk_available: Whether MuseTalk video generation is enabled
+    """
+    loop = asyncio.get_event_loop()
+    
+    # Constants for syncing
+    SAMPLES_PER_FRAME = 960  # 40ms at 24kHz
+    
+    # Sync queue for combined audio+video
+    sync_queue: asyncio.Queue = asyncio.Queue()
+    
+    def run_tts_and_musetalk_synced():
+        """Run TTS and MuseTalk in sync in a background thread."""
+        try:
+            all_audio = []  # Accumulate all TTS audio
+            all_words = []  # Track words for each audio chunk
+            all_metrics = []  # Track metrics for each audio chunk
+            chunks_received = 0
+            audio_chunks_generated = 0
+            
+            logger.info(f"[TTS_WORKER] Started, session_id={state.tts_session_id}, musetalk={musetalk_available}")
+            
+            # Phase 1: Generate all TTS audio
+            while True:
+                item = tts_input_queue.get()
+                if item is None:
+                    logger.info(f"[TTS_WORKER] Received None, TTS generation complete. chunks_received={chunks_received}, audio_generated={audio_chunks_generated}")
+                    break
+                
+                text_chunks = item
+                chunks_received += 1
+                
+                if chunks_received <= 5 or chunks_received % 10 == 0:
+                    logger.info(f"[TTS_WORKER] Processing chunk #{chunks_received}: {text_chunks}")
+                
+                for audio, word, metrics in triton_client.generate_tts_stream(
+                    text_chunks,
+                    session_id=state.tts_session_id,
+                ):
+                    audio_chunks_generated += 1
+                    if audio_chunks_generated <= 3:
+                        logger.info(f"[TTS_WORKER] Audio chunk #{audio_chunks_generated}, samples={len(audio)}, word={word}")
+                    
+                    if not state.is_generating:
+                        logger.info(f"[TTS_WORKER] state.is_generating=False, breaking")
+                        break
+                    
+                    all_audio.append(audio)
+                    all_words.append(word)
+                    all_metrics.append(metrics)
+                    
+                    # If MuseTalk not available, send audio immediately
+                    if not musetalk_available:
+                        audio_b64 = base64.b64encode(audio.tobytes()).decode("utf-8")
+                        loop.call_soon_threadsafe(
+                            sync_queue.put_nowait,
+                            ("audio_only", {
+                                "audio": audio_b64,
+                                "word": word,
+                                "rtf": round(metrics.rtf, 3),
+                                "generation_time_ms": round(metrics.generation_time_ms, 1),
+                                "audio_duration_ms": round(metrics.audio_duration_ms, 1),
+                            })
+                        )
+            
+            # Phase 2: If MuseTalk available, generate video frames for all audio
+            if musetalk_available and len(all_audio) > 0 and state.is_generating:
+                # Concatenate all audio
+                full_audio = np.concatenate(all_audio)
+                total_duration_ms = len(full_audio) / 24.0  # At 24kHz
+                
+                logger.info(f"[TTS_WORKER] Generating MuseTalk frames for {len(full_audio)} samples ({total_duration_ms:.1f}ms)")
+                
+                # Get starting frame index for animation continuity
+                start_frame_index = state.musetalk_frame_index
+                
+                # Generate video frames (stateless call)
+                frames = []
+                for frame_bytes, frame_idx, timestamp_ms, mt_metrics in triton_client.generate_musetalk_frames(
+                    full_audio,
+                    frame_index=start_frame_index,
+                ):
+                    if not state.is_generating:
+                        break
+                    frames.append((frame_bytes, frame_idx, timestamp_ms))
+                
+                # Update frame index for next call
+                if frames:
+                    # frame_idx is the last frame index returned
+                    state.musetalk_frame_index = frames[-1][1] + 1
+                
+                logger.info(f"[TTS_WORKER] Generated {len(frames)} video frames")
+                
+                # Phase 3: Send synced audio+video frames
+                # Each frame is 40ms, audio is at 24kHz
+                frame_idx = 0
+                audio_offset = 0
+                word_idx = 0
+                cumulative_samples = 0
+                word_sample_boundaries = []
+                
+                # Calculate sample boundaries for each TTS chunk to map words
+                for audio_chunk in all_audio:
+                    cumulative_samples += len(audio_chunk)
+                    word_sample_boundaries.append(cumulative_samples)
+                
+                for frame_bytes, server_frame_idx, timestamp_ms in frames:
+                    if not state.is_generating:
+                        break
+                    
+                    is_last_frame = (frame_idx == len(frames) - 1)
+                    
+                    # Extract 40ms of audio for this frame
+                    audio_start = frame_idx * SAMPLES_PER_FRAME
+                    audio_end = audio_start + SAMPLES_PER_FRAME
+                    
+                    if audio_start < len(full_audio):
+                        # For last frame, include any remaining audio
+                        if is_last_frame:
+                            frame_audio = full_audio[audio_start:]
+                        else:
+                            frame_audio = full_audio[audio_start:min(audio_end, len(full_audio))]
+                        audio_b64 = base64.b64encode(frame_audio.tobytes()).decode("utf-8")
+                    else:
+                        audio_b64 = ""
+                    
+                    frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
+                    
+                    # Find the word for this frame and its metrics
+                    word = ""
+                    metrics_data = {}
+                    while word_idx < len(word_sample_boundaries) and audio_start >= word_sample_boundaries[word_idx]:
+                        word_idx += 1
+                    if word_idx < len(all_words) and all_words[word_idx]:
+                        word = all_words[word_idx]
+                        all_words[word_idx] = ""  # Clear so we don't repeat
+                        # Include metrics for this word
+                        if word_idx < len(all_metrics):
+                            metrics_data = {
+                                "rtf": round(all_metrics[word_idx].rtf, 3),
+                                "generation_time_ms": round(all_metrics[word_idx].generation_time_ms, 1),
+                                "audio_duration_ms": round(all_metrics[word_idx].audio_duration_ms, 1),
+                            }
+                    
+                    msg_data = {
+                        "audio": audio_b64,
+                        "frame": frame_b64,
+                        "frame_index": server_frame_idx,
+                        "timestamp_ms": timestamp_ms,
+                        "word": word,
+                        **metrics_data
+                    }
+                    
+                    loop.call_soon_threadsafe(
+                        sync_queue.put_nowait,
+                        ("synced", msg_data)
+                    )
+                    frame_idx += 1
+            
+            logger.info(f"[TTS_WORKER] Finished. Total chunks_received={chunks_received}, audio_chunks_generated={audio_chunks_generated}")
+            loop.call_soon_threadsafe(sync_queue.put_nowait, ("done", None))
+            
+        except Exception as e:
+            logger.error(f"[TTS_WORKER] Error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            loop.call_soon_threadsafe(sync_queue.put_nowait, ("error", str(e)))
+    
+    async def sync_consumer():
+        """Consume synced audio+video and forward to client."""
+        messages_sent = 0
+        synced_frames = 0
+        audio_only_msgs = 0
+        try:
+            logger.info(f"[SYNC_CONSUMER] Started, musetalk={musetalk_available}")
+            while state.is_generating:
+                try:
+                    msg_type, data = await asyncio.wait_for(sync_queue.get(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[SYNC_CONSUMER] Timeout waiting for synced data")
+                    break
+
+                if msg_type == "synced":
+                    synced_frames += 1
+                    await send_message(state, "synced_av_frame", data)
+                    messages_sent += 1
+                elif msg_type == "audio_only":
+                    audio_only_msgs += 1
+                    await send_message(state, "tts_audio", data)
+                    messages_sent += 1
+                elif msg_type == "done":
+                    logger.info(f"[SYNC_CONSUMER] Got 'done', stopping")
+                    break
+                elif msg_type == "error":
+                    logger.error(f"[SYNC_CONSUMER] Error: {data}")
+                    break
+        finally:
+            logger.info(f"[SYNC_CONSUMER] Finished. synced_frames={synced_frames}, audio_only_msgs={audio_only_msgs}, total_sent={messages_sent}")
+            # Only send completion messages if connection is still active
+            if state.is_connected:
+                await send_message(state, "tts_complete", {})
+                if musetalk_available:
+                    await send_message(state, "video_complete", {})
+                logger.info("[SYNC_CONSUMER] TTS/Video complete sent")
+            else:
+                logger.info("[SYNC_CONSUMER] Connection closed, skipping completion messages")
+    
+    # Start worker in background thread
+    sync_future = loop.run_in_executor(None, run_tts_and_musetalk_synced)
+    
+    # Start consumer task
+    sync_task = asyncio.create_task(sync_consumer())
+    
+    # Return futures so caller can await them
+    return sync_future, sync_task
+
+
+def handle_asyncio_exception(loop, context):
+    """Global asyncio exception handler"""
+    msg = context.get("exception", context["message"])
+    logger.error(f"Asyncio exception: {msg}")
+    if "exception" in context:
+        import traceback
+        logger.error("".join(traceback.format_exception(type(context["exception"]), context["exception"], context["exception"].__traceback__)))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     global triton_client
     
+    # Set asyncio exception handler
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(handle_asyncio_exception)
+    
     # Startup
-    logger.info("Initializing Triton client...")
+    triton_url = os.environ.get("TRITON_URL", "localhost:8001")
+    logger.info(f"Initializing Triton client with URL: {triton_url}")
     triton_client = TritonVoiceClient(
-        triton_url="localhost:8001",
+        triton_url=triton_url,
         vad_params=VADParams(),
         llm_params=LLMParams(),
         tts_params=TTSParams()
@@ -259,10 +519,13 @@ class ConnectionState:
         self.is_connected = True  # Track connection state
         self.vad_time_ms = 0
         
-        # MuseTalk state
-        self.musetalk_session_id: Optional[int] = None
-        self.musetalk_session_ready = asyncio.Event()
+        # Audio processing queue (decoupled from WS receive loop)
+        self.audio_queue: asyncio.Queue = asyncio.Queue(maxsize=100)  # ~3.2s buffer at 32ms chunks
+        self.audio_processor_task: Optional[asyncio.Task] = None
+        
+        # MuseTalk state (stateless - only track frame index for video continuity)
         self.musetalk_enabled = True  # Can be disabled if model not available
+        self.musetalk_frame_index: int = 0  # Track frame index for avatar animation continuity
         self.musetalk_audio_buffer: List[np.ndarray] = []  # Buffer TTS audio for MuseTalk
 
 
@@ -279,7 +542,8 @@ async def send_message(state_or_ws, msg_type: str, data: dict):
             ws = state_or_ws
         await ws.send_json({"type": msg_type, **data})
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        error_msg = str(e) if str(e) else type(e).__name__
+        logger.error(f"Failed to send message '{msg_type}': {error_msg}")
 
 
 @app.websocket("/ws")
@@ -299,20 +563,57 @@ async def websocket_endpoint(websocket: WebSocket):
             "message": "Connected to Voice Assistant"
         })
         
-        # Initialize TTS and MuseTalk sessions on connection
-        if triton_client:
-            # Run cache init in background
-            asyncio.create_task(init_tts_cache_async(state))
-            asyncio.create_task(init_musetalk_session_async(state))
+        # Check if MuseTalk is available and send ready message with idle frame
+        musetalk_available = await check_musetalk_available()
+        if musetalk_available:
+            # Get idle frame in background to not block connection
+            loop = asyncio.get_event_loop()
+            idle_frame = await loop.run_in_executor(None, triton_client.get_musetalk_idle_frame)
+            buffer_config = triton_client.get_buffer_config()
+            
+            await send_message(websocket, "musetalk_ready", {
+                "success": True,
+                "session_id": None,  # Stateless - no session
+                "idle_frame": base64.b64encode(idle_frame).decode("utf-8") if idle_frame else None,
+                "buffer_config": buffer_config,
+            })
+            logger.info(f"MuseTalk ready (stateless), idle_frame={'yes' if idle_frame else 'no'}")
+        else:
+            state.musetalk_enabled = False
+            await send_message(websocket, "musetalk_ready", {
+                "success": False,
+                "session_id": None,
+                "reason": "model_unavailable"
+            })
+            logger.info("MuseTalk not available")
         
-        # Main message loop
+        logger.info("WebSocket ready - TTS will be initialized on-demand")
+        
+        # Start audio processor task (decoupled from receive loop)
+        state.audio_processor_task = asyncio.create_task(audio_processor_loop(state))
+        
+        # Main message loop - fast receive, no blocking
         while True:
             message = await websocket.receive()
+            
+            # Check for disconnect message type
+            if message.get("type") == "websocket.disconnect":
+                logger.info(f"WebSocket disconnect message received: {connection_id}")
+                break
             
             if "text" in message:
                 await handle_text_message(state, json.loads(message["text"]))
             elif "bytes" in message:
-                await handle_audio_message(state, message["bytes"])
+                # Non-blocking enqueue - drop if queue is full (backpressure)
+                try:
+                    state.audio_queue.put_nowait(message["bytes"])
+                except asyncio.QueueFull:
+                    # Queue full - drop oldest and add new (sliding window)
+                    try:
+                        state.audio_queue.get_nowait()
+                        state.audio_queue.put_nowait(message["bytes"])
+                    except asyncio.QueueEmpty:
+                        pass
     
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {connection_id}")
@@ -321,6 +622,15 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         # Mark connection as closed first (so async tasks know to stop)
         state.is_connected = False
+        state.is_generating = False  # Stop any ongoing generation
+        
+        # Cancel audio processor task
+        if state.audio_processor_task is not None:
+            state.audio_processor_task.cancel()
+            try:
+                await state.audio_processor_task
+            except asyncio.CancelledError:
+                pass
         
         # Clean up TTS session on disconnect
         if state.tts_session_id is not None and triton_client is not None:
@@ -330,13 +640,7 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 logger.warning(f"Error cleaning up TTS session: {e}")
         
-        # Clean up MuseTalk session on disconnect
-        if state.musetalk_session_id is not None and triton_client is not None:
-            try:
-                triton_client.end_musetalk_session(state.musetalk_session_id)
-                logger.info(f"MuseTalk session {state.musetalk_session_id} cleaned up on disconnect")
-            except Exception as e:
-                logger.warning(f"Error cleaning up MuseTalk session: {e}")
+        # MuseTalk is now stateless - no session cleanup needed
         
         if connection_id in active_connections:
             del active_connections[connection_id]
@@ -437,110 +741,14 @@ async def init_tts_cache_async(state: ConnectionState):
         state.tts_session_id = None
 
 
-async def close_musetalk_session_async(state: ConnectionState):
-    """Close existing MuseTalk session asynchronously"""
-    if state.musetalk_session_id is not None and triton_client is not None:
-        old_session_id = state.musetalk_session_id
-        state.musetalk_session_ready.clear()
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                triton_client.end_musetalk_session,
-                old_session_id
-            )
-            logger.info(f"MuseTalk session {old_session_id} closed")
-        except Exception as e:
-            logger.warning(f"Error closing MuseTalk session {old_session_id}: {e}")
-        state.musetalk_session_id = None
-
-
-async def init_musetalk_session_async(state: ConnectionState, avatar_id: str = "default"):
-    """Initialize MuseTalk session asynchronously"""
-    state.musetalk_session_ready.clear()
-    
+async def check_musetalk_available() -> bool:
+    """Check if MuseTalk model is available on the server (stateless check)"""
     try:
-        if not state.is_connected:
-            logger.info("Connection closed, skipping MuseTalk init")
-            return
-        
-        # Check if musetalk model is available
         models_status = triton_client.check_models_ready()
-        if not models_status.get("musetalk", False):
-            logger.warning("MuseTalk model not available, disabling avatar")
-            state.musetalk_enabled = False
-            await send_message(state, "musetalk_ready", {
-                "success": False,
-                "session_id": None,
-                "reason": "model_unavailable"
-            })
-            return
-        
-        # Close existing session if any
-        if state.musetalk_session_id is not None:
-            logger.info(f"Closing existing MuseTalk session {state.musetalk_session_id}")
-            await close_musetalk_session_async(state)
-        
-        # Get new session ID
-        new_session_id = triton_client._get_next_musetalk_session_id()
-        state.musetalk_session_id = new_session_id
-        
-        if not state.is_connected:
-            state.musetalk_session_id = None
-            return
-        
-        loop = asyncio.get_event_loop()
-        success = await loop.run_in_executor(
-            None,
-            triton_client.init_musetalk_session,
-            new_session_id,
-            avatar_id
-        )
-        
-        if not state.is_connected:
-            try:
-                await loop.run_in_executor(None, triton_client.end_musetalk_session, new_session_id)
-            except Exception:
-                pass
-            state.musetalk_session_id = None
-            return
-        
-        if success:
-            state.musetalk_session_ready.set()
-            state.musetalk_enabled = True
-            
-            # Get idle frame and buffer config to send to client
-            idle_frame = triton_client.get_musetalk_idle_frame(new_session_id)
-            buffer_config = triton_client.get_buffer_config()
-
-            await send_message(state, "musetalk_ready", {
-                "success": True,
-                "session_id": new_session_id,
-                "idle_frame": base64.b64encode(idle_frame).decode("utf-8") if idle_frame else None,
-                "buffer_config": buffer_config,
-            })
-            logger.info(
-                f"MuseTalk session {new_session_id} initialized successfully, "
-                f"buffer: {buffer_config.get('buffer_ms', 0)}ms "
-                f"(source={buffer_config.get('buffer_source')}, manual={buffer_config.get('manual_buffer_ms')}) "
-                f"details: {buffer_config}"
-            )
-        else:
-            state.musetalk_session_id = None
-            state.musetalk_enabled = False
-            await send_message(state, "musetalk_ready", {
-                "success": False,
-                "session_id": new_session_id,
-                "reason": "init_failed"
-            })
-            logger.warning(f"MuseTalk initialization failed for session {new_session_id}")
-            
+        return models_status.get("musetalk", False)
     except Exception as e:
-        logger.error(f"MuseTalk init error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        state.musetalk_session_id = None
-        state.musetalk_enabled = False
+        logger.warning(f"Error checking MuseTalk availability: {e}")
+        return False
 
 
 async def handle_text_message(state: ConnectionState, data: dict):
@@ -571,6 +779,23 @@ async def handle_text_message(state: ConnectionState, data: dict):
     
     elif msg_type == "stop_generation":
         state.is_generating = False
+        # End TTS session on stop in voice_to_voice mode
+        if state.mode == "voice_to_voice" and state.tts_session_id is not None:
+            await close_tts_session_async(state)
+            logger.info("TTS session closed on stop_generation")
+
+    elif msg_type == "recording_start":
+        # Voice-to-voice: Initialize TTS when recording starts
+        if state.mode == "voice_to_voice":
+            logger.info("Recording started - initializing TTS session")
+            await init_tts_cache_async(state)
+
+    elif msg_type == "recording_stop":
+        # Voice-to-voice: Clean up TTS session when recording stops (if not generating)
+        if state.mode == "voice_to_voice" and not state.is_generating:
+            if state.tts_session_id is not None:
+                await close_tts_session_async(state)
+                logger.info("TTS session closed on recording_stop")
 
     elif msg_type == "toggle_musetalk":
         # Toggle MuseTalk on/off for testing
@@ -587,44 +812,95 @@ async def handle_text_message(state: ConnectionState, data: dict):
             logger.info(f"Buffer config sent to client: {buffer_config}")
 
 
-async def handle_audio_message(state: ConnectionState, audio_bytes: bytes):
-    """Handle audio data from WebSocket"""
-    if state.mode not in ["voice_to_voice"]:
-        return
+async def audio_processor_loop(state: ConnectionState):
+    """
+    Dedicated audio processor that consumes from audio queue.
     
-    if triton_client is None:
-        return
+    This decouples the WebSocket receive loop from audio processing,
+    preventing message backlog and disconnection issues.
     
-    # Decode audio (expecting float32 PCM at 16kHz)
-    try:
-        audio = np.frombuffer(audio_bytes, dtype=np.float32)
-    except Exception as e:
-        logger.error(f"Failed to decode audio: {e}")
-        return
+    Audio is batched and processed together to reduce per-chunk overhead.
+    """
+    audio_buffer: List[np.ndarray] = []
+    BATCH_SIZE = 5  # Process 5 chunks at once (~160ms at 32ms/chunk)
+    BATCH_TIMEOUT = 0.05  # 50ms max wait for batch to fill
     
-    # Process through VAD
-    state.vad_time_ms += len(audio) / 16000 * 1000
+    logger.info(f"[AUDIO_PROC] Started for {state.connection_id}")
     
     try:
-        loop = asyncio.get_event_loop()
-        status, complete_audio = await loop.run_in_executor(
-            None,
-            triton_client.process_vad_with_state,
-            audio,
-            state.vad_time_ms
-        )
-        
-        # Send VAD status
-        await send_message(state, "vad_status", {"status": status})
-        
-        if status == "utterance_complete" and complete_audio is not None:
-            # Process complete utterance
-            await process_voice_to_voice(state, complete_audio)
-            state.vad_time_ms = 0
-            triton_client.reset_vad_state()
-    
+        while state.is_connected:
+            # Collect a batch of audio chunks
+            batch_start = time.time()
+            
+            while len(audio_buffer) < BATCH_SIZE:
+                remaining_time = BATCH_TIMEOUT - (time.time() - batch_start)
+                if remaining_time <= 0:
+                    break
+                    
+                try:
+                    audio_bytes = await asyncio.wait_for(
+                        state.audio_queue.get(),
+                        timeout=remaining_time
+                    )
+                    
+                    # Decode audio (expecting float32 PCM at 16kHz)
+                    try:
+                        audio = np.frombuffer(audio_bytes, dtype=np.float32)
+                        audio_buffer.append(audio)
+                    except Exception as e:
+                        logger.error(f"Failed to decode audio: {e}")
+                        
+                except asyncio.TimeoutError:
+                    break
+            
+            # Process batch if we have any audio
+            if audio_buffer and state.mode == "voice_to_voice":
+                # Skip processing if currently generating (TTS/LLM running)
+                if state.is_generating:
+                    audio_buffer.clear()
+                    continue
+                
+                # Concatenate all buffered audio
+                combined_audio = np.concatenate(audio_buffer)
+                audio_buffer.clear()
+                
+                # Update VAD time
+                state.vad_time_ms += len(combined_audio) / 16000 * 1000
+                
+                if triton_client is not None:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        status, complete_audio = await loop.run_in_executor(
+                            None,
+                            triton_client.process_vad_with_state,
+                            combined_audio,
+                            state.vad_time_ms
+                        )
+                        
+                        # Send VAD status (only for speech-related changes)
+                        if status in ["speaking", "utterance_complete"]:
+                            await send_message(state, "vad_status", {"status": status})
+                        
+                        if status == "utterance_complete" and complete_audio is not None:
+                            # Process complete utterance
+                            await process_voice_to_voice(state, complete_audio)
+                            state.vad_time_ms = 0
+                            triton_client.reset_vad_state()
+                    
+                    except Exception as e:
+                        logger.error(f"VAD processing error: {e}")
+            elif audio_buffer:
+                # Clear buffer if not in voice_to_voice mode or generating
+                audio_buffer.clear()
+                
+    except asyncio.CancelledError:
+        logger.info(f"[AUDIO_PROC] Cancelled for {state.connection_id}")
     except Exception as e:
-        logger.error(f"VAD processing error: {e}")
+        logger.error(f"[AUDIO_PROC] Error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info(f"[AUDIO_PROC] Stopped for {state.connection_id}")
 
 
 async def process_voice_to_voice(state: ConnectionState, audio: np.ndarray):
@@ -687,6 +963,8 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
     When MuseTalk is enabled, audio and video are synchronized:
     - Audio is buffered until corresponding video frames are generated
     - Combined synced_av_frame messages are sent with both audio and video
+    
+    TTS and MuseTalk sessions are initialized on-demand to avoid Triton reaping idle sessions.
     """
     loop = asyncio.get_event_loop()
 
@@ -703,11 +981,17 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
     # Queues
     token_queue: asyncio.Queue = asyncio.Queue()   # LLM tokens -> main
     tts_input_queue: Queue = Queue()               # main -> TTS (blocking, thread-safe)
-    
-    # Sync queue for combined audio+video (used when MuseTalk is enabled)
-    sync_queue: asyncio.Queue = asyncio.Queue()    # Synced audio+video -> main
 
-    # Wait for TTS session to be ready
+    # Initialize TTS session on-demand (just-in-time)
+    # Close any existing session first to ensure fresh state
+    if state.tts_session_id is not None:
+        logger.info(f"Closing existing TTS session {state.tts_session_id} before new generation")
+        await close_tts_session_async(state)
+    
+    # Initialize fresh TTS session
+    logger.info("Initializing TTS session on-demand for generation...")
+    await init_tts_cache_async(state)
+    
     try:
         await asyncio.wait_for(state.tts_session_ready.wait(), timeout=35.0)
     except asyncio.TimeoutError:
@@ -719,18 +1003,18 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
         logger.error("TTS session ID is None")
         await send_message(state, "error", {"message": "TTS session not initialized"})
         return
-
-    # Check if MuseTalk is available
-    musetalk_available = (
-        state.musetalk_enabled and 
-        state.musetalk_session_id is not None and 
-        state.musetalk_session_ready.is_set()
-    )
     
-    if musetalk_available:
-        logger.info(f"MuseTalk enabled for session {state.musetalk_session_id}")
-    else:
-        logger.info("MuseTalk not available, audio-only mode")
+    logger.info(f"TTS session {state.tts_session_id} ready for generation")
+
+    # MuseTalk is now stateless - just check if model is available
+    musetalk_available = False
+    if state.musetalk_enabled:
+        musetalk_available = await check_musetalk_available()
+        if musetalk_available:
+            logger.info("MuseTalk model available (stateless mode)")
+        else:
+            logger.info("MuseTalk model not available, audio-only mode")
+            state.musetalk_enabled = False
 
     # Get current buffer config for adaptive buffering
     buffer_config = triton_client.get_buffer_config() if triton_client else {}
@@ -741,12 +1025,7 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
         "buffer_config": buffer_config,
     })
 
-    # Constants for syncing
-    # At 24kHz, 40ms (one video frame at 25 FPS) = 960 samples
-    SAMPLES_PER_FRAME = 960  # 40ms at 24kHz
-    MUSETALK_CHUNK_SIZE = 1920  # 80ms at 24kHz (produces 2 frames)
-
-    # ---------- Blocking workers (run in executor) ----------
+    # ---------- Blocking LLM worker (run in executor) ----------
 
     def run_llm_blocking():
         """Run LLM in a thread and push tokens into token_queue."""
@@ -762,221 +1041,19 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
         except Exception as e:
             loop.call_soon_threadsafe(token_queue.put_nowait, ("error", str(e)))
 
-    def run_tts_and_musetalk_synced():
-        """
-        Run TTS and MuseTalk in sync.
-        Buffers audio, generates video frames, and sends synced messages.
-        """
-        try:
-            audio_buffer = np.array([], dtype=np.float32)
-            frame_index = 0
-            # Track latest TTS metrics and word to include with synced frames
-            latest_metrics = None
-            latest_word = ""
-            
-            while True:
-                item = tts_input_queue.get()
-                if item is None:
-                    break
-
-                text_chunks = item
-
-                for audio, word, metrics in triton_client.generate_tts_stream(
-                    text_chunks,
-                    session_id=state.tts_session_id,
-                ):
-                    if not state.is_generating:
-                        break
-                    
-                    # Store latest metrics and word
-                    latest_metrics = metrics
-                    if word:
-                        latest_word = word
-                    
-                    # Add audio to buffer
-                    audio_buffer = np.concatenate([audio_buffer, audio])
-                    
-                    if musetalk_available:
-                        # Process complete 80ms chunks through MuseTalk
-                        while len(audio_buffer) >= MUSETALK_CHUNK_SIZE:
-                            chunk = audio_buffer[:MUSETALK_CHUNK_SIZE]
-                            audio_buffer = audio_buffer[MUSETALK_CHUNK_SIZE:]
-                            
-                            # Get video frames for this audio chunk
-                            frames_for_chunk = []
-                            for frame_bytes, frame_idx, timestamp_ms, mt_metrics in triton_client.send_musetalk_audio(
-                                chunk,
-                                session_id=state.musetalk_session_id
-                            ):
-                                if not state.is_generating:
-                                    break
-                                frames_for_chunk.append((frame_bytes, frame_idx, timestamp_ms))
-                            
-                            # Send synced audio+video
-                            # 80ms audio = 2 frames, each frame gets 40ms of audio
-                            if frames_for_chunk:
-                                # Split audio chunk into per-frame segments
-                                for i, (frame_bytes, f_idx, ts_ms) in enumerate(frames_for_chunk):
-                                    audio_start = i * SAMPLES_PER_FRAME
-                                    audio_end = (i + 1) * SAMPLES_PER_FRAME
-                                    frame_audio = chunk[audio_start:audio_end]
-                                    
-                                    audio_b64 = base64.b64encode(frame_audio.tobytes()).decode("utf-8")
-                                    frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
-                                    
-                                    # Build message with metrics
-                                    msg_data = {
-                                        "audio": audio_b64,
-                                        "frame": frame_b64,
-                                        "frame_index": frame_index,
-                                        "timestamp_ms": frame_index * 40.0,  # 40ms per frame
-                                        "word": latest_word if i == 0 else "",
-                                    }
-                                    # Include TTS metrics if available
-                                    if latest_metrics and i == 0:
-                                        msg_data["rtf"] = round(latest_metrics.rtf, 3)
-                                        msg_data["generation_time_ms"] = round(latest_metrics.generation_time_ms, 1)
-                                        msg_data["audio_duration_ms"] = round(latest_metrics.audio_duration_ms, 1)
-                                    
-                                    loop.call_soon_threadsafe(
-                                        sync_queue.put_nowait,
-                                        ("synced", msg_data)
-                                    )
-                                    frame_index += 1
-                                    # Clear word after first frame of chunk
-                                    if i == 0:
-                                        latest_word = ""
-                            else:
-                                # No frames generated, send audio only
-                                audio_b64 = base64.b64encode(chunk.tobytes()).decode("utf-8")
-                                msg_data = {
-                                    "audio": audio_b64,
-                                    "word": latest_word,
-                                }
-                                if latest_metrics:
-                                    msg_data["rtf"] = round(latest_metrics.rtf, 3)
-                                    msg_data["generation_time_ms"] = round(latest_metrics.generation_time_ms, 1)
-                                    msg_data["audio_duration_ms"] = round(latest_metrics.audio_duration_ms, 1)
-                                loop.call_soon_threadsafe(
-                                    sync_queue.put_nowait,
-                                    ("audio_only", msg_data)
-                                )
-                                latest_word = ""
-                    else:
-                        # No MuseTalk - send audio directly
-                        audio_b64 = base64.b64encode(audio.tobytes()).decode("utf-8")
-                        loop.call_soon_threadsafe(
-                            sync_queue.put_nowait,
-                            ("audio_only", {
-                                "audio": audio_b64,
-                                "word": word,
-                                "rtf": round(metrics.rtf, 3),
-                                "generation_time_ms": round(metrics.generation_time_ms, 1),
-                                "audio_duration_ms": round(metrics.audio_duration_ms, 1),
-                            })
-                        )
-
-            # Process any remaining audio in buffer
-            if len(audio_buffer) > 0 and state.is_generating:
-                if musetalk_available:
-                    # Pad to chunk size if needed
-                    if len(audio_buffer) < MUSETALK_CHUNK_SIZE:
-                        padded_audio = np.pad(audio_buffer, (0, MUSETALK_CHUNK_SIZE - len(audio_buffer)))
-                    else:
-                        padded_audio = audio_buffer
-                    
-                    frames_for_chunk = []
-                    for frame_bytes, f_idx, ts_ms, mt_metrics in triton_client.send_musetalk_audio(
-                        padded_audio[:MUSETALK_CHUNK_SIZE],
-                        session_id=state.musetalk_session_id
-                    ):
-                        if not state.is_generating:
-                            break
-                        frames_for_chunk.append((frame_bytes, f_idx, ts_ms))
-                    
-                    # Send remaining synced frames
-                    remaining_audio = audio_buffer
-                    for i, (frame_bytes, f_idx, ts_ms) in enumerate(frames_for_chunk):
-                        audio_start = i * SAMPLES_PER_FRAME
-                        audio_end = min((i + 1) * SAMPLES_PER_FRAME, len(remaining_audio))
-                        frame_audio = remaining_audio[audio_start:audio_end] if audio_start < len(remaining_audio) else np.array([], dtype=np.float32)
-                        
-                        if len(frame_audio) > 0:
-                            audio_b64 = base64.b64encode(frame_audio.tobytes()).decode("utf-8")
-                        else:
-                            audio_b64 = ""
-                        frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
-                        
-                        loop.call_soon_threadsafe(
-                            sync_queue.put_nowait,
-                            ("synced", {
-                                "audio": audio_b64,
-                                "frame": frame_b64,
-                                "frame_index": frame_index,
-                                "timestamp_ms": frame_index * 40.0,
-                                "word": "",
-                            })
-                        )
-                        frame_index += 1
-                else:
-                    # Send remaining audio without video
-                    audio_b64 = base64.b64encode(audio_buffer.tobytes()).decode("utf-8")
-                    loop.call_soon_threadsafe(
-                        sync_queue.put_nowait,
-                        ("audio_only", {
-                            "audio": audio_b64,
-                            "word": "",
-                        })
-                    )
-            
-            loop.call_soon_threadsafe(sync_queue.put_nowait, ("done", None))
-            
-        except Exception as e:
-            logger.error(f"TTS/MuseTalk sync thread error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            loop.call_soon_threadsafe(sync_queue.put_nowait, ("error", str(e)))
-
-    # ---------- Async consumer ----------
-
-    async def sync_consumer():
-        """Consume synced audio+video and forward to client."""
-        try:
-            while state.is_generating:
-                try:
-                    msg_type, data = await asyncio.wait_for(sync_queue.get(), timeout=120.0)
-                except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for synced data")
-                    break
-
-                if msg_type == "synced":
-                    # Send combined audio+video frame
-                    await send_message(state, "synced_av_frame", data)
-                elif msg_type == "audio_only":
-                    # Send audio only (when MuseTalk disabled or no frames)
-                    await send_message(state, "tts_audio", data)
-                elif msg_type == "done":
-                    break
-                elif msg_type == "error":
-                    logger.error(f"Sync error: {data}")
-                    break
-        finally:
-            await send_message(state, "tts_complete", {})
-            if musetalk_available:
-                await send_message(state, "video_complete", {})
-            logger.info("TTS/Video complete")
-
     try:
-        # Start workers in background threads
+        # Start LLM worker in background thread
         llm_future = loop.run_in_executor(None, run_llm_blocking)
-        sync_future = loop.run_in_executor(None, run_tts_and_musetalk_synced)
-
-        # Start consumer
-        sync_task = asyncio.create_task(sync_consumer())
+        
+        # Start shared TTS + MuseTalk worker
+        sync_future, sync_task = await run_tts_with_musetalk(
+            state, tts_input_queue, musetalk_available
+        )
 
         # State for word-based TTS streaming
         tts_started = False
         words_sent_to_tts = 0
+        logger.info(f"[LLM_TTS] Starting token processing. is_generating={state.is_generating}")
 
         # ---------- Main LLM token loop ----------
         while state.is_generating:
@@ -1000,6 +1077,7 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
 
                 if (not tts_started) and num_words >= 4:
                     first_chunk = " ".join(words[:3])
+                    logger.info(f"[LLM_TTS] Starting TTS with first chunk: '{first_chunk}'")
                     tts_input_queue.put([first_chunk])
                     tts_started = True
                     words_sent_to_tts = 3
@@ -1011,6 +1089,7 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
                     words_sent_to_tts = num_words
 
             elif msg_type == "done":
+                logger.info(f"[LLM_TTS] LLM done. tts_started={tts_started}, words_sent={words_sent_to_tts}")
                 break
             elif msg_type == "error":
                 logger.error(f"LLM error: {data}")
@@ -1023,19 +1102,35 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
 
         state.conversation.add_assistant_message(llm_response)
 
+        # Send final empty strings to flush TTS lookahead buffer
+        logger.info(f"[LLM_TTS] Flushing TTS and signaling end. tts_started={tts_started}")
         if tts_started:
             tts_input_queue.put([""])
             tts_input_queue.put([""])
 
         tts_input_queue.put(None)
+        logger.info(f"[LLM_TTS] Sent None to TTS queue. Waiting for sync_future and sync_task...")
 
         await sync_future
+        logger.info(f"[LLM_TTS] sync_future completed")
         await sync_task
+        logger.info(f"[LLM_TTS] sync_task completed")
 
-        # Reinitialize sessions for next request
-        asyncio.create_task(init_tts_cache_async(state))
-        if musetalk_available:
-            asyncio.create_task(init_musetalk_session_async(state))
+        # Voice-to-voice mode: End current session and reinitialize for next request
+        # This keeps sessions fresh and avoids stale state
+        if state.mode == "voice_to_voice":
+            if state.tts_session_id is not None:
+                await close_tts_session_async(state)
+                logger.info("[LLM_TTS] TTS session closed after voice_to_voice completion")
+            # Only reinitialize if connection is still active
+            if state.is_connected:
+                logger.info("[LLM_TTS] Reinitializing TTS session for next voice_to_voice request")
+                await init_tts_cache_async(state)
+            else:
+                logger.info("[LLM_TTS] Connection closed, skipping TTS session reinitialization")
+        else:
+            # Chat-to-voice: Sessions initialized on-demand
+            logger.info("[LLM_TTS] Generation complete. Sessions will be initialized on-demand for next request.")
 
     except Exception as e:
         logger.error(f"LLM/TTS/MuseTalk error: {e}")
@@ -1053,11 +1148,16 @@ async def process_tts_only(state: ConnectionState, text: str):
         return
     
     state.is_generating = True
-    loop = asyncio.get_event_loop()
 
-    text_chunks = _split_text_for_streaming(text)
     try:
-        # Wait for TTS session to be ready (with timeout)
+        # Initialize TTS session on-demand (just-in-time)
+        if state.tts_session_id is not None:
+            logger.info(f"Closing existing TTS session {state.tts_session_id} before TTS-only generation")
+            await close_tts_session_async(state)
+        
+        logger.info("Initializing TTS session on-demand for TTS-only generation...")
+        await init_tts_cache_async(state)
+        
         try:
             await asyncio.wait_for(state.tts_session_ready.wait(), timeout=35.0)
         except asyncio.TimeoutError:
@@ -1065,22 +1165,22 @@ async def process_tts_only(state: ConnectionState, text: str):
             await send_message(state, "error", {"message": "TTS session not ready"})
             return
         
-        # Double check session is valid
         if state.tts_session_id is None:
-            logger.error("TTS session ID is None after ready signal")
+            logger.error("TTS session ID is None after initialization")
             await send_message(state, "error", {"message": "TTS session not initialized"})
             return
         
-        # Check if MuseTalk is available
+        logger.info(f"TTS session {state.tts_session_id} ready for TTS-only generation")
+        
+        # MuseTalk is now stateless - just check if model is available
         musetalk_available = False
-        if state.musetalk_enabled and state.musetalk_session_id is not None:
-            # Wait briefly for MuseTalk session to be ready; if not, fall back to audio-only
-            try:
-                await asyncio.wait_for(state.musetalk_session_ready.wait(), timeout=5.0)
-                musetalk_available = state.musetalk_session_ready.is_set()
-            except asyncio.TimeoutError:
-                logger.warning("MuseTalk session not ready in time; continuing without video for this request")
-                musetalk_available = False
+        if state.musetalk_enabled:
+            musetalk_available = await check_musetalk_available()
+            if musetalk_available:
+                logger.info("MuseTalk model available (stateless mode) for TTS-only")
+            else:
+                logger.info("MuseTalk model not available, audio-only mode for TTS-only")
+                state.musetalk_enabled = False
     
         # Get current buffer config for adaptive buffering
         buffer_config = triton_client.get_buffer_config() if triton_client else {}
@@ -1091,205 +1191,25 @@ async def process_tts_only(state: ConnectionState, text: str):
             "buffer_config": buffer_config,
         })
         
-        # Sync queue for combined audio+video
-        sync_queue: asyncio.Queue = asyncio.Queue()
+        # Create TTS input queue and pre-fill with text chunks
+        tts_input_queue: Queue = Queue()
+        text_chunks = _split_text_for_streaming(text)
+        for chunk in text_chunks:
+            tts_input_queue.put([chunk])
+        tts_input_queue.put(None)  # Signal end
         
-        # Constants for syncing
-        SAMPLES_PER_FRAME = 960  # 40ms at 24kHz
-        MUSETALK_CHUNK_SIZE = 1920  # 80ms at 24kHz (produces 2 frames)
-        
-        def run_tts_and_musetalk_synced():
-            """Run TTS and MuseTalk in sync."""
-            try:
-                audio_buffer = np.array([], dtype=np.float32)
-                frame_index = 0
-                latest_metrics = None
-                latest_word = ""
-                
-                for audio, word, metrics in triton_client.generate_tts_stream(text_chunks, session_id=state.tts_session_id):
-                    if not state.is_generating:
-                        break
-                    
-                    # Store latest metrics and word
-                    latest_metrics = metrics
-                    if word:
-                        latest_word = word
-                    
-                    # Add audio to buffer
-                    audio_buffer = np.concatenate([audio_buffer, audio])
-                    
-                    if musetalk_available:
-                        # Process complete 80ms chunks through MuseTalk
-                        while len(audio_buffer) >= MUSETALK_CHUNK_SIZE:
-                            chunk = audio_buffer[:MUSETALK_CHUNK_SIZE]
-                            audio_buffer = audio_buffer[MUSETALK_CHUNK_SIZE:]
-                            
-                            # Get video frames for this audio chunk
-                            frames_for_chunk = []
-                            for frame_bytes, frame_idx, timestamp_ms, mt_metrics in triton_client.send_musetalk_audio(
-                                chunk,
-                                session_id=state.musetalk_session_id
-                            ):
-                                if not state.is_generating:
-                                    break
-                                frames_for_chunk.append((frame_bytes, frame_idx, timestamp_ms))
-                            
-                            # Send synced audio+video
-                            if frames_for_chunk:
-                                for i, (frame_bytes, f_idx, ts_ms) in enumerate(frames_for_chunk):
-                                    audio_start = i * SAMPLES_PER_FRAME
-                                    audio_end = (i + 1) * SAMPLES_PER_FRAME
-                                    frame_audio = chunk[audio_start:audio_end]
-                                    
-                                    audio_b64 = base64.b64encode(frame_audio.tobytes()).decode("utf-8")
-                                    frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
-                                    
-                                    # Build message with metrics
-                                    msg_data = {
-                                        "audio": audio_b64,
-                                        "frame": frame_b64,
-                                        "frame_index": frame_index,
-                                        "timestamp_ms": frame_index * 40.0,
-                                        "word": latest_word if i == 0 else "",
-                                    }
-                                    # Include TTS metrics if available
-                                    if latest_metrics and i == 0:
-                                        msg_data["rtf"] = round(latest_metrics.rtf, 3)
-                                        msg_data["generation_time_ms"] = round(latest_metrics.generation_time_ms, 1)
-                                        msg_data["audio_duration_ms"] = round(latest_metrics.audio_duration_ms, 1)
-                                    
-                                    loop.call_soon_threadsafe(
-                                        sync_queue.put_nowait,
-                                        ("synced", msg_data)
-                                    )
-                                    frame_index += 1
-                                    if i == 0:
-                                        latest_word = ""
-                            else:
-                                # No frames generated, send audio only
-                                audio_b64 = base64.b64encode(chunk.tobytes()).decode("utf-8")
-                                msg_data = {
-                                    "audio": audio_b64,
-                                    "word": latest_word,
-                                }
-                                if latest_metrics:
-                                    msg_data["rtf"] = round(latest_metrics.rtf, 3)
-                                    msg_data["generation_time_ms"] = round(latest_metrics.generation_time_ms, 1)
-                                    msg_data["audio_duration_ms"] = round(latest_metrics.audio_duration_ms, 1)
-                                loop.call_soon_threadsafe(
-                                    sync_queue.put_nowait,
-                                    ("audio_only", msg_data)
-                                )
-                                latest_word = ""
-                    else:
-                        # No MuseTalk - send audio directly
-                        audio_b64 = base64.b64encode(audio.tobytes()).decode("utf-8")
-                        loop.call_soon_threadsafe(
-                            sync_queue.put_nowait,
-                            ("audio_only", {
-                                "audio": audio_b64,
-                                "word": word,
-                                "rtf": round(metrics.rtf, 3),
-                                "generation_time_ms": round(metrics.generation_time_ms, 1),
-                                "audio_duration_ms": round(metrics.audio_duration_ms, 1),
-                            })
-                        )
-                
-                # Process remaining audio
-                if len(audio_buffer) > 0 and state.is_generating:
-                    if musetalk_available:
-                        if len(audio_buffer) < MUSETALK_CHUNK_SIZE:
-                            padded_audio = np.pad(audio_buffer, (0, MUSETALK_CHUNK_SIZE - len(audio_buffer)))
-                        else:
-                            padded_audio = audio_buffer
-                        
-                        frames_for_chunk = []
-                        for frame_bytes, f_idx, ts_ms, mt_metrics in triton_client.send_musetalk_audio(
-                            padded_audio[:MUSETALK_CHUNK_SIZE],
-                            session_id=state.musetalk_session_id
-                        ):
-                            if not state.is_generating:
-                                break
-                            frames_for_chunk.append((frame_bytes, f_idx, ts_ms))
-                        
-                        remaining_audio = audio_buffer
-                        for i, (frame_bytes, f_idx, ts_ms) in enumerate(frames_for_chunk):
-                            audio_start = i * SAMPLES_PER_FRAME
-                            audio_end = min((i + 1) * SAMPLES_PER_FRAME, len(remaining_audio))
-                            frame_audio = remaining_audio[audio_start:audio_end] if audio_start < len(remaining_audio) else np.array([], dtype=np.float32)
-                            
-                            if len(frame_audio) > 0:
-                                audio_b64 = base64.b64encode(frame_audio.tobytes()).decode("utf-8")
-                            else:
-                                audio_b64 = ""
-                            frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
-                            
-                            loop.call_soon_threadsafe(
-                                sync_queue.put_nowait,
-                                ("synced", {
-                                    "audio": audio_b64,
-                                    "frame": frame_b64,
-                                    "frame_index": frame_index,
-                                    "timestamp_ms": frame_index * 40.0,
-                                    "word": "",
-                                })
-                            )
-                            frame_index += 1
-                    else:
-                        audio_b64 = base64.b64encode(audio_buffer.tobytes()).decode("utf-8")
-                        loop.call_soon_threadsafe(
-                            sync_queue.put_nowait,
-                            ("audio_only", {
-                                "audio": audio_b64,
-                                "word": "",
-                            })
-                        )
-                
-                loop.call_soon_threadsafe(sync_queue.put_nowait, ("done", None))
-                
-            except Exception as e:
-                logger.error(f"TTS/MuseTalk sync thread error: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                loop.call_soon_threadsafe(sync_queue.put_nowait, ("error", str(e)))
-
-        async def sync_consumer():
-            """Consume synced audio+video and forward to client."""
-            try:
-                while state.is_generating:
-                    try:
-                        msg_type, data = await asyncio.wait_for(sync_queue.get(), timeout=120.0)
-                    except asyncio.TimeoutError:
-                        logger.warning("Timeout waiting for synced data")
-                        break
-
-                    if msg_type == "synced":
-                        await send_message(state, "synced_av_frame", data)
-                    elif msg_type == "audio_only":
-                        await send_message(state, "tts_audio", data)
-                    elif msg_type == "done":
-                        break
-                    elif msg_type == "error":
-                        logger.error(f"Sync error: {data}")
-                        break
-            finally:
-                await send_message(state, "tts_complete", {})
-                if musetalk_available:
-                    await send_message(state, "video_complete", {})
-                logger.info("TTS only complete")
-
-        # Start workers
-        sync_future = loop.run_in_executor(None, run_tts_and_musetalk_synced)
-        sync_task = asyncio.create_task(sync_consumer())
+        # Run shared TTS + MuseTalk logic
+        sync_future, sync_task = await run_tts_with_musetalk(
+            state, tts_input_queue, musetalk_available
+        )
         
         # Wait for completion
         await sync_future
         await sync_task
         
-        # Reinitialize TTS session for next generation; keep MuseTalk session if already ready
-        asyncio.create_task(init_tts_cache_async(state))
-        if not state.musetalk_session_ready.is_set() or state.musetalk_session_id is None:
-            asyncio.create_task(init_musetalk_session_async(state))
+        # Don't pre-initialize sessions for next request
+        # They will be initialized on-demand when next generation starts
+        logger.info("[TTS_ONLY] Generation complete. Sessions will be initialized on-demand for next request.")
     
     except Exception as e:
         logger.error(f"TTS only error: {e}")
