@@ -30,4 +30,8 @@ RUN pip install --no-cache \
 RUN pip install --no-cache opencv-python-headless==4.10.0.84 \
     diffusers==0.30.2 \
     einops==0.8.1 \
-    sounddevice==0.5.3 \
+    sounddevice==0.5.3 
+
+EXPOSE 8001
+
+CMD ["tritonserver", "--model-repository", "/models", "--strict-model-config", "false", "--log-verbose", "1"]

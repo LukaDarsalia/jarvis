@@ -19,11 +19,8 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command: >
-      tritonserver
-      --model-repository=/models
-      --strict-model-config=false
-      --log-verbose=1
+    networks:
+      - triton-network
 
   client:
     build:
@@ -35,4 +32,10 @@ services:
       - triton
     environment:
       - TRITON_URL=triton:8001
-    restart: unless-stopped
+    networks:
+      - triton-network
+
+
+networks:
+  triton-network:
+    driver: bridge
