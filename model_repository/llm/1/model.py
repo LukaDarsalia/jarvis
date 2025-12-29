@@ -9,6 +9,7 @@ import triton_python_backend_utils as pb_utils
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 from threading import Thread
 import json
+import time
 
 
 class TritonPythonModel:
@@ -85,7 +86,10 @@ class TritonPythonModel:
                 pb_utils.Logger.log_info(f"Streaming generation: max_tokens={max_new_tokens}, temp={temperature}")
                 
                 # Tokenize input
-                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+                tokenize_start = time.perf_counter()
+                inputs = self.tokenizer(prompt, return_token_type_ids=False,  return_tensors="pt").to(self.model.device)
+                tokenize_ms = (time.perf_counter() - tokenize_start) * 1000.0
+                prompt_tokens = int(inputs["input_ids"].shape[-1])
                 
                 # Create streamer
                 streamer = TextIteratorStreamer(
@@ -106,12 +110,20 @@ class TritonPythonModel:
                 }
                 
                 # Start generation in a thread
+                start_time = time.perf_counter()
                 thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
                 thread.start()
                 
                 # Stream tokens
+                first_token_time = None
+                chunk_count = 0
+                char_count = 0
                 for text_chunk in streamer:
                     if text_chunk:
+                        if first_token_time is None:
+                            first_token_time = time.perf_counter()
+                        chunk_count += 1
+                        char_count += len(text_chunk)
                         chunk_tensor = pb_utils.Tensor(
                             "TEXT_CHUNK",
                             np.array([text_chunk.encode("utf-8")], dtype=object)
@@ -125,6 +137,11 @@ class TritonPythonModel:
                 
                 # Wait for thread to finish
                 thread.join()
+                end_time = time.perf_counter()
+                total_ms = (end_time - start_time) * 1000.0
+                ttft_ms = (first_token_time - start_time) * 1000.0 if first_token_time else 0.0
+                gen_ms = (end_time - first_token_time) * 1000.0 if first_token_time else 0.0
+                chunks_per_s = (chunk_count / (gen_ms / 1000.0)) if gen_ms > 0 else 0.0
                 
                 # Send final response
                 chunk_tensor = pb_utils.Tensor(
@@ -141,7 +158,12 @@ class TritonPythonModel:
                     flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
                 )
                 
-                pb_utils.Logger.log_info("Streaming generation completed")
+                pb_utils.Logger.log_info(
+                    f"Streaming generation completed: prompt_tokens={prompt_tokens} "
+                    f"chunks={chunk_count} chars={char_count} ttft_ms={ttft_ms:.1f} "
+                    f"gen_ms={gen_ms:.1f} total_ms={total_ms:.1f} "
+                    f"chunks_per_s={chunks_per_s:.2f} tokenize_ms={tokenize_ms:.1f}"
+                )
                 
             except Exception as e:
                 pb_utils.Logger.log_error(f"Error in LLM streaming: {str(e)}")

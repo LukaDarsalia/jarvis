@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 import triton_python_backend_utils as pb_utils
+import os
+import time
 
 class TritonPythonModel:
 
@@ -14,11 +16,14 @@ class TritonPythonModel:
         self.chunk_samples = 512  # Silero VAD requires exactly 512 samples at 16kHz
         self.frame_ms = self.chunk_samples / self.sample_rate * 1000  # ~32ms
         self.silence_threshold_ms = 1000  # 0.4 sec silence = end-of-speech
+        self.log_every_n = int(os.environ.get("VAD_LOG_EVERY_N", "200"))
+        self._req_count = 0
 
     def execute(self, requests):
         responses = []
 
         for req in requests:
+            start_time = time.perf_counter()
             audio = pb_utils.get_input_tensor_by_name(req, "AUDIO_PCM").as_numpy()
 
             # Process audio in chunks of 512 samples
@@ -54,5 +59,12 @@ class TritonPythonModel:
             ]
 
             responses.append(pb_utils.InferenceResponse(outputs))
+            self._req_count += 1
+            if self.log_every_n > 0 and self._req_count % self.log_every_n == 0:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                pb_utils.Logger.log_info(
+                    f"VAD: req={self._req_count} audio_samples={len(audio)} "
+                    f"elapsed_ms={elapsed_ms:.2f} prob={prob:.3f} speech={is_speech} end={end_of_utt}"
+                )
 
         return responses

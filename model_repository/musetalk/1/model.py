@@ -11,6 +11,7 @@ import glob
 import pickle
 import traceback
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
@@ -282,11 +283,14 @@ class TritonPythonModel:
             )
             audio = audio[-max_samples:]
         
+        t0 = time.perf_counter()
         # Create temp file for audio
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as temp_file:
             # Resample and save
             resampled = self._resample_audio(audio)
+            t_resample = time.perf_counter()
             sf.write(temp_file.name, resampled, self.config.whisper_sample_rate)
+            t_write = time.perf_counter()
             
             try:
                 # Get audio features using existing AudioProcessor
@@ -294,6 +298,7 @@ class TritonPythonModel:
                     temp_file.name,
                     weight_dtype=self.weight_dtype
                 )
+                t_features = time.perf_counter()
                 
                 if not whisper_input_features:
                     return None
@@ -308,6 +313,15 @@ class TritonPythonModel:
                     fps=self.config.fps,
                     audio_padding_length_left=self.config.audio_padding_length_left,
                     audio_padding_length_right=self.config.audio_padding_length_right
+                )
+                t_chunks = time.perf_counter()
+                pb_utils.Logger.log_info(
+                    "Whisper timing (ms): "
+                    f"resample={(t_resample - t0) * 1000.0:.1f} "
+                    f"write={(t_write - t_resample) * 1000.0:.1f} "
+                    f"feature={(t_features - t_write) * 1000.0:.1f} "
+                    f"chunk={(t_chunks - t_features) * 1000.0:.1f} "
+                    f"total={(t_chunks - t0) * 1000.0:.1f}"
                 )
                 
                 return whisper_chunks
@@ -417,9 +431,12 @@ class TritonPythonModel:
             
             audio_duration_s = len(audio) / self.config.input_sample_rate
             pb_utils.Logger.log_info(f"Processing audio: {audio_duration_s:.3f}s, start_frame_index: {frame_index}")
+            req_start = time.perf_counter()
             
             # Process audio through Whisper
+            whisper_start = time.perf_counter()
             whisper_chunks = self._process_audio_to_whisper(audio)
+            whisper_ms = (time.perf_counter() - whisper_start) * 1000.0
             
             if whisper_chunks is None or len(whisper_chunks) == 0:
                 pb_utils.Logger.log_error("Failed to process audio through Whisper")
@@ -429,13 +446,28 @@ class TritonPythonModel:
             pb_utils.Logger.log_info(f"Generated {len(whisper_chunks)} whisper chunks")
             
             # Generate all frames
+            gen_start = time.perf_counter()
             frames = self._generate_frames(whisper_chunks, frame_index)
+            gen_ms = (time.perf_counter() - gen_start) * 1000.0
             
             if len(frames) == 0:
                 pb_utils.Logger.log_warning("No frames generated")
                 self._send_final(sender)
                 return
             
+            total_ms = (time.perf_counter() - req_start) * 1000.0
+            fps = (len(frames) / (gen_ms / 1000.0)) if gen_ms > 0 else 0.0
+            rtf = (total_ms / (audio_duration_s * 1000.0)) if audio_duration_s > 0 else 0.0
+            pb_utils.Logger.log_info(
+                "MuseTalk perf: "
+                f"audio_s={audio_duration_s:.3f} "
+                f"whisper_ms={whisper_ms:.1f} "
+                f"gen_ms={gen_ms:.1f} "
+                f"total_ms={total_ms:.1f} "
+                f"fps={fps:.1f} "
+                f"rtf={rtf:.3f}"
+            )
+
             pb_utils.Logger.log_info(f"Sending {len(frames)} frames")
             
             # Send all frames

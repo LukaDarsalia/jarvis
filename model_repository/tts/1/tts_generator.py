@@ -15,6 +15,20 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 
 @dataclass
+class PerfStats:
+    bb_inject_ms: float = 0.0
+    bb_audio_ms: float = 0.0
+    dd_ms: float = 0.0
+    lm_ms: float = 0.0
+    codec_ms: float = 0.0
+    inject_calls: int = 0
+    audio_calls: int = 0
+    dd_calls: int = 0
+    lm_calls: int = 0
+    codec_calls: int = 0
+
+
+@dataclass
 class GenerationState:
     """State for a single generation session."""
     bb_pkv: StaticCache
@@ -29,6 +43,7 @@ class GenerationState:
     eos: torch.Tensor
     cache_pos: torch.Tensor
     has_active_text: bool       # True if currently generating for a chunk
+    perf: PerfStats = field(default_factory=PerfStats)
     last_activity_time: float = field(default_factory=time.time)  # Track last activity
 
 
@@ -60,6 +75,8 @@ class TTSGenerator:
         self.decoder_top_p = decoder_top_p
         self.max_concurrent_sessions = max_concurrent_sessions
         self.idle_timeout_seconds = idle_timeout_seconds
+        self.enable_timing = os.environ.get("TTS_TIMING", "1") != "0"
+        self.timing_sync_cuda = os.environ.get("TTS_TIMING_SYNC", "0") == "1"
 
         # Torch settings
         torch.set_grad_enabled(False)
@@ -104,6 +121,17 @@ class TTSGenerator:
         self._cleanup_thread_stop = threading.Event()
         self._cleanup_thread = threading.Thread(target=self._idle_session_cleanup_loop, daemon=True)
         self._cleanup_thread.start()
+
+    def _maybe_sync(self):
+        if self.enable_timing and self.timing_sync_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _record_perf(self, state: GenerationState, key: str, delta_ms: float, count_key: Optional[str] = None):
+        if not self.enable_timing:
+            return
+        setattr(state.perf, key, getattr(state.perf, key) + delta_ms)
+        if count_key:
+            setattr(state.perf, count_key, getattr(state.perf, count_key) + 1)
 
     def _idle_session_cleanup_loop(self):
         """Background thread to clean up idle sessions."""
@@ -161,6 +189,26 @@ class TTSGenerator:
                 })
         
         return info
+
+    def get_session_perf(self, session_id: int, reset: bool = False) -> Optional[PerfStats]:
+        with self.session_lock:
+            state = self.sessions.get(session_id)
+            if state is None:
+                return None
+            perf = state.perf
+            if reset:
+                state.perf = PerfStats()
+            return perf
+
+    def record_codec_time(self, session_id: int, delta_ms: float):
+        if not self.enable_timing:
+            return
+        with self.session_lock:
+            state = self.sessions.get(session_id)
+            if state is None:
+                return
+            state.perf.codec_ms += delta_ms
+            state.perf.codec_calls += 1
 
     def save_model(self, save_dir: str = "saved_csm_model"):
         os.makedirs(save_dir, exist_ok=True)
@@ -429,6 +477,9 @@ class TTSGenerator:
                         inject_embeds = self.model.embed_text_tokens(
                             inject_inputs["input_ids"]
                         )
+                        if self.enable_timing:
+                            self._maybe_sync()
+                            t0 = time.perf_counter()
                         (
                             state.h_last,
                             state.bb_pkv,
@@ -440,6 +491,14 @@ class TTSGenerator:
                             state.bb_pkv,
                             state.seq_len,
                         )
+                        if self.enable_timing:
+                            self._maybe_sync()
+                            self._record_perf(
+                                state,
+                                "bb_inject_ms",
+                                (time.perf_counter() - t0) * 1000.0,
+                                "inject_calls",
+                            )
                         state.has_active_text = True
                         state.cur_step = 0
                         state.counter += 1  # consumed this text chunk
@@ -449,6 +508,9 @@ class TTSGenerator:
                         break
 
                 # 2) We have an active text chunk: generate one frame
+                if self.enable_timing:
+                    self._maybe_sync()
+                    t0 = time.perf_counter()
                 logits0 = self.model.lm_head(state.h_last.unsqueeze(1))[:, -1:, :]
                 c0 = self.sample_from_logits(
                     logits0[:, -1, :],
@@ -456,6 +518,14 @@ class TTSGenerator:
                     temperature=self.temperature,
                     top_p=self.top_p,
                 )
+                if self.enable_timing:
+                    self._maybe_sync()
+                    self._record_perf(
+                        state,
+                        "lm_ms",
+                        (time.perf_counter() - t0) * 1000.0,
+                        "lm_calls",
+                    )
 
                 reached_eos = (c0 == state.eos).all()
 
@@ -468,6 +538,9 @@ class TTSGenerator:
 
                 # Depth decoder for codebooks 1..N
                 depth_prompt = torch.nn.functional.pad(c0, (1, 0), value=0)
+                if self.enable_timing:
+                    self._maybe_sync()
+                    t0 = time.perf_counter()
                 dd_out = self.model.depth_decoder.generate(
                     input_ids=depth_prompt,
                     backbone_last_hidden_state=state.h_last.clone(),
@@ -480,12 +553,23 @@ class TTSGenerator:
                     past_key_values=state.dd_pkv,
                     return_dict_in_generate=False,
                 )
+                if self.enable_timing:
+                    self._maybe_sync()
+                    self._record_perf(
+                        state,
+                        "dd_ms",
+                        (time.perf_counter() - t0) * 1000.0,
+                        "dd_calls",
+                    )
                 frame = dd_out[:, 1:]  # [B, num_codebooks]
                 state.frames.append(frame)
 
                 # Feed new audio frame back into backbone
                 frame_3d = frame.unsqueeze(1)  # [B,1,C]
                 audio_embeds = self.model.backbone_model.embed_tokens(frame_3d)
+                if self.enable_timing:
+                    self._maybe_sync()
+                    t0 = time.perf_counter()
                 (
                     state.h_last,
                     state.bb_pkv,
@@ -497,6 +581,14 @@ class TTSGenerator:
                     state.bb_pkv,
                     state.seq_len,
                 )
+                if self.enable_timing:
+                    self._maybe_sync()
+                    self._record_perf(
+                        state,
+                        "bb_audio_ms",
+                        (time.perf_counter() - t0) * 1000.0,
+                        "audio_calls",
+                    )
 
                 state.cur_step += 1
                 steps_taken += 1
