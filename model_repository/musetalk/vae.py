@@ -28,7 +28,7 @@ class VAE():
         
         # Load VAE - with absolute path, diffusers will use local files
         # It will automatically fall back from .safetensors to .bin if needed
-        self.vae = AutoencoderKL.from_pretrained(model_path)
+        self.vae = AutoencoderKL.from_pretrained(model_path, use_safetensors=False)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.vae.to(self.device)

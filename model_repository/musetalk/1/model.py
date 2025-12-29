@@ -116,13 +116,14 @@ class TritonPythonModel:
         device = torch.device(self.config.device)
         
         pb_utils.Logger.log_info(f"Loading VAE model from {self.config.vae_model_path}...")
-        self.vae = VAE(model_path=self.config.vae_model_path)
+        self.vae = VAE(model_path=self.config.vae_model_path, use_float16=True)
         
         pb_utils.Logger.log_info(f"Loading UNet model from {self.config.unet_model_path}...")
         self.unet = UNet(
             unet_config=self.config.unet_config,
             model_path=self.config.unet_model_path,
-            device=device
+            device=device,
+            use_float16=True
         )
         
         pb_utils.Logger.log_info("Loading Positional Encoding...")
@@ -132,9 +133,9 @@ class TritonPythonModel:
         self.whisper = WhisperModel.from_pretrained(self.config.whisper_dir)
         
         # Convert to half precision and move to device
-        self.pe = self.pe.half().to(device)
-        self.vae.vae = self.vae.vae.half().to(device)
-        self.unet.model = self.unet.model.half().to(device)
+        self.pe = self.pe.half()
+        # self.vae.vae = self.vae.vae.half()
+        # self.unet.model = self.unet.model.half()
         self.whisper = self.whisper.to(device=device, dtype=torch.float16).eval()
         self.whisper.requires_grad_(False)
         

@@ -93,6 +93,10 @@ class VoiceAssistant {
                 depth_temperature: 0.8,
                 depth_top_p: 0.9
             },
+            musetalk: {
+                start_after_chunks: 3,
+                lookahead_chunks: 2
+            },
             buffer: {
                 manual_buffer_ms: null
             }
@@ -207,6 +211,10 @@ class VoiceAssistant {
             ttsDepthTempValue: document.getElementById('ttsDepthTempValue'),
             ttsDepthTopP: document.getElementById('ttsDepthTopP'),
             ttsDepthTopPValue: document.getElementById('ttsDepthTopPValue'),
+            musetalkStartChunks: document.getElementById('musetalkStartChunks'),
+            musetalkStartChunksValue: document.getElementById('musetalkStartChunksValue'),
+            musetalkLookaheadChunks: document.getElementById('musetalkLookaheadChunks'),
+            musetalkLookaheadChunksValue: document.getElementById('musetalkLookaheadChunksValue'),
             bufferSize: document.getElementById('bufferSize'),
             bufferAutoToggle: document.getElementById('bufferAutoToggle'),
             bufferCurrent: document.getElementById('bufferCurrent'),
@@ -252,6 +260,8 @@ class VoiceAssistant {
         this.bindSlider('ttsBackboneTopP', 'ttsBackboneTopPValue');
         this.bindSlider('ttsDepthTemp', 'ttsDepthTempValue');
         this.bindSlider('ttsDepthTopP', 'ttsDepthTopPValue');
+        this.bindSlider('musetalkStartChunks', 'musetalkStartChunksValue');
+        this.bindSlider('musetalkLookaheadChunks', 'musetalkLookaheadChunksValue');
         if (this.elements.bufferAutoToggle) {
             this.elements.bufferAutoToggle.addEventListener('change', () => this.toggleBufferMode());
         }
@@ -502,6 +512,13 @@ class VoiceAssistant {
                 this.log('[VIDEO] Complete, total frames received:', this.totalFramesReceived);
                 this.logState('video_complete_begin');
                 this.videoComplete = true;
+
+                if (this.recordedSyncedFrames && this.recordedSyncedFrames.length > 0) {
+                    const lastFrame = this.recordedSyncedFrames[this.recordedSyncedFrames.length - 1];
+                    if (lastFrame && lastFrame.frame) {
+                        this.idleFrame = lastFrame.frame;
+                    }
+                }
 
                 const haveFrames = this.syncedQueue.length > 0 || (this.recordedSyncedFrames && this.recordedSyncedFrames.length > 0);
                 this.log('[VIDEO] haveFrames:', haveFrames, 'isBuffering:', this.isBuffering, 'isSyncedPlayback:', this.isSyncedPlayback);
@@ -1828,6 +1845,11 @@ class VoiceAssistant {
         this.elements.ttsDepthTempValue.textContent = this.config.tts.depth_temperature;
         this.elements.ttsDepthTopP.value = this.config.tts.depth_top_p;
         this.elements.ttsDepthTopPValue.textContent = this.config.tts.depth_top_p;
+
+        this.elements.musetalkStartChunks.value = this.config.musetalk.start_after_chunks;
+        this.elements.musetalkStartChunksValue.textContent = this.config.musetalk.start_after_chunks;
+        this.elements.musetalkLookaheadChunks.value = this.config.musetalk.lookahead_chunks;
+        this.elements.musetalkLookaheadChunksValue.textContent = this.config.musetalk.lookahead_chunks;
         
         this.updateBufferSettingUI();
     }
@@ -1880,6 +1902,9 @@ class VoiceAssistant {
         this.config.tts.backbone_top_p = parseFloat(this.elements.ttsBackboneTopP.value);
         this.config.tts.depth_temperature = parseFloat(this.elements.ttsDepthTemp.value);
         this.config.tts.depth_top_p = parseFloat(this.elements.ttsDepthTopP.value);
+
+        this.config.musetalk.start_after_chunks = parseInt(this.elements.musetalkStartChunks.value);
+        this.config.musetalk.lookahead_chunks = parseInt(this.elements.musetalkLookaheadChunks.value);
         
         const autoBuffer = this.elements.bufferAutoToggle?.checked ?? true;
         if (autoBuffer) {
@@ -1938,6 +1963,10 @@ class VoiceAssistant {
                 depth_temperature: 0.8,
                 depth_top_p: 0.9
             },
+            musetalk: {
+                start_after_chunks: 3,
+                lookahead_chunks: 2
+            },
             buffer: {
                 manual_buffer_ms: null
             }
@@ -1965,6 +1994,7 @@ class VoiceAssistant {
                 if (serverConfig.vad) this.config.vad = { ...this.config.vad, ...serverConfig.vad };
                 if (serverConfig.llm) this.config.llm = { ...this.config.llm, ...serverConfig.llm };
                 if (serverConfig.tts) this.config.tts = { ...this.config.tts, ...serverConfig.tts };
+                if (serverConfig.musetalk) this.config.musetalk = { ...this.config.musetalk, ...serverConfig.musetalk };
                 if (serverConfig.buffer) {
                     this.config.buffer = { ...this.config.buffer, manual_buffer_ms: serverConfig.buffer.manual_buffer_ms ?? this.config.buffer.manual_buffer_ms };
                     this.updateBufferConfig({

@@ -59,6 +59,8 @@ class MuseTalkParams:
     """MuseTalk configuration parameters"""
     avatar_id: str = "default"
     fps: int = 25
+    start_after_chunks: int = 3
+    lookahead_chunks: int = 2
 
 
 @dataclass
@@ -1425,10 +1427,7 @@ class TritonVoiceClient:
                         break
                     
                     response = data.get_response()
-                    
-                    # Check for final response
-                    if response.parameters.get("triton_final_response").bool_param:
-                        break
+                    is_final = response.parameters.get("triton_final_response").bool_param
                     
                     frame_data = data.as_numpy("VIDEO_FRAME")
                     output_frame_index = int(data.as_numpy("FRAME_INDEX")[0])
@@ -1449,6 +1448,9 @@ class TritonVoiceClient:
                             on_frame(frame_bytes, output_frame_index, timestamp_ms, metrics)
                         
                         yield frame_bytes, output_frame_index, timestamp_ms, metrics
+                    
+                    if is_final:
+                        break
                         
                 except queue.Empty:
                     logger.warning("Timeout waiting for MuseTalk frame")

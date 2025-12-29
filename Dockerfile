@@ -34,4 +34,4 @@ RUN pip install --no-cache opencv-python-headless==4.10.0.84 \
 
 EXPOSE 8001
 
-CMD ["tritonserver", "--model-repository", "/models", "--strict-model-config", "false", "--log-verbose", "1"]
+CMD ["tritonserver", "--model-repository", "/models", "--strict-model-config", "false", "--log-verbose", "0", "--log-info", "true", "--log-warning", "true", "--log-error", "true"]
