@@ -10,7 +10,7 @@ class TritonPythonModel:
         """
         This runs ONCE when Triton loads the model.
         """
-        model_path = "/local_models/stt_model/stt_ka_fastconformer_hybrid_large_pc.nemo"
+        model_path = "/local_models/stt_model/fast_conformer_georgian.nemo"
 
         # Load NeMo ASR model (FastConformer)
         self.asr_model = nemo_asr.models.ASRModel.restore_from(
