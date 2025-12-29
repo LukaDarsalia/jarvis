@@ -116,11 +116,24 @@ class TTSGenerator:
         # Sessions
         self.sessions: Dict[int, GenerationState] = {}
         self.session_lock = threading.Lock()
+        self._session_pool: List[GenerationState] = []
+        self._reference_speaker_id = 0
+        self._bb_cache_len = 4096
+        self._dd_cache_len = 32
+        self._reference_bb_pkv: Optional[StaticCache] = None
+        self._reference_attn_mask: Optional[torch.Tensor] = None
+        self._reference_h_last: Optional[torch.Tensor] = None
+        self._reference_seq_len: int = 0
+        self._reference_eos: Optional[torch.Tensor] = None
+        self._reference_cache_pos: Optional[torch.Tensor] = None
         
         # Start idle session cleanup thread
         self._cleanup_thread_stop = threading.Event()
         self._cleanup_thread = threading.Thread(target=self._idle_session_cleanup_loop, daemon=True)
         self._cleanup_thread.start()
+
+        # Build reference cache once for all sessions
+        self._build_reference_state(self._reference_speaker_id)
 
     def _maybe_sync(self):
         if self.enable_timing and self.timing_sync_cuda and torch.cuda.is_available():
@@ -162,6 +175,7 @@ class TTSGenerator:
         """Remove all active sessions."""
         with self.session_lock:
             session_ids = list(self.sessions.keys())
+            self._session_pool.clear()
         
         for session_id in session_ids:
             print(f"[TTSGenerator] Cleaning up session {session_id}")
@@ -228,6 +242,164 @@ class TTSGenerator:
         self.reference_transcript = audio_transcript.get(Path(audio_path).name)
         if self.reference_transcript is None:
             raise RuntimeError(f"No transcript entry for key '{Path(audio_path).name}' in json.")
+
+    def _build_reference_state(self, speaker_id: int = 0) -> None:
+        if self.reference_audio is None or self.reference_transcript is None:
+            raise RuntimeError("Reference audio/transcript not loaded.")
+
+        conversation = [
+            {
+                "role": f"{speaker_id}",
+                "content": [
+                    {"type": "text", "text": self.reference_transcript},
+                    {"type": "audio", "path": self.reference_audio.numpy()[0]},
+                ],
+            }
+        ]
+
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+        ).to(self.device)
+
+        if "input_values" in inputs:
+            inputs["input_values"] = inputs["input_values"].to(torch.bfloat16)
+
+        model_inputs = self.model.prepare_inputs_for_generation(**inputs)
+        ref_embeds = model_inputs["inputs_embeds"]
+        attn_mask = inputs["attention_mask"].clone()
+
+        bb_pkv = StaticCache(
+            config=self.model.config,
+            batch_size=1,
+            max_cache_len=self._bb_cache_len,
+            device=self.model.device,
+            dtype=self.model.dtype,
+        )
+        pos_ids = torch.arange(ref_embeds.shape[1], device=self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            bb_out = self.model.backbone_model(
+                inputs_embeds=ref_embeds,
+                attention_mask=attn_mask,
+                position_ids=pos_ids,
+                past_key_values=bb_pkv,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+
+        h_last = bb_out.hidden_states[-1][:, -1, :]
+        seq_len = ref_embeds.shape[1]
+
+        eos = torch.tensor(
+            [self.model.config.codebook_eos_token_id],
+            device=self.model.device,
+            dtype=torch.long,
+        )
+        cache_pos = torch.arange(0, 2, device=self.device)
+
+        self._reference_bb_pkv = bb_out.past_key_values
+        self._reference_attn_mask = attn_mask
+        self._reference_h_last = h_last
+        self._reference_seq_len = seq_len
+        self._reference_eos = eos
+        self._reference_cache_pos = cache_pos
+        self._reference_speaker_id = speaker_id
+
+    def _new_bb_cache(self) -> StaticCache:
+        return StaticCache(
+            config=self.model.config,
+            batch_size=1,
+            max_cache_len=self._bb_cache_len,
+            device=self.model.device,
+            dtype=self.model.dtype,
+        )
+
+    def _new_dd_cache(self) -> StaticCache:
+        return StaticCache(
+            config=self.model.depth_decoder.config,
+            batch_size=1,
+            max_cache_len=self._dd_cache_len,
+            device=self.model.device,
+            dtype=self.model.dtype,
+        )
+
+    def _copy_reference_cache(self, target: StaticCache) -> None:
+        if self._reference_bb_pkv is None:
+            raise RuntimeError("Reference cache not initialized.")
+        for layer_idx in range(len(self._reference_bb_pkv.key_cache)):
+            target.key_cache[layer_idx].copy_(self._reference_bb_pkv.key_cache[layer_idx])
+            target.value_cache[layer_idx].copy_(self._reference_bb_pkv.value_cache[layer_idx])
+
+    def _reset_state_from_reference(self, state: GenerationState) -> None:
+        if self._reference_attn_mask is None or self._reference_h_last is None:
+            raise RuntimeError("Reference state not initialized.")
+        self._copy_reference_cache(state.bb_pkv)
+        state.dd_pkv.reset()
+        state.attn_mask = self._reference_attn_mask.clone()
+        state.h_last = self._reference_h_last.clone()
+        state.seq_len = self._reference_seq_len
+        state.cur_step = 0
+        state.frames = []
+        state.input_queue = []
+        state.counter = 0
+        state.has_active_text = False
+        state.perf = PerfStats()
+        state.last_activity_time = time.time()
+
+        if self._reference_eos is not None:
+            state.eos = self._reference_eos
+        if self._reference_cache_pos is not None:
+            state.cache_pos = self._reference_cache_pos
+
+    def _acquire_state(self) -> GenerationState:
+        if self._session_pool:
+            state = self._session_pool.pop()
+        else:
+            state = GenerationState(
+                bb_pkv=self._new_bb_cache(),
+                dd_pkv=self._new_dd_cache(),
+                attn_mask=torch.zeros((1, 1), device=self.device),
+                h_last=torch.zeros((1, self.model.config.hidden_size), device=self.device),
+                seq_len=0,
+                cur_step=0,
+                frames=[],
+                input_queue=[],
+                counter=0,
+                eos=self._reference_eos if self._reference_eos is not None else torch.zeros(1, device=self.device, dtype=torch.long),
+                cache_pos=self._reference_cache_pos if self._reference_cache_pos is not None else torch.arange(0, 2, device=self.device),
+                has_active_text=False,
+            )
+        self._reset_state_from_reference(state)
+        return state
+
+    def _release_state(self, state: GenerationState) -> None:
+        state.frames = []
+        state.input_queue = []
+        state.has_active_text = False
+        state.counter = 0
+        state.cur_step = 0
+        state.perf = PerfStats()
+        state.last_activity_time = time.time()
+        if len(self._session_pool) < self.max_concurrent_sessions:
+            self._session_pool.append(state)
+
+    def warmup(self, speaker_id: int = 0) -> bool:
+        session_id = -1
+        if session_id in self.sessions:
+            return False
+        if not self.initialize_session(session_id, speaker_id=speaker_id):
+            return False
+        try:
+            self.append_texts(session_id, [" warmup"], speaker_id=speaker_id)
+            self.step_session(session_id, max_steps=2)
+            codes = self.get_session_audio(session_id, return_codes=True)
+            if codes is not None and codes.shape[0] > 0:
+                _ = self._decode_audio(codes[-1:])
+            return True
+        finally:
+            self.end_session(session_id)
 
     def sample_from_logits(
         self,
@@ -302,100 +474,20 @@ class TTSGenerator:
 
     def initialize_session(self, session_id: int, speaker_id: int = 0) -> bool:
         """
-        Initialize a session:
-        - runs ONLY the reference (text + audio) through the backbone
-        - builds KV cache and h_last
-        - no text chunks yet (those come via append_texts)
+        Initialize a session from the cached reference state.
         """
         with self.session_lock:
             if len(self.sessions) >= self.max_concurrent_sessions:
                 return False
             if session_id in self.sessions:
-                # overwrite existing
                 del self.sessions[session_id]
 
-        if self.reference_audio is None or self.reference_transcript is None:
-            raise RuntimeError("Reference audio/transcript not loaded.")
+        if speaker_id != self._reference_speaker_id:
+            print(f"[TTSGenerator] Speaker ID {speaker_id} differs from cached reference; rebuilding reference cache.")
+            self._build_reference_state(speaker_id)
+            self._session_pool.clear()
 
-        # Build reference-only conversation
-        conversation = [
-            {
-                "role": f"{speaker_id}",
-                "content": [
-                    {"type": "text", "text": self.reference_transcript},
-                    {"type": "audio", "path": self.reference_audio.numpy()[0]},
-                ],
-            }
-        ]
-
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-        ).to(self.device)
-
-        if "input_values" in inputs:
-            inputs["input_values"] = inputs["input_values"].to(torch.bfloat16)
-
-        model_inputs = self.model.prepare_inputs_for_generation(**inputs)
-        ref_embeds = model_inputs["inputs_embeds"]  # [B, T_ref, D]
-        attn_mask = inputs["attention_mask"].clone()
-
-        dtype = self.model.dtype
-        bb_pkv = StaticCache(
-            config=self.model.config,
-            batch_size=1,
-            max_cache_len=4096,
-            device=self.model.device,
-            dtype=dtype,
-        )
-        dd_pkv = StaticCache(
-            config=self.model.depth_decoder.config,
-            batch_size=1,
-            max_cache_len=32,
-            device=self.model.device,
-            dtype=dtype,
-        )
-
-        B, T_ref, _ = ref_embeds.shape
-        pos_ids = torch.arange(T_ref, device=self.device).unsqueeze(0)  # [1, T_ref]
-
-        with torch.no_grad():
-            bb_out = self.model.backbone_model(
-                inputs_embeds=ref_embeds,
-                attention_mask=attn_mask,
-                position_ids=pos_ids,
-                past_key_values=bb_pkv,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-
-        pkv = bb_out.past_key_values
-        h_last = bb_out.hidden_states[-1][:, -1, :]  # [B, D]
-        seq_len = T_ref
-
-        eos = torch.tensor(
-            [self.model.config.codebook_eos_token_id],
-            device=self.model.device,
-            dtype=torch.long,
-        )
-        cache_pos = torch.arange(0, 2, device=self.device)
-
-        state = GenerationState(
-            bb_pkv=pkv,
-            dd_pkv=dd_pkv,
-            attn_mask=attn_mask,
-            h_last=h_last,
-            seq_len=seq_len,
-            cur_step=0,
-            frames=[],
-            input_queue=[],
-            counter=0,               # next text index to inject
-            eos=eos,
-            cache_pos=cache_pos,
-            has_active_text=False,   # no text chunk yet
-        )
-
+        state = self._acquire_state()
         with self.session_lock:
             self.sessions[session_id] = state
 
@@ -649,8 +741,9 @@ class TTSGenerator:
         """
         audio = self.get_session_audio(session_id, return_codes=False)
         with self.session_lock:
-            if session_id in self.sessions:
-                del self.sessions[session_id]
+            state = self.sessions.pop(session_id, None)
+        if state is not None:
+            self._release_state(state)
         return audio
 
     def get_active_sessions(self) -> List[int]:

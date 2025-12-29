@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+import threading
 import base64
 import sys
 import signal
@@ -110,237 +111,347 @@ async def run_tts_with_musetalk(
     sync_queue: asyncio.Queue = asyncio.Queue()
     
     def run_tts_and_musetalk_synced():
-        """Run TTS and MuseTalk in sync in a background thread."""
-        try:
-            all_audio = []  # TTS audio chunks (80ms each)
-            all_words = []  # Word per audio chunk
-            all_metrics = []  # Metrics per audio chunk
-            word_sample_boundaries = []  # Cumulative samples per chunk
-            chunks_received = 0
-            audio_chunks_generated = 0
-            total_samples = 0
+        """Run TTS and MuseTalk in parallel in a background thread."""
+        all_audio = []  # TTS audio chunks (80ms each)
+        all_words = []  # Word per audio chunk
+        all_metrics = []  # Metrics per audio chunk
+        word_sample_boundaries = []  # Cumulative samples per chunk
+        chunks_received = 0
+        audio_chunks_generated = 0
+        total_samples = 0
+        audio_lock = threading.Lock()
+        audio_ready = threading.Condition(audio_lock)
+        tts_done = threading.Event()
+        error_event = threading.Event()
 
-            # MuseTalk streaming controls (chunk-based)
-            mt_start_after = 0
-            mt_lookahead = 0
-            if triton_client is not None:
-                mt_start_after = max(0, int(getattr(triton_client.musetalk_params, "start_after_chunks", 0)))
-                mt_lookahead = max(0, int(getattr(triton_client.musetalk_params, "lookahead_chunks", 0)))
+        # MuseTalk streaming controls (chunk-based)
+        mt_start_after = 0
+        mt_lookahead = 0
+        if triton_client is not None:
+            mt_start_after = max(0, int(getattr(triton_client.musetalk_params, "start_after_chunks", 0)))
+            mt_lookahead = max(0, int(getattr(triton_client.musetalk_params, "lookahead_chunks", 0)))
 
-            base_frame_index = state.musetalk_frame_index
-            frames_sent = 0  # Frames sent in this session
-            processed_chunk_index = 0  # Chunks already sent to MuseTalk
-            word_idx = 0
+        base_frame_index = state.musetalk_frame_index
+
+        def report_error(msg: str) -> None:
+            if error_event.is_set():
+                return
+            error_event.set()
+            loop.call_soon_threadsafe(sync_queue.put_nowait, ("error", msg))
+
+        def samples_before_chunk(boundaries: list[int], chunk_idx: int) -> int:
+            if chunk_idx <= 0:
+                return 0
+            if chunk_idx - 1 >= len(boundaries):
+                return boundaries[-1] if boundaries else 0
+            return boundaries[chunk_idx - 1]
+
+        def enqueue_synced_frame(
+            frame_bytes: bytes,
+            frame_idx: int,
+            timestamp_ms: float,
+            segment_audio: np.ndarray,
+            segment_start_samples: int,
+            frame_audio_start: int,
+            allow_partial_last: bool,
+            segment_start_ms: float,
+            word_cursor: dict,
+            last_emitted_word_idx: dict,
+            boundaries_snapshot: list[int],
+            words_snapshot: list[str],
+            metrics_snapshot: list[TTSMetrics],
+            frames_sent_ref: dict,
+        ) -> None:
+            expected_idx = base_frame_index + frames_sent_ref["value"]
+            if frame_idx < expected_idx:
+                return
+            if frame_idx > expected_idx:
+                logger.warning(
+                    "[MUSETALK_WORKER] Frame index gap: expected=%s got=%s",
+                    expected_idx,
+                    frame_idx,
+                )
+                frames_sent_ref["value"] = frame_idx - base_frame_index
+
+            audio_start = int(frame_audio_start)
+            audio_end = audio_start + SAMPLES_PER_FRAME
+            if allow_partial_last:
+                audio_end = min(audio_end, len(segment_audio))
+            else:
+                audio_end = min(audio_end, len(segment_audio), audio_start + SAMPLES_PER_FRAME)
+
+            if audio_start < len(segment_audio):
+                frame_audio = segment_audio[audio_start:audio_end]
+                audio_b64 = base64.b64encode(frame_audio.tobytes()).decode("utf-8")
+            else:
+                audio_b64 = ""
+
+            frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
+            global_audio_start = segment_start_samples + audio_start
+
+            while word_cursor["value"] < len(boundaries_snapshot) and global_audio_start >= boundaries_snapshot[word_cursor["value"]]:
+                word_cursor["value"] += 1
+
+            word = ""
+            metrics_data = {}
+            current_word_idx = word_cursor["value"]
+            if current_word_idx < len(words_snapshot) and current_word_idx != last_emitted_word_idx["value"]:
+                word = words_snapshot[current_word_idx]
+                last_emitted_word_idx["value"] = current_word_idx
+                if current_word_idx < len(metrics_snapshot):
+                    metrics_data = {
+                        "rtf": round(metrics_snapshot[current_word_idx].rtf, 3),
+                        "generation_time_ms": round(metrics_snapshot[current_word_idx].generation_time_ms, 1),
+                        "audio_duration_ms": round(metrics_snapshot[current_word_idx].audio_duration_ms, 1),
+                    }
+
+            msg_data = {
+                "audio": audio_b64,
+                "frame": frame_b64,
+                "frame_index": frame_idx,
+                "timestamp_ms": segment_start_ms + timestamp_ms,
+                "word": word,
+                **metrics_data,
+            }
+
+            loop.call_soon_threadsafe(
+                sync_queue.put_nowait,
+                ("synced", msg_data)
+            )
+            frames_sent_ref["value"] = frame_idx - base_frame_index + 1
+
+        def tts_worker() -> None:
+            nonlocal chunks_received, audio_chunks_generated, total_samples
+            try:
+                logger.info(f"[TTS_WORKER] Started, session_id={state.tts_session_id}, musetalk={musetalk_available}")
+                while True:
+                    item = tts_input_queue.get()
+                    if item is None:
+                        logger.info(
+                            "[TTS_WORKER] Received None, TTS generation complete. chunks_received=%s, audio_generated=%s",
+                            chunks_received,
+                            audio_chunks_generated,
+                        )
+                        break
+
+                    text_chunks = item
+                    chunks_received += 1
+
+                    if chunks_received <= 5 or chunks_received % 10 == 0:
+                        logger.info(f"[TTS_WORKER] Processing chunk #{chunks_received}: {text_chunks}")
+
+                    for audio, word, metrics in triton_client.generate_tts_stream(
+                        text_chunks,
+                        session_id=state.tts_session_id,
+                    ):
+                        audio_chunks_generated += 1
+                        if audio_chunks_generated <= 3:
+                            logger.info(
+                                "[TTS_WORKER] Audio chunk #%s, samples=%s, word=%s",
+                                audio_chunks_generated,
+                                len(audio),
+                                word,
+                            )
+
+                        if not state.is_generating:
+                            logger.info("[TTS_WORKER] state.is_generating=False, breaking")
+                            break
+
+                        with audio_ready:
+                            all_audio.append(audio)
+                            all_words.append(word)
+                            all_metrics.append(metrics)
+                            total_samples += len(audio)
+                            word_sample_boundaries.append(total_samples)
+                            audio_ready.notify_all()
+
+                        if not musetalk_available:
+                            audio_b64 = base64.b64encode(audio.tobytes()).decode("utf-8")
+                            loop.call_soon_threadsafe(
+                                sync_queue.put_nowait,
+                                ("audio_only", {
+                                    "audio": audio_b64,
+                                    "word": word,
+                                    "rtf": round(metrics.rtf, 3),
+                                    "generation_time_ms": round(metrics.generation_time_ms, 1),
+                                    "audio_duration_ms": round(metrics.audio_duration_ms, 1),
+                                })
+                            )
+            except Exception as e:
+                logger.error(f"[TTS_WORKER] Error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                report_error(str(e))
+            finally:
+                tts_done.set()
+                with audio_ready:
+                    audio_ready.notify_all()
+
+        def musetalk_worker() -> None:
+            frames_sent_ref = {"value": 0}
+            processed_chunk_index = 0
+            word_cursor = {"value": 0}
+            last_emitted_word_idx = {"value": -1}
 
             logger.info(
-                "[TTS_WORKER] MuseTalk buffering: start_after_chunks=%s, lookahead_chunks=%s",
+                "[MUSETALK_WORKER] Started. start_after_chunks=%s, lookahead_chunks=%s",
                 mt_start_after,
                 mt_lookahead,
             )
-            
-            logger.info(f"[TTS_WORKER] Started, session_id={state.tts_session_id}, musetalk={musetalk_available}")
+            try:
+                while state.is_generating and not error_event.is_set():
+                    done = False
+                    segment_info = None
+                    with audio_ready:
+                        while True:
+                            total_chunks = len(all_audio)
+                            flush = tts_done.is_set()
+                            if total_chunks == 0 and not flush:
+                                audio_ready.wait(timeout=0.1)
+                                if not state.is_generating or error_event.is_set():
+                                    break
+                                continue
+                            if not flush and total_chunks < mt_start_after:
+                                audio_ready.wait(timeout=0.1)
+                                if not state.is_generating or error_event.is_set():
+                                    break
+                                continue
 
-            def samples_before_chunk(chunk_idx: int) -> int:
-                if chunk_idx <= 0:
-                    return 0
-                return word_sample_boundaries[chunk_idx - 1]
+                            output_end_chunk = total_chunks if flush else max(0, total_chunks - mt_lookahead)
+                            if output_end_chunk <= processed_chunk_index:
+                                if flush:
+                                    done = True
+                                    break
+                                audio_ready.wait(timeout=0.1)
+                                if not state.is_generating or error_event.is_set():
+                                    break
+                                continue
 
-            def enqueue_synced_frame(
-                frame_bytes: bytes,
-                frame_idx: int,
-                timestamp_ms: float,
-                segment_audio: np.ndarray,
-                segment_start_samples: int,
-                frame_audio_start: int,
-                allow_partial_last: bool,
-                segment_start_ms: float,
-            ) -> None:
-                nonlocal frames_sent, word_idx
+                            segment_start_chunk = max(0, processed_chunk_index - (1 if processed_chunk_index > 0 else 0))
+                            segment_end_chunk = total_chunks
+                            segment_info = (
+                                list(all_audio[segment_start_chunk:segment_end_chunk]),
+                                list(word_sample_boundaries),
+                                list(all_words),
+                                list(all_metrics),
+                                output_end_chunk,
+                                segment_start_chunk,
+                                flush,
+                            )
+                            break
 
-                expected_idx = base_frame_index + frames_sent
-                if frame_idx < expected_idx:
-                    return
-                if frame_idx > expected_idx:
-                    logger.warning(
-                        "[TTS_WORKER] Frame index gap: expected=%s got=%s",
-                        expected_idx,
-                        frame_idx,
-                    )
-                    frames_sent = frame_idx - base_frame_index
-
-                audio_start = int(frame_audio_start)
-                audio_end = audio_start + SAMPLES_PER_FRAME
-                if allow_partial_last:
-                    audio_end = min(audio_end, len(segment_audio))
-                else:
-                    audio_end = min(audio_end, len(segment_audio), audio_start + SAMPLES_PER_FRAME)
-
-                if audio_start < len(segment_audio):
-                    frame_audio = segment_audio[audio_start:audio_end]
-                    audio_b64 = base64.b64encode(frame_audio.tobytes()).decode("utf-8")
-                else:
-                    audio_b64 = ""
-
-                frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
-                global_audio_start = segment_start_samples + audio_start
-
-                word = ""
-                metrics_data = {}
-                while word_idx < len(word_sample_boundaries) and global_audio_start >= word_sample_boundaries[word_idx]:
-                    word_idx += 1
-                if word_idx < len(all_words) and all_words[word_idx]:
-                    word = all_words[word_idx]
-                    all_words[word_idx] = ""  # Clear so we don't repeat
-                    if word_idx < len(all_metrics):
-                        metrics_data = {
-                            "rtf": round(all_metrics[word_idx].rtf, 3),
-                            "generation_time_ms": round(all_metrics[word_idx].generation_time_ms, 1),
-                            "audio_duration_ms": round(all_metrics[word_idx].audio_duration_ms, 1),
-                        }
-
-                msg_data = {
-                    "audio": audio_b64,
-                    "frame": frame_b64,
-                    "frame_index": frame_idx,
-                    "timestamp_ms": segment_start_ms + timestamp_ms,
-                    "word": word,
-                    **metrics_data,
-                }
-
-                loop.call_soon_threadsafe(
-                    sync_queue.put_nowait,
-                    ("synced", msg_data)
-                )
-                frames_sent = frame_idx - base_frame_index + 1
-
-            def process_musetalk_segment(flush: bool = False) -> None:
-                nonlocal processed_chunk_index, frames_sent, word_idx
-
-                if not musetalk_available or not state.is_generating:
-                    return
-
-                total_chunks = len(all_audio)
-                if total_chunks == 0:
-                    return
-
-                if not flush and total_chunks < mt_start_after:
-                    return
-
-                output_end_chunk = total_chunks if flush else max(0, total_chunks - mt_lookahead)
-                if output_end_chunk <= processed_chunk_index:
-                    return
-
-                overlap_chunks = 1 if processed_chunk_index > 0 else 0
-                segment_start_chunk = max(0, processed_chunk_index - overlap_chunks)
-                segment_end_chunk = total_chunks
-
-                if segment_end_chunk <= segment_start_chunk:
-                    processed_chunk_index = output_end_chunk
-                    return
-
-                segment_audio = np.concatenate(all_audio[segment_start_chunk:segment_end_chunk])
-                if segment_audio.size == 0:
-                    processed_chunk_index = output_end_chunk
-                    return
-
-                segment_start_samples = samples_before_chunk(segment_start_chunk)
-                overlap_samples = 0
-                if processed_chunk_index > segment_start_chunk:
-                    overlap_samples = samples_before_chunk(processed_chunk_index) - segment_start_samples
-                output_end_samples = samples_before_chunk(output_end_chunk) - segment_start_samples
-
-                segment_start_frame_index = base_frame_index + int(segment_start_samples // SAMPLES_PER_FRAME)
-                segment_start_ms = segment_start_samples / 24.0
-
-                for frame_bytes, frame_idx, timestamp_ms, _ in triton_client.generate_musetalk_frames(
-                    segment_audio,
-                    frame_index=segment_start_frame_index,
-                ):
-                    if not state.is_generating:
+                    if not state.is_generating or error_event.is_set():
                         break
 
-                    local_frame_idx = frame_idx - segment_start_frame_index
-                    frame_audio_start = local_frame_idx * SAMPLES_PER_FRAME
-                    if frame_audio_start < overlap_samples:
-                        continue
-                    if not flush and (frame_audio_start + SAMPLES_PER_FRAME) > output_end_samples:
-                        continue
-                    if flush and frame_audio_start >= output_end_samples:
+                    if done:
+                        break
+
+                    if segment_info is None:
                         continue
 
-                    enqueue_synced_frame(
-                        frame_bytes,
-                        frame_idx,
-                        timestamp_ms,
+                    (
+                        audio_slice,
+                        boundaries_snapshot,
+                        words_snapshot,
+                        metrics_snapshot,
+                        output_end_chunk,
+                        segment_start_chunk,
+                        flush,
+                    ) = segment_info
+
+                    if not audio_slice:
+                        if flush:
+                            break
+                        continue
+
+                    output_end_chunk = min(output_end_chunk, len(boundaries_snapshot))
+                    if output_end_chunk <= processed_chunk_index:
+                        if flush:
+                            break
+                        continue
+
+                    segment_audio = np.concatenate(audio_slice)
+                    if segment_audio.size == 0:
+                        processed_chunk_index = output_end_chunk
+                        if flush:
+                            break
+                        continue
+
+                    segment_start_samples = samples_before_chunk(boundaries_snapshot, segment_start_chunk)
+                    overlap_samples = 0
+                    if processed_chunk_index > segment_start_chunk:
+                        overlap_samples = samples_before_chunk(boundaries_snapshot, processed_chunk_index) - segment_start_samples
+                    output_end_samples = samples_before_chunk(boundaries_snapshot, output_end_chunk) - segment_start_samples
+
+                    segment_start_frame_index = base_frame_index + int(segment_start_samples // SAMPLES_PER_FRAME)
+                    segment_start_ms = segment_start_samples / 24.0
+                    allow_partial_last = flush
+
+                    for frame_bytes, frame_idx, timestamp_ms, _ in triton_client.generate_musetalk_frames(
                         segment_audio,
-                        segment_start_samples,
-                        frame_audio_start,
-                        allow_partial_last=flush,
-                        segment_start_ms=segment_start_ms,
-                    )
+                        frame_index=segment_start_frame_index,
+                    ):
+                        if not state.is_generating or error_event.is_set():
+                            break
 
-                processed_chunk_index = output_end_chunk
-                state.musetalk_frame_index = base_frame_index + frames_sent
+                        local_frame_idx = frame_idx - segment_start_frame_index
+                        frame_audio_start = local_frame_idx * SAMPLES_PER_FRAME
+                        if frame_audio_start < overlap_samples:
+                            continue
+                        if not allow_partial_last and (frame_audio_start + SAMPLES_PER_FRAME) > output_end_samples:
+                            continue
+                        if allow_partial_last and frame_audio_start >= output_end_samples:
+                            continue
 
-            # Phase 1: Generate TTS audio and stream MuseTalk as chunks arrive
-            while True:
-                item = tts_input_queue.get()
-                if item is None:
-                    logger.info(f"[TTS_WORKER] Received None, TTS generation complete. chunks_received={chunks_received}, audio_generated={audio_chunks_generated}")
-                    break
-                
-                text_chunks = item
-                chunks_received += 1
-                
-                if chunks_received <= 5 or chunks_received % 10 == 0:
-                    logger.info(f"[TTS_WORKER] Processing chunk #{chunks_received}: {text_chunks}")
-                
-                for audio, word, metrics in triton_client.generate_tts_stream(
-                    text_chunks,
-                    session_id=state.tts_session_id,
-                ):
-                    audio_chunks_generated += 1
-                    if audio_chunks_generated <= 3:
-                        logger.info(f"[TTS_WORKER] Audio chunk #{audio_chunks_generated}, samples={len(audio)}, word={word}")
-                    
-                    if not state.is_generating:
-                        logger.info(f"[TTS_WORKER] state.is_generating=False, breaking")
-                        break
-                    
-                    all_audio.append(audio)
-                    all_words.append(word)
-                    all_metrics.append(metrics)
-                    total_samples += len(audio)
-                    word_sample_boundaries.append(total_samples)
-                    
-                    # If MuseTalk not available, send audio immediately
-                    if not musetalk_available:
-                        audio_b64 = base64.b64encode(audio.tobytes()).decode("utf-8")
-                        loop.call_soon_threadsafe(
-                            sync_queue.put_nowait,
-                            ("audio_only", {
-                                "audio": audio_b64,
-                                "word": word,
-                                "rtf": round(metrics.rtf, 3),
-                                "generation_time_ms": round(metrics.generation_time_ms, 1),
-                                "audio_duration_ms": round(metrics.audio_duration_ms, 1),
-                            })
+                        enqueue_synced_frame(
+                            frame_bytes,
+                            frame_idx,
+                            timestamp_ms,
+                            segment_audio,
+                            segment_start_samples,
+                            frame_audio_start,
+                            allow_partial_last=allow_partial_last,
+                            segment_start_ms=segment_start_ms,
+                            word_cursor=word_cursor,
+                            last_emitted_word_idx=last_emitted_word_idx,
+                            boundaries_snapshot=boundaries_snapshot,
+                            words_snapshot=words_snapshot,
+                            metrics_snapshot=metrics_snapshot,
+                            frames_sent_ref=frames_sent_ref,
                         )
-                    else:
-                        process_musetalk_segment(flush=False)
-            
-            # Phase 2: Flush remaining MuseTalk frames without lookahead
-            if musetalk_available and len(all_audio) > 0 and state.is_generating:
-                process_musetalk_segment(flush=True)
-            
-            logger.info(f"[TTS_WORKER] Finished. Total chunks_received={chunks_received}, audio_chunks_generated={audio_chunks_generated}")
+
+                    processed_chunk_index = output_end_chunk
+                    state.musetalk_frame_index = base_frame_index + frames_sent_ref["value"]
+
+                    if allow_partial_last and output_end_chunk <= processed_chunk_index:
+                        break
+            except Exception as e:
+                logger.error(f"[MUSETALK_WORKER] Error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                report_error(str(e))
+            finally:
+                logger.info("[MUSETALK_WORKER] Finished")
+
+        tts_thread = threading.Thread(target=tts_worker, name="tts-worker", daemon=True)
+        tts_thread.start()
+
+        musetalk_thread = None
+        if musetalk_available:
+            musetalk_thread = threading.Thread(target=musetalk_worker, name="musetalk-worker", daemon=True)
+            musetalk_thread.start()
+
+        tts_thread.join()
+        if musetalk_thread is not None:
+            musetalk_thread.join()
+
+        logger.info(
+            "[TTS_WORKER] Finished. Total chunks_received=%s, audio_chunks_generated=%s",
+            chunks_received,
+            audio_chunks_generated,
+        )
+        if not error_event.is_set():
             loop.call_soon_threadsafe(sync_queue.put_nowait, ("done", None))
-            
-        except Exception as e:
-            logger.error(f"[TTS_WORKER] Error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            loop.call_soon_threadsafe(sync_queue.put_nowait, ("error", str(e)))
     
     async def sync_consumer():
         """Consume synced audio+video and forward to client."""
@@ -1317,4 +1428,6 @@ async def process_tts_only(state: ConnectionState, text: str):
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+    os.environ['TRITON_URL'] = '185.151.171.35:46298'
     uvicorn.run(app, host="0.0.0.0", port=8080)

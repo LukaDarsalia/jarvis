@@ -39,7 +39,6 @@ class TritonPythonModel:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map="auto",
-            load_in_8bit=True,
             torch_dtype=torch.float16,
         )
         self.model.eval()

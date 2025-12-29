@@ -55,6 +55,21 @@ class TritonPythonModel:
                 reference_json_path="/local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
             )
 
+            warmup_enabled = os.environ.get("TTS_WARMUP", "1") != "0"
+            if warmup_enabled:
+                warmup_start = time.perf_counter()
+                try:
+                    ok = self.tts_generator.warmup()
+                    warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
+                    pb_utils.Logger.log_info(
+                        f"TTS warmup {'completed' if ok else 'skipped'} in {warmup_ms:.1f}ms"
+                    )
+                except Exception as exc:
+                    warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
+                    pb_utils.Logger.log_warning(
+                        f"TTS warmup failed after {warmup_ms:.1f}ms: {exc}"
+                    )
+
             pb_utils.Logger.log_info("TTS Triton model initialized")
             self.log_every_n_steps = int(os.environ.get("TTS_LOG_EVERY_N_STEPS", "10"))
 
