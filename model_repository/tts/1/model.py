@@ -70,11 +70,8 @@ class TritonPythonModel:
                     )
                     warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
                     pb_utils.Logger.log_info(
-                        "TTS warmup %s in %.1fms (steps=%s, rounds=%s)",
-                        "completed" if ok else "skipped",
-                        warmup_ms,
-                        warmup_steps,
-                        warmup_rounds,
+                        f"TTS warmup {'completed' if ok else 'skipped'} "
+                        f"in {warmup_ms:.1f}ms (steps={warmup_steps}, rounds={warmup_rounds})"
                     )
                 except Exception as exc:
                     warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
