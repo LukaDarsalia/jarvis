@@ -210,6 +210,9 @@ class TritonPythonModel:
         pb_utils.Logger.log_info(f"[Seq {seq_id}] append_texts_ms={append_ms:.1f}")
 
         req_start = time.perf_counter()
+        base_frames = self.tts_generator.get_session_frame_count(seq_id)
+        chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
+        base_samples = base_frames * chunk_len
         total_steps = 0
         last_audio_ms = 0.0
         interval_steps = 0
@@ -245,9 +248,6 @@ class TritonPythonModel:
             audio_np = audio_24k.numpy()
             last_audio_ms = (len(audio_np) / float(self.output_sample_rate)) * 1000.0
 
-            # Chunk length = 1920 @ 24k scaled by target_sr
-            chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
-
             # stream last chunk_len samples
             chunk_np = audio_np[-chunk_len:].astype(np.float32)
             audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
@@ -258,7 +258,9 @@ class TritonPythonModel:
             if self.log_every_n_steps > 0 and (interval_steps >= self.log_every_n_steps or is_complete):
                 perf = self.tts_generator.get_session_perf(seq_id, reset=True)
                 gen_ms = (time.perf_counter() - req_start) * 1000.0
-                rtf = (gen_ms / last_audio_ms) if last_audio_ms > 0 else 0.0
+                request_samples = max(0, len(audio_np) - base_samples)
+                request_audio_ms = (request_samples / float(self.output_sample_rate)) * 1000.0
+                rtf = (gen_ms / request_audio_ms) if request_audio_ms > 0 else 0.0
                 if perf is not None:
                     bb_inject_avg = perf.bb_inject_ms / perf.inject_calls if perf.inject_calls else 0.0
                     bb_audio_avg = perf.bb_audio_ms / perf.audio_calls if perf.audio_calls else 0.0
@@ -267,7 +269,7 @@ class TritonPythonModel:
                     codec_avg = perf.codec_ms / perf.codec_calls if perf.codec_calls else 0.0
                     pb_utils.Logger.log_info(
                         f"[Seq {seq_id}] steps={total_steps} step_ms={step_ms:.1f} decode_ms={decode_ms:.1f} "
-                        f"audio_ms={last_audio_ms:.1f} rtf={rtf:.3f} "
+                        f"audio_ms={request_audio_ms:.1f} rtf={rtf:.3f} "
                         f"bb_inject_ms(avg)={bb_inject_avg:.2f} bb_audio_ms(avg)={bb_audio_avg:.2f} "
                         f"dd_ms(avg)={dd_avg:.2f} lm_ms(avg)={lm_avg:.2f} codec_ms(avg)={codec_avg:.2f}"
                     )

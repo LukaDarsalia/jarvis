@@ -778,6 +778,14 @@ class TTSGenerator:
         else:
             return self._decode_audio(audio_codes)
 
+    def get_session_frame_count(self, session_id: int) -> int:
+        """Return the number of generated frames for a session."""
+        with self.session_lock:
+            state = self.sessions.get(session_id)
+            if state is None:
+                return 0
+            return len(state.frames)
+
     def end_session(self, session_id: int) -> Optional[torch.Tensor]:
         """
         End a session and return final decoded audio (full).
