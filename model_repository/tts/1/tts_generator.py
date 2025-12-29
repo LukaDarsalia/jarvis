@@ -415,18 +415,31 @@ class TTSGenerator:
         if len(self._session_pool) < self.max_concurrent_sessions:
             self._session_pool.append(state)
 
-    def warmup(self, speaker_id: int = 0) -> bool:
+    def warmup(
+        self,
+        speaker_id: int = 0,
+        text: Optional[str] = None,
+        max_steps: int = 12,
+        max_rounds: int = 2,
+    ) -> bool:
         session_id = -1
         if session_id in self.sessions:
             return False
         if not self.initialize_session(session_id, speaker_id=speaker_id):
             return False
         try:
-            self.append_texts(session_id, [" warmup"], speaker_id=speaker_id)
-            self.step_session(session_id, max_steps=2)
+            if text is None:
+                text = "გამარჯობა, მე ვარ თიბისი ბანკის ციფრული ასისტენტი."
+            chunks = _split_text_for_streaming(text)
+            self.append_texts(session_id, chunks, speaker_id=speaker_id)
+            for _ in range(max(1, max_rounds)):
+                is_complete = self.step_session(session_id, max_steps=max_steps)
+                if is_complete:
+                    break
             codes = self.get_session_audio(session_id, return_codes=True)
             if codes is not None and codes.shape[0] > 0:
-                _ = self._decode_audio(codes[-1:])
+                tail = min(2, codes.shape[0])
+                _ = self._decode_audio(codes[-tail:])
             return True
         finally:
             self.end_session(session_id)

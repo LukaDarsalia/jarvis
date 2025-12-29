@@ -57,12 +57,24 @@ class TritonPythonModel:
 
             warmup_enabled = os.environ.get("TTS_WARMUP", "1") != "0"
             if warmup_enabled:
+                warmup_text = os.environ.get("TTS_WARMUP_TEXT", "").strip() or None
+                warmup_steps = int(os.environ.get("TTS_WARMUP_STEPS", "12"))
+                warmup_rounds = int(os.environ.get("TTS_WARMUP_ROUNDS", "2"))
                 warmup_start = time.perf_counter()
                 try:
-                    ok = self.tts_generator.warmup()
+                    ok = self.tts_generator.warmup(
+                        speaker_id=0,
+                        text=warmup_text,
+                        max_steps=warmup_steps,
+                        max_rounds=warmup_rounds,
+                    )
                     warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
                     pb_utils.Logger.log_info(
-                        f"TTS warmup {'completed' if ok else 'skipped'} in {warmup_ms:.1f}ms"
+                        "TTS warmup %s in %.1fms (steps=%s, rounds=%s)",
+                        "completed" if ok else "skipped",
+                        warmup_ms,
+                        warmup_steps,
+                        warmup_rounds,
                     )
                 except Exception as exc:
                     warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
