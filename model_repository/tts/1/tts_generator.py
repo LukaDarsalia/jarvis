@@ -1,4 +1,5 @@
 import os
+import copy
 import threading
 import time
 from dataclasses import dataclass, field
@@ -325,17 +326,46 @@ class TTSGenerator:
             dtype=self.model.dtype,
         )
 
-    def _copy_reference_cache(self, target: StaticCache) -> None:
+    def _copy_reference_cache(self, target: StaticCache) -> StaticCache:
         if self._reference_bb_pkv is None:
             raise RuntimeError("Reference cache not initialized.")
-        for layer_idx in range(len(self._reference_bb_pkv.key_cache)):
-            target.key_cache[layer_idx].copy_(self._reference_bb_pkv.key_cache[layer_idx])
-            target.value_cache[layer_idx].copy_(self._reference_bb_pkv.value_cache[layer_idx])
+        src = self._reference_bb_pkv
+
+        if (
+            hasattr(src, "key_cache")
+            and hasattr(src, "value_cache")
+            and hasattr(target, "key_cache")
+            and hasattr(target, "value_cache")
+        ):
+            for layer_idx in range(len(src.key_cache)):
+                target.key_cache[layer_idx].copy_(src.key_cache[layer_idx])
+                target.value_cache[layer_idx].copy_(src.value_cache[layer_idx])
+            return target
+
+        if hasattr(src, "layers") and hasattr(target, "layers"):
+            copied_layers = 0
+            for layer_idx, src_layer in enumerate(src.layers):
+                if layer_idx >= len(target.layers):
+                    break
+                tgt_layer = target.layers[layer_idx]
+                if not hasattr(src_layer, "keys") or not hasattr(src_layer, "values"):
+                    break
+                if getattr(tgt_layer, "is_initialized", True) is False:
+                    if hasattr(tgt_layer, "lazy_initialization"):
+                        tgt_layer.lazy_initialization(src_layer.keys)
+                if hasattr(tgt_layer, "keys") and hasattr(tgt_layer, "values"):
+                    tgt_layer.keys.copy_(src_layer.keys)
+                    tgt_layer.values.copy_(src_layer.values)
+                    copied_layers += 1
+            if copied_layers == len(src.layers):
+                return target
+
+        return copy.deepcopy(src)
 
     def _reset_state_from_reference(self, state: GenerationState) -> None:
         if self._reference_attn_mask is None or self._reference_h_last is None:
             raise RuntimeError("Reference state not initialized.")
-        self._copy_reference_cache(state.bb_pkv)
+        state.bb_pkv = self._copy_reference_cache(state.bb_pkv)
         state.dd_pkv.reset()
         state.attn_mask = self._reference_attn_mask.clone()
         state.h_last = self._reference_h_last.clone()

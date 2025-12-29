@@ -66,7 +66,7 @@ class TritonPythonModel:
                     )
                 except Exception as exc:
                     warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
-                    pb_utils.Logger.log_warning(
+                    pb_utils.Logger.log_warn(
                         f"TTS warmup failed after {warmup_ms:.1f}ms: {exc}"
                     )
 
