@@ -84,7 +84,7 @@ class TritonPythonModel:
                 pb_utils.Logger.log_info(f"Streaming generation: max_tokens={max_new_tokens}, temp={temperature}")
                 
                 # Tokenize input
-                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+                inputs = self.tokenizer(prompt, return_token_type_ids=False, return_tensors="pt").to(self.model.device)
                 
                 # Create streamer
                 streamer = TextIteratorStreamer(
