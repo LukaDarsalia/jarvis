@@ -1,6 +1,6 @@
 """
 Triton Client for Voice Assistant Pipeline
-Handles VAD, STT, LLM, and TTS model interactions
+Handles VAD, STT, LLM, TTS, and MuseTalk model interactions
 """
 
 import math

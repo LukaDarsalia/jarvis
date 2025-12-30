@@ -185,46 +185,6 @@ body::before {
     height: 20px;
 }
 
-/* ===== Mode Selector ===== */
-.mode-selector {
-    display: flex;
-    gap: var(--spacing-sm);
-    padding: var(--spacing-md) 0;
-    justify-content: center;
-}
-
-.mode-btn {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-sm);
-    padding: var(--spacing-sm) var(--spacing-lg);
-    border: 1px solid var(--border-light);
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--text-secondary);
-    font-family: var(--font-primary);
-    font-size: 0.875rem;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-}
-
-.mode-btn svg {
-    width: 18px;
-    height: 18px;
-}
-
-.mode-btn:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    border-color: var(--border-light);
-}
-
-.mode-btn.active {
-    background: var(--accent-gradient);
-    border-color: transparent;
-    color: white;
-    box-shadow: var(--accent-glow);
-}
 
 /* ===== Main Content ===== */
 .main-content {
@@ -441,16 +401,6 @@ body::before {
 
 .avatar-metrics .video-frames {
     color: var(--success);
-}
-
-/* Avatar Toggle Switch */
-.avatar-toggle {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-sm);
-    margin-top: var(--spacing-sm);
-    padding-top: var(--spacing-sm);
-    border-top: 1px solid var(--border-subtle);
 }
 
 .toggle-switch {
@@ -695,80 +645,6 @@ input:focus + .toggle-slider {
     100% { background: rgba(59, 130, 246, 0.3); }
 }
 
-/* Audio Message (TTS-only mode) */
-.audio-message .message-avatar {
-    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-}
-
-.audio-content {
-    min-width: 200px;
-}
-
-.audio-player {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-md);
-    padding: var(--spacing-sm);
-}
-
-.play-btn {
-    width: 44px;
-    height: 44px;
-    border: none;
-    border-radius: 50%;
-    background: var(--accent-gradient);
-    color: white;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all var(--transition-fast);
-    flex-shrink: 0;
-}
-
-.play-btn:hover:not(:disabled) {
-    transform: scale(1.05);
-    box-shadow: var(--accent-glow);
-}
-
-.play-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-    background: var(--bg-elevated);
-}
-
-.play-btn svg {
-    width: 20px;
-    height: 20px;
-}
-
-.play-btn .pause-icon,
-.play-btn .play-icon.hidden {
-    display: none;
-}
-
-.play-btn .pause-icon:not(.hidden) {
-    display: block;
-}
-
-.audio-info {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-}
-
-.audio-status {
-    font-size: 0.875rem;
-    color: var(--text-primary);
-    font-weight: 500;
-}
-
-.audio-word {
-    font-size: 0.75rem;
-    color: var(--accent-primary);
-    font-family: var(--font-mono);
-}
-
 /* Status indicator in message */
 .message-status {
     display: flex;
@@ -972,80 +848,6 @@ input:focus + .toggle-slider {
 
 .vad-status.processing {
     color: var(--accent-primary);
-}
-
-/* Text Input */
-.text-input {
-    width: 100%;
-    max-width: 700px;
-}
-
-.input-wrapper {
-    display: flex;
-    align-items: flex-end;
-    gap: var(--spacing-sm);
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-light);
-    border-radius: var(--radius-xl);
-    padding: var(--spacing-sm);
-    transition: all var(--transition-fast);
-}
-
-.input-wrapper:focus-within {
-    border-color: var(--accent-primary);
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-}
-
-.text-input textarea {
-    flex: 1;
-    border: none;
-    background: transparent;
-    color: var(--text-primary);
-    font-family: var(--font-primary);
-    font-size: 1rem;
-    line-height: 1.5;
-    padding: var(--spacing-sm) var(--spacing-md);
-    resize: none;
-    max-height: 150px;
-}
-
-.text-input textarea::placeholder {
-    color: var(--text-muted);
-}
-
-.text-input textarea:focus {
-    outline: none;
-}
-
-.send-btn {
-    width: 44px;
-    height: 44px;
-    border: none;
-    border-radius: var(--radius-lg);
-    background: var(--accent-gradient);
-    color: white;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all var(--transition-fast);
-    flex-shrink: 0;
-}
-
-.send-btn:hover {
-    transform: scale(1.05);
-    box-shadow: var(--accent-glow);
-}
-
-.send-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-    transform: none;
-}
-
-.send-btn svg {
-    width: 20px;
-    height: 20px;
 }
 
 /* Stop Button */
@@ -1348,19 +1150,6 @@ input:focus + .toggle-slider {
     
     .logo h1 {
         font-size: 1rem;
-    }
-    
-    .mode-selector {
-        flex-wrap: wrap;
-    }
-    
-    .mode-btn {
-        padding: var(--spacing-sm) var(--spacing-md);
-        font-size: 0.75rem;
-    }
-    
-    .mode-btn span {
-        display: none;
     }
     
     .avatar-container {

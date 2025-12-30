@@ -37,31 +37,6 @@
             </div>
         </header>
 
-        <!-- Mode Selector -->
-        <div class="mode-selector">
-            <button class="mode-btn active" data-mode="voice_to_voice">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                </svg>
-                <span>ხმა → ხმა</span>
-            </button>
-            <button class="mode-btn" data-mode="text_to_voice">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-                </svg>
-                <span>ტექსტი → ხმა</span>
-            </button>
-            <button class="mode-btn" data-mode="tts_only">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
-                </svg>
-                <span>მხოლოდ TTS</span>
-            </button>
-        </div>
-
         <!-- Main Content -->
         <main class="main-content">
             <!-- Content wrapper for avatar + chat layout -->
@@ -85,13 +60,6 @@
                             <div class="avatar-metrics" id="avatarMetrics">
                                 <span class="video-fps" id="videoFps">- FPS</span>
                                 <span class="video-frames" id="videoFrames">0 კადრი</span>
-                            </div>
-                            <div class="avatar-toggle">
-                                <label class="toggle-switch">
-                                    <input type="checkbox" id="musetalkToggle" checked>
-                                    <span class="toggle-slider"></span>
-                                </label>
-                                <span class="toggle-label">ავატარი</span>
                             </div>
                         </div>
                     </div>
@@ -166,23 +134,6 @@
                         </button>
                     </div>
                     <div class="vad-status" id="vadStatus">დააჭირეთ მიკროფონს საუბრის დასაწყებად</div>
-                </div>
-
-                <!-- Text Input (for text_to_voice and tts_only modes) -->
-                <div class="text-input hidden" id="textInput">
-                    <div class="input-wrapper">
-                        <textarea 
-                            id="textArea" 
-                            placeholder="შეიყვანეთ ტექსტი..."
-                            rows="1"
-                        ></textarea>
-                        <button class="send-btn" id="sendBtn">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <line x1="22" y1="2" x2="11" y2="13"/>
-                                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                            </svg>
-                        </button>
-                    </div>
                 </div>
 
                 <!-- Stop Button -->

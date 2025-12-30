@@ -16,15 +16,11 @@ class VoiceAssistant {
         // Audio
         this.audioContext = null;
         this.mediaStream = null;
-        this.audioWorklet = null;
         this.isRecording = false;
-        this.audioQueue = [];
-        this.isPlaying = false;
         this.currentPlaybackNode = null;
         
         // Video/Avatar
         this.videoEnabled = false;
-        this.videoFrameQueue = [];
         this.isDisplayingVideo = false;
         this.videoStartTime = null;
         this.idleFrame = null;
@@ -33,7 +29,6 @@ class VoiceAssistant {
         this.videoFps = 25;  // Target FPS
         this.videoFrameInterval = 1000 / 25;  // 40ms per frame
         this.videoDisplayTimer = null;
-        this.musetalkEnabled = true;  // MuseTalk toggle state
         this.videoComplete = false;   // Set when server signals video_complete
         
         // Synced A/V playback
@@ -44,10 +39,6 @@ class VoiceAssistant {
         this.frameReplayTimer = null;
         this.isReplayingAV = false;
         this.isLoopingFrames = false;
-        // Per-message media store for replays
-        this.messageMedia = new WeakMap();
-        this.frameReplayTimer = null;
-        this.isReplayingAV = false;
         
         // Adaptive buffering
         this.bufferConfig = {
@@ -65,15 +56,9 @@ class VoiceAssistant {
         this.lastBufferUpdate = 0;     // Timestamp of last buffer config update
         
         // State
-        this.currentMode = 'voice_to_voice';
         this.isGenerating = false;
         this.currentAssistantMessage = null;
         this.wordsSpoken = [];
-        
-        // TTS-only mode state
-        this.currentTTSText = '';
-        this.currentTTSAudioChunks = [];
-        this.currentTTSMessage = null;
         
         // Config
         this.config = {
@@ -125,7 +110,6 @@ class VoiceAssistant {
                 isGenerating: this.isGenerating,
                 videoComplete: this.videoComplete,
                 syncedQueueLen: this.syncedQueue.length,
-                audioQueueLen: this.audioQueue.length,
                 recordedFramesLen: this.recordedSyncedFrames.length,
                 bufferConfig: this.bufferConfig,
             });
@@ -145,9 +129,6 @@ class VoiceAssistant {
             // Connection
             connectionStatus: document.getElementById('connectionStatus'),
             
-            // Mode
-            modeBtns: document.querySelectorAll('.mode-btn'),
-            
             // Avatar/Video
             avatarContainer: document.getElementById('avatarContainer'),
             avatarImage: document.getElementById('avatarImage'),
@@ -156,7 +137,6 @@ class VoiceAssistant {
             avatarMetrics: document.getElementById('avatarMetrics'),
             videoFps: document.getElementById('videoFps'),
             videoFrames: document.getElementById('videoFrames'),
-            musetalkToggle: document.getElementById('musetalkToggle'),
             
             // Chat
             chatMessages: document.getElementById('chatMessages'),
@@ -174,11 +154,6 @@ class VoiceAssistant {
             vadIndicator: document.getElementById('vadIndicator'),
             micBtn: document.getElementById('micBtn'),
             vadStatus: document.getElementById('vadStatus'),
-            
-            // Text Input
-            textInput: document.getElementById('textInput'),
-            textArea: document.getElementById('textArea'),
-            sendBtn: document.getElementById('sendBtn'),
             
             // Stop
             stopBtn: document.getElementById('stopBtn'),
@@ -222,23 +197,8 @@ class VoiceAssistant {
     }
     
     bindEvents() {
-        // Mode switching
-        this.elements.modeBtns.forEach(btn => {
-            btn.addEventListener('click', () => this.setMode(btn.dataset.mode));
-        });
-        
         // Microphone
         this.elements.micBtn.addEventListener('click', () => this.toggleRecording());
-        
-        // Text input
-        this.elements.sendBtn.addEventListener('click', () => this.sendTextInput());
-        this.elements.textArea.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                this.sendTextInput();
-            }
-        });
-        this.elements.textArea.addEventListener('input', () => this.autoResizeTextarea());
         
         // Stop button
         this.elements.stopBtn.addEventListener('click', () => this.stopGeneration());
@@ -272,12 +232,6 @@ class VoiceAssistant {
             });
         }
         
-        // MuseTalk toggle
-        if (this.elements.musetalkToggle) {
-            this.elements.musetalkToggle.addEventListener('change', (e) => {
-                this.toggleMuseTalk(e.target.checked);
-            });
-        }
     }
     
     bindSlider(sliderId, valueId) {
@@ -335,7 +289,6 @@ class VoiceAssistant {
                 this.isConnected = true;
                 this.connectionId = data.connection_id;
                 this.log('[WS] Connected with ID:', this.connectionId);
-                this.sendMessage('set_mode', { mode: this.currentMode });
             },
             
             'tts_cache_ready': () => {
@@ -348,6 +301,9 @@ class VoiceAssistant {
                 if (data.success) {
                     this.videoEnabled = true;
                     this.updateAvatarStatus('ready', 'მზადაა');
+                    if (this.elements.avatarContainer) {
+                        this.elements.avatarContainer.classList.remove('disabled');
+                    }
 
                     // Show idle frame if available
                     if (data.idle_frame) {
@@ -367,6 +323,9 @@ class VoiceAssistant {
                 } else {
                     this.videoEnabled = false;
                     this.updateAvatarStatus('unavailable', 'მიუწვდომელია');
+                    if (this.elements.avatarContainer) {
+                        this.elements.avatarContainer.classList.add('disabled');
+                    }
                     console.log('MuseTalk not available:', data.reason);
                 }
             },
@@ -374,10 +333,6 @@ class VoiceAssistant {
             'buffer_config': () => {
                 // Handle buffer config updates from server
                 this.updateBufferConfig(data);
-            },
-            
-            'mode_changed': () => {
-                console.log('Mode changed to:', data.mode);
             },
             
             'vad_status': () => {
@@ -399,20 +354,13 @@ class VoiceAssistant {
                 }
             },
             
-            'user_message': () => {
-                this.addMessage('user', data.text);
-            },
-            
             'llm_start': () => {
                 this.isGenerating = true;
-                this.setSendButtonEnabled(false);  // Disable send button during generation
                 this.showStopButton();
                 this.currentAssistantMessage = this.addMessage('assistant', '', true);
                 this.wordsSpoken = [];
-                this.currentTTSAudioChunks = [];
                 
                 // Reset video state
-                this.videoFrameQueue = [];
                 this.totalFramesReceived = 0;
                 this.lastFrameIndex = -1;
                 this.videoStartTime = null;
@@ -436,9 +384,7 @@ class VoiceAssistant {
             'tts_start': () => {
                 this.log('[TTS] Starting, text:', data.text ? data.text.substring(0, 50) : '(empty)', 'video_enabled:', data.video_enabled);
                 this.logState('tts_start_begin');
-                
-                this.currentTTSText = data.text;
-                this.currentTTSAudioChunks = [];
+
                 this.videoComplete = false;
                 this.recordedSyncedFrames = [];
                 // Stop any idle/loop playback so new frames can take over
@@ -464,26 +410,6 @@ class VoiceAssistant {
                     this.log('[BUFFER] Video NOT enabled, isBuffering stays:', this.isBuffering);
                 }
                 this.logState('tts_start_end');
-
-                // In TTS-only mode, show user message and prepare audio message
-                if (this.currentMode === 'tts_only') {
-                    this.isGenerating = true;
-                    this.showStopButton();
-                    // Add user message (the text to synthesize)
-                    this.addMessage('user', data.text);
-                    // Create audio message placeholder
-                    this.currentTTSMessage = this.addAudioMessage();
-
-                    // Reset video state
-                    this.videoFrameQueue = [];
-                    this.totalFramesReceived = 0;
-                    this.lastFrameIndex = -1;
-                    this.videoStartTime = null;
-                }
-            },
-            
-            'tts_audio': () => {
-                this.handleTTSAudio(data);
             },
             
             'tts_complete': () => {
@@ -491,16 +417,6 @@ class VoiceAssistant {
                 this.logState('tts_complete');
                 this.hideStopButton();
                 this.isGenerating = false;
-                this.setSendButtonEnabled(true);  // Re-enable send button
-                
-                // Finalize audio message in TTS-only mode
-                if (this.currentMode === 'tts_only' && this.currentTTSMessage) {
-                    this.finalizeTTSMessage();
-                }
-            },
-            
-            'video_frame': () => {
-                this.handleVideoFrame(data);
             },
             
             'synced_av_frame': () => {
@@ -562,25 +478,14 @@ class VoiceAssistant {
                 }
             },
             
-            'musetalk_toggled': () => {
-                console.log('MuseTalk toggled:', data.enabled);
-                this.musetalkEnabled = data.enabled;
-                this.updateMuseTalkToggleUI();
-            },
-            
             'error': () => {
                 this.log('[ERROR] Server error:', data.message);
                 this.logState('error');
                 this.hideStopButton();
                 this.isGenerating = false;
-                this.setSendButtonEnabled(true);  // Re-enable send button on error
                 this.stopVideoPlayback();
                 this.updateAvatarStatus('error', 'შეცდომა');
             },
-            
-            'conversation_cleared': () => {
-                this.clearChat();
-            }
         };
         
         const handler = handlers[data.type];
@@ -758,116 +663,16 @@ class VoiceAssistant {
         }
     }
     
-    handleTTSAudio(data) {
-        try {
-            const binaryString = atob(data.audio);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
-            
-            const alignedBuffer = new ArrayBuffer(bytes.length);
-            new Uint8Array(alignedBuffer).set(bytes);
-            const audioData = new Float32Array(alignedBuffer);
-            
-            if (audioData.length === 0) {
-                return;
-            }
-            
-            // Update metrics
-            this.updateMetrics(data);
-            
-            // Store audio chunk for TTS message
-            this.currentTTSAudioChunks.push(audioData.slice());
-            
-            // Highlight current word in message (for non-TTS-only modes)
-            if (data.word && this.currentAssistantMessage && this.currentMode !== 'tts_only') {
-                this.highlightWord(data.word);
-            }
-            
-            // Update TTS message progress
-            if (this.currentMode === 'tts_only' && this.currentTTSMessage) {
-                this.updateTTSMessageProgress(data.word);
-            }
-            
-            // Queue audio for playback
-            this.queueAudio(audioData);
-            
-        } catch (e) {
-            console.error('Failed to decode audio:', e);
-        }
-    }
-    
-    queueAudio(audioData) {
-        this.audioQueue.push(audioData);
-        
-        if (!this.isPlaying) {
-            this.playNextAudio();
-        }
-    }
-    
-    async playNextAudio() {
-        if (this.audioQueue.length === 0) {
-            this.isPlaying = false;
-            return;
-        }
-        
-        this.isPlaying = true;
-        
-        if (this.audioContext.state === 'suspended') {
-            await this.audioContext.resume();
-        }
-        
-        const audioData = this.audioQueue.shift();
-        
-        const audioBuffer = this.audioContext.createBuffer(1, audioData.length, 24000);
-        audioBuffer.getChannelData(0).set(audioData);
-        
-        const source = this.audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(this.audioContext.destination);
-        
-        source.onended = () => {
-            this.playNextAudio();
-        };
-        
-        source.start();
-        this.currentPlaybackNode = source;
-    }
-    
     stopAudioPlayback() {
-        this.audioQueue = [];
         if (this.currentPlaybackNode) {
             try {
                 this.currentPlaybackNode.stop();
             } catch (e) {}
             this.currentPlaybackNode = null;
         }
-        this.isPlaying = false;
     }
     
     // ============ Video/Avatar ============
-    
-    handleVideoFrame(data) {
-        if (!data.frame) return;
-        
-        this.totalFramesReceived++;
-        
-        // Queue frame for display
-        this.videoFrameQueue.push({
-            frame: data.frame,
-            frameIndex: data.frame_index,
-            timestampMs: data.timestamp_ms,
-        });
-        
-        // Update metrics
-        this.updateVideoMetrics(data);
-        
-        // Start video playback if not already running
-        if (!this.isDisplayingVideo) {
-            this.startVideoPlayback();
-        }
-    }
     
     handleSyncedAVFrame(data) {
         /**
@@ -889,14 +694,9 @@ class VoiceAssistant {
         if (this.totalFramesReceived % 10 === 1 || this.totalFramesReceived <= 5) {
             this.log(`[SYNC FRAME] #${data.frame_index} received, total: ${this.totalFramesReceived}, queue: ${this.syncedQueue.length}, buffering: ${this.isBuffering}, playing: ${this.isSyncedPlayback}`);
         }
-        const isTtsOnly = this.currentMode === 'tts_only';
         let decodedAudio = null;
         if (data.audio) {
             decodedAudio = this.decodeAudioBase64(data.audio);
-            if (decodedAudio && isTtsOnly) {
-                // Store audio for replay/UI in TTS-only mode
-                this.currentTTSAudioChunks.push(decodedAudio);
-            }
         }
         // Record frames/audio for potential replay/fallback even if not TTS-only
         if (data.frame || data.audio) {
@@ -1019,13 +819,8 @@ class VoiceAssistant {
                 // Handle word highlighting
                 if (syncedData.word) {
                     this.wordsSpoken.push(syncedData.word);
-                    // Highlight word in message if in voice modes
-                    if (this.currentAssistantMessage && this.currentMode !== 'tts_only') {
+                    if (this.currentAssistantMessage) {
                         this.highlightWord(syncedData.word);
-                    }
-                    // Update TTS message progress in TTS-only mode
-                    if (this.currentMode === 'tts_only' && this.currentTTSMessage) {
-                        this.updateTTSMessageProgress(syncedData.word);
                     }
                 }
                 // Log every 25th frame (about once per second)
@@ -1189,36 +984,6 @@ class VoiceAssistant {
         }
     }
     
-    toggleMuseTalk(enabled) {
-        /**
-         * Toggle MuseTalk on/off.
-         * Sends message to server and updates local state.
-         */
-        this.musetalkEnabled = enabled;
-        this.sendMessage('toggle_musetalk', { enabled });
-        this.updateMuseTalkToggleUI();
-        console.log('MuseTalk toggled:', enabled);
-    }
-    
-    updateMuseTalkToggleUI() {
-        /**
-         * Update the toggle switch UI to reflect current state.
-         */
-        const toggle = document.getElementById('musetalkToggle');
-        if (toggle) {
-            toggle.checked = this.musetalkEnabled;
-        }
-        
-        // Update avatar container visibility/opacity
-        if (this.elements.avatarContainer) {
-            if (this.musetalkEnabled) {
-                this.elements.avatarContainer.classList.remove('disabled');
-            } else {
-                this.elements.avatarContainer.classList.add('disabled');
-            }
-        }
-    }
-    
     displayFrame(frameBase64) {
         if (!this.elements.avatarImage) return;
         
@@ -1227,31 +992,6 @@ class VoiceAssistant {
         } catch (e) {
             console.error('Failed to display frame:', e);
         }
-    }
-    
-    startVideoPlayback() {
-        if (this.isDisplayingVideo) return;
-        
-        this.isDisplayingVideo = true;
-        this.videoStartTime = performance.now();
-        
-        // Use requestAnimationFrame for smooth playback
-        const displayNextFrame = () => {
-            if (!this.isDisplayingVideo) return;
-            
-            if (this.videoFrameQueue.length > 0) {
-                const frameData = this.videoFrameQueue.shift();
-                this.displayFrame(frameData.frame);
-                this.lastFrameIndex = frameData.frameIndex;
-            }
-            
-            // Schedule next frame at 25 FPS (40ms intervals)
-            this.videoDisplayTimer = setTimeout(() => {
-                requestAnimationFrame(displayNextFrame);
-            }, this.videoFrameInterval);
-        };
-        
-        requestAnimationFrame(displayNextFrame);
     }
     
     stopVideoPlayback() {
@@ -1273,13 +1013,11 @@ class VoiceAssistant {
         }
         
         // Clear remaining frames
-        const remainingVideo = this.videoFrameQueue.length;
         const remainingSynced = this.syncedQueue.length;
-        this.videoFrameQueue = [];
         this.syncedQueue = [];
         
-        if (remainingVideo > 0 || remainingSynced > 0) {
-            this.log(`[VIDEO] Cleared ${remainingVideo} video frames, ${remainingSynced} synced frames`);
+        if (remainingSynced > 0) {
+            this.log(`[VIDEO] Cleared ${remainingSynced} synced frames`);
         }
     }
     
@@ -1463,29 +1201,6 @@ class VoiceAssistant {
         textEl.textContent = texts[status] || 'კავშირის დამყარება...';
     }
     
-    setMode(mode) {
-        this.currentMode = mode;
-        
-        this.elements.modeBtns.forEach(btn => {
-            btn.classList.toggle('active', btn.dataset.mode === mode);
-        });
-        
-        if (mode === 'voice_to_voice') {
-            this.elements.voiceInput.classList.remove('hidden');
-            this.elements.textInput.classList.add('hidden');
-        } else {
-            this.elements.voiceInput.classList.add('hidden');
-            this.elements.textInput.classList.remove('hidden');
-        }
-        
-        if (mode !== 'voice_to_voice' && this.isRecording) {
-            this.stopRecording();
-            this.elements.micBtn.classList.remove('active');
-        }
-        
-        this.sendMessage('set_mode', { mode });
-    }
-    
     updateVadStatus(status) {
         const indicator = this.elements.vadIndicator;
         const statusEl = this.elements.vadStatus;
@@ -1577,126 +1292,6 @@ class VoiceAssistant {
         return messageEl;
     }
     
-    // Add audio message (for TTS-only mode)
-    addAudioMessage() {
-        const welcomeMsg = this.elements.chatMessages.querySelector('.welcome-message');
-        if (welcomeMsg) {
-            welcomeMsg.remove();
-        }
-        
-        const messageEl = document.createElement('div');
-        messageEl.className = 'message assistant audio-message';
-        
-        messageEl.innerHTML = `
-            <div class="message-avatar">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
-                </svg>
-            </div>
-            <div class="message-content audio-content">
-                <div class="audio-player">
-                    <button class="play-btn" disabled>
-                        <svg class="play-icon" viewBox="0 0 24 24" fill="currentColor">
-                            <polygon points="5 3 19 12 5 21 5 3"/>
-                        </svg>
-                        <svg class="pause-icon hidden" viewBox="0 0 24 24" fill="currentColor">
-                            <rect x="6" y="4" width="4" height="16"/>
-                            <rect x="14" y="4" width="4" height="16"/>
-                        </svg>
-                    </button>
-                    <div class="audio-info">
-                        <span class="audio-status">გენერაცია...</span>
-                        <span class="audio-word"></span>
-                    </div>
-                </div>
-            </div>
-        `;
-        
-        this.elements.chatMessages.appendChild(messageEl);
-        this.scrollToBottom();
-        
-        return messageEl;
-    }
-    
-    updateTTSMessageProgress(word) {
-        if (!this.currentTTSMessage) return;
-        
-        const wordEl = this.currentTTSMessage.querySelector('.audio-word');
-        if (wordEl && word) {
-            wordEl.textContent = word;
-        }
-    }
-    
-    finalizeTTSMessage() {
-        if (!this.currentTTSMessage) return;
-        
-        const messageEl = this.currentTTSMessage;
-        const playBtn = messageEl.querySelector('.play-btn');
-        const statusEl = messageEl.querySelector('.audio-status');
-        const wordEl = messageEl.querySelector('.audio-word');
-        
-        // Store audio chunks in the button's dataset
-        const audioChunks = [...this.currentTTSAudioChunks];
-        const framesForMessage = [...this.recordedSyncedFrames];
-        // Persist media for this message so replays use the right content later
-        this.messageMedia.set(messageEl, {
-            audioChunks,
-            frames: framesForMessage,
-        });
-        
-        if (audioChunks.length > 0) {
-            playBtn.disabled = false;
-            
-            // Calculate duration
-            const totalSamples = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-            const durationSec = totalSamples / 24000;
-            statusEl.textContent = `${durationSec.toFixed(1)}წმ`;
-            wordEl.textContent = '';
-            
-            // Add click handler
-            let isPlaying = false;
-            playBtn.addEventListener('click', async () => {
-                const playIcon = playBtn.querySelector('.play-icon');
-                const pauseIcon = playBtn.querySelector('.pause-icon');
-                const media = this.messageMedia.get(messageEl) || { audioChunks: [], frames: [] };
-                const storedAudio = media.audioChunks || [];
-                const storedFrames = media.frames || [];
-                
-                if (isPlaying) {
-                    this.stopAudioPlayback();
-                    this.stopSyncedPlayback();
-                    isPlaying = false;
-                    playIcon.classList.remove('hidden');
-                    pauseIcon.classList.add('hidden');
-                } else {
-                    const hasFrames = storedFrames && storedFrames.length > 0 && this.musetalkEnabled;
-                    if (hasFrames) {
-                        this.playRecordedAV(storedFrames);
-                    } else {
-                        await this.playStoredAudio(storedAudio);
-                    }
-                    isPlaying = true;
-                    playIcon.classList.add('hidden');
-                    pauseIcon.classList.remove('hidden');
-                    
-                    // Reset when done (approximate)
-                    setTimeout(() => {
-                        isPlaying = false;
-                        playIcon.classList.remove('hidden');
-                        pauseIcon.classList.add('hidden');
-                    }, durationSec * 1000 + 100);
-                }
-            });
-        } else {
-            statusEl.textContent = 'შეცდომა';
-        }
-        
-        this.currentTTSMessage = null;
-        this.currentTTSAudioChunks = [];
-    }
-    
     updateAssistantMessage(text, complete = false) {
         if (!this.currentAssistantMessage) return;
         
@@ -1773,43 +1368,7 @@ class VoiceAssistant {
         this.stopVideoPlayback();
         this.hideStopButton();
         this.isGenerating = false;
-        this.setSendButtonEnabled(true);  // Re-enable send button
         this.updateAvatarStatus('ready', 'მზადაა');
-    }
-    
-    sendTextInput() {
-        const text = this.elements.textArea.value.trim();
-        if (!text) return;
-        
-        // Check if we can send (not generating)
-        if (this.isGenerating) {
-            this.log('[SEND] Blocked - already generating');
-            return;
-        }
-        
-        // Disable send button while processing
-        this.setSendButtonEnabled(false);
-        
-        this.sendMessage('text_input', { text });
-        this.elements.textArea.value = '';
-        this.autoResizeTextarea();
-    }
-    
-    setSendButtonEnabled(enabled) {
-        if (this.elements.sendBtn) {
-            this.elements.sendBtn.disabled = !enabled;
-            if (enabled) {
-                this.elements.sendBtn.classList.remove('disabled');
-            } else {
-                this.elements.sendBtn.classList.add('disabled');
-            }
-        }
-    }
-    
-    autoResizeTextarea() {
-        const textarea = this.elements.textArea;
-        textarea.style.height = 'auto';
-        textarea.style.height = Math.min(textarea.scrollHeight, 150) + 'px';
     }
     
     // ============ Settings ============

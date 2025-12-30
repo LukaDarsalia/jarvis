@@ -1,15 +1,14 @@
 # Voice Assistant Client
 
-A modern web-based voice assistant client that connects to a Triton Inference Server running VAD, STT, LLM, and TTS models.
+A modern web-based voice assistant client that connects to a Triton Inference Server running VAD, STT, LLM, TTS, and MuseTalk models.
 
 ## Features
 
 - **Voice-to-Voice Chat**: Speak to the assistant and hear responses
-- **Text-to-Voice Chat**: Type messages and hear spoken responses
-- **TTS-Only Mode**: Direct text-to-speech synthesis for testing
+- **Avatar Video (MuseTalk)**: Lip-synced video frames generated from audio
 - **Real-time Metrics**: RTF (Real-Time Factor), generation time, and audio duration display
 - **Word-level Synchronization**: Visual highlighting of words as they're being spoken
-- **Configurable Parameters**: Tune VAD, LLM, and TTS settings from the UI
+- **Configurable Parameters**: Tune VAD, LLM, TTS, MuseTalk, and buffering settings from the UI
 
 ## Architecture
 
@@ -20,6 +19,7 @@ A modern web-based voice assistant client that connects to a Triton Inference Se
 │  │                    Voice Assistant UI                    │   │
 │  │  • Voice Recording (16kHz)                               │   │
 │  │  • Audio Playback (24kHz)                                │   │
+│  │  • Avatar Playback (25 FPS)                              │   │
 │  │  • WebSocket Communication                               │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
@@ -31,7 +31,7 @@ A modern web-based voice assistant client that connects to a Triton Inference Se
 │  │                     main.py                              │   │
 │  │  • WebSocket endpoint (/ws)                              │   │
 │  │  • REST endpoints (/health, /config)                     │   │
-│  │  • Audio/Text message routing                            │   │
+│  │  • Audio message routing                                 │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────┐   │
@@ -40,22 +40,23 @@ A modern web-based voice assistant client that connects to a Triton Inference Se
 │  │  • STT transcription                                     │   │
 │  │  • LLM streaming generation                              │   │
 │  │  • TTS streaming with word sync                          │   │
+│  │  • MuseTalk video generation                             │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
                               │ gRPC
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   Triton Inference Server                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
-│  │   VAD    │  │   STT    │  │   LLM    │  │   TTS    │        │
-│  │ (Silero) │  │ (NeMo)   │  │ (Kona2)  │  │ (CSM-1B) │        │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐│
+│  │   VAD    │  │   STT    │  │   LLM    │  │   TTS    │  │  MuseTalk  ││
+│  │ (Silero) │  │ (NeMo)   │  │ (Kona2)  │  │ (CSM-1B) │  │  (Avatar)  ││
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └────────────┘│
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Pipeline Flow
 
-### Voice-to-Voice Mode
+### Voice-to-Voice Pipeline
 
 1. **VAD (Voice Activity Detection)**
    - Detects speech onset (>200ms of speech)
@@ -74,6 +75,11 @@ A modern web-based voice assistant client that connects to a Triton Inference Se
    - Uses 2-word lookahead for streaming
    - Generates audio frames progressively
    - Reports RTF metrics
+
+5. **MuseTalk (Avatar)**
+   - Generates video frames from TTS audio
+   - Audio and video are delivered as synced 40ms frames
+   - Maintains frame index continuity across turns
 
 ### TTS Streaming Protocol
 
@@ -183,14 +189,9 @@ Access the UI at: http://localhost:8080
 #### Client → Server Messages
 
 ```json
-// Set mode
-{"type": "set_mode", "mode": "voice_to_voice|text_to_voice|tts_only"}
-
-// Text input (for text_to_voice and tts_only modes)
-{"type": "text_input", "text": "ტექსტი"}
-
-// Clear conversation history
-{"type": "clear_conversation"}
+// Recording lifecycle (pre-initialize TTS cache)
+{"type": "recording_start"}
+{"type": "recording_stop"}
 
 // Stop current generation
 {"type": "stop_generation"}
@@ -201,6 +202,9 @@ Access the UI at: http://localhost:8080
 ```json
 // Connection established
 {"type": "connected", "connection_id": "...", "message": "..."}
+
+// MuseTalk availability + idle frame
+{"type": "musetalk_ready", "success": true, "idle_frame": "<base64>", "buffer_config": {...}}
 
 // TTS cache initialized
 {"type": "tts_cache_ready", "success": true}
@@ -218,9 +222,14 @@ Access the UI at: http://localhost:8080
 {"type": "llm_complete", "text": "..."}
 
 // TTS events
-{"type": "tts_start", "text": "..."}
-{"type": "tts_audio", "audio": "<base64>", "word": "...", "rtf": 0.85, ...}
+{"type": "tts_start", "text": "", "video_enabled": true, "buffer_config": {...}}
 {"type": "tts_complete"}
+
+// Synced audio + video frames (40ms chunks)
+{"type": "synced_av_frame", "audio": "<base64>", "frame": "<base64>", "frame_index": 0, "timestamp_ms": 0, "word": "..."}
+
+// Video completed
+{"type": "video_complete"}
 ```
 
 #### Binary Messages
@@ -274,4 +283,3 @@ client/
 1. Monitor RTF in the metrics panel
 2. Reduce `max_new_tokens` for faster LLM responses
 3. Check GPU utilization on Triton server
-
