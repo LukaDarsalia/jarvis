@@ -1,6 +1,5 @@
 import json
 import os
-import time
 import traceback
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
@@ -55,32 +54,7 @@ class TritonPythonModel:
                 reference_json_path="/local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
             )
 
-            warmup_enabled = os.environ.get("TTS_WARMUP", "1") != "0"
-            if warmup_enabled:
-                warmup_text = os.environ.get("TTS_WARMUP_TEXT", "").strip() or None
-                warmup_steps = int(os.environ.get("TTS_WARMUP_STEPS", "12"))
-                warmup_rounds = int(os.environ.get("TTS_WARMUP_ROUNDS", "2"))
-                warmup_start = time.perf_counter()
-                try:
-                    ok = self.tts_generator.warmup(
-                        speaker_id=0,
-                        text=warmup_text,
-                        max_steps=warmup_steps,
-                        max_rounds=warmup_rounds,
-                    )
-                    warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
-                    pb_utils.Logger.log_info(
-                        f"TTS warmup {'completed' if ok else 'skipped'} "
-                        f"in {warmup_ms:.1f}ms (steps={warmup_steps}, rounds={warmup_rounds})"
-                    )
-                except Exception as exc:
-                    warmup_ms = (time.perf_counter() - warmup_start) * 1000.0
-                    pb_utils.Logger.log_warn(
-                        f"TTS warmup failed after {warmup_ms:.1f}ms: {exc}"
-                    )
-
             pb_utils.Logger.log_info("TTS Triton model initialized")
-            self.log_every_n_steps = int(os.environ.get("TTS_LOG_EVERY_N_STEPS", "10"))
 
         except Exception as e:
             msg = f"Failed to initialize: {e}\n{traceback.format_exc()}"
@@ -181,46 +155,29 @@ class TritonPythonModel:
 
         # Handles init cache. If session ids are more than supposed number, raises error!
         if is_start:
-            t0 = time.perf_counter()
             is_initialized = self.tts_generator.initialize_session(seq_id)
-            init_ms = (time.perf_counter() - t0) * 1000.0
             self._send_final(sender)
             if not is_initialized:
                 raise RuntimeError(f"[Seq {seq_id}] Failed to start session: max concurrent reached")
-            pb_utils.Logger.log_info(f"[Seq {seq_id}] Cache initialized successfully in {init_ms:.1f}ms")
+            pb_utils.Logger.log_info(f"[Seq {seq_id}] Cache initialized successfully")
             return
 
         # Handles ending. Ends session
         if is_end:
-            t0 = time.perf_counter()
             pb_utils.Logger.log_info(f"[Seq {seq_id}] Session successfully ended!")
             self.tts_generator.end_session(seq_id)
-            end_ms = (time.perf_counter() - t0) * 1000.0
             self._send_final(sender)
-            pb_utils.Logger.log_info(f"[Seq {seq_id}] Session cleanup completed in {end_ms:.1f}ms")
             return
 
         pb_utils.Logger.log_info(f"Appends intermediate texts: {texts}")
-        append_start = time.perf_counter()
         ok = self.tts_generator.append_texts(seq_id, texts, speaker_id=0)
-        append_ms = (time.perf_counter() - append_start) * 1000.0
         if not ok:
             self._send_final(sender)
             raise RuntimeError(f"[Seq {seq_id}] session is not active!")
-        pb_utils.Logger.log_info(f"[Seq {seq_id}] append_texts_ms={append_ms:.1f}")
-
-        req_start = time.perf_counter()
-        base_frames = self.tts_generator.get_session_frame_count(seq_id)
-        chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
-        base_samples = base_frames * chunk_len
-        total_steps = 0
-        last_audio_ms = 0.0
-        interval_steps = 0
 
         # Processes one word audio
         # If model loops and never returns eos token, max_steps will stop it!
         for cur_step in range(self.config.max_steps):
-            step_start = time.perf_counter()
             is_complete = self.tts_generator.step_session(
                 seq_id,
                 max_steps=1,
@@ -229,9 +186,6 @@ class TritonPythonModel:
                 depth_temperature=depth_temperature,
                 depth_topp=depth_topp
             )
-            step_ms = (time.perf_counter() - step_start) * 1000.0
-            total_steps += 1
-            interval_steps += 1
 
             # Get all codes so far
             codes = self.tts_generator.get_session_audio(seq_id, return_codes=True)
@@ -239,14 +193,13 @@ class TritonPythonModel:
                 continue
 
             # Decode full audio from all codes
-            decode_start = time.perf_counter()
             audio_24k = self.tts_generator._decode_audio(codes)
-            decode_ms = (time.perf_counter() - decode_start) * 1000.0
-            self.tts_generator.record_codec_time(seq_id, decode_ms)
             audio_24k = audio_24k.cpu().float()
 
             audio_np = audio_24k.numpy()
-            last_audio_ms = (len(audio_np) / float(self.output_sample_rate)) * 1000.0
+
+            # Chunk length = 1920 @ 24k scaled by target_sr
+            chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
 
             # stream last chunk_len samples
             chunk_np = audio_np[-chunk_len:].astype(np.float32)
@@ -254,26 +207,6 @@ class TritonPythonModel:
             sender.send(pb_utils.InferenceResponse(
                 output_tensors=[audio_tensor]
             ))
-
-            if self.log_every_n_steps > 0 and (interval_steps >= self.log_every_n_steps or is_complete):
-                perf = self.tts_generator.get_session_perf(seq_id, reset=True)
-                gen_ms = (time.perf_counter() - req_start) * 1000.0
-                request_samples = max(0, len(audio_np) - base_samples)
-                request_audio_ms = (request_samples / float(self.output_sample_rate)) * 1000.0
-                rtf = (gen_ms / request_audio_ms) if request_audio_ms > 0 else 0.0
-                if perf is not None:
-                    bb_inject_avg = perf.bb_inject_ms / perf.inject_calls if perf.inject_calls else 0.0
-                    bb_audio_avg = perf.bb_audio_ms / perf.audio_calls if perf.audio_calls else 0.0
-                    dd_avg = perf.dd_ms / perf.dd_calls if perf.dd_calls else 0.0
-                    lm_avg = perf.lm_ms / perf.lm_calls if perf.lm_calls else 0.0
-                    codec_avg = perf.codec_ms / perf.codec_calls if perf.codec_calls else 0.0
-                    pb_utils.Logger.log_info(
-                        f"[Seq {seq_id}] steps={total_steps} step_ms={step_ms:.1f} decode_ms={decode_ms:.1f} "
-                        f"audio_ms={request_audio_ms:.1f} rtf={rtf:.3f} "
-                        f"bb_inject_ms(avg)={bb_inject_avg:.2f} bb_audio_ms(avg)={bb_audio_avg:.2f} "
-                        f"dd_ms(avg)={dd_avg:.2f} lm_ms(avg)={lm_avg:.2f} codec_ms(avg)={codec_avg:.2f}"
-                    )
-                interval_steps = 0
 
             # Means model returned eos token
             if is_complete:
