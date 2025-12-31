@@ -211,6 +211,9 @@ async def run_tts_with_musetalk(
                         text_chunks,
                         session_id=state.tts_session_id,
                     ):
+                        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+                        if audio.size == 0:
+                            continue
                         audio_chunks_generated += 1
                         if audio_chunks_generated <= 3:
                             logger.info(
