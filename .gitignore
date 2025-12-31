@@ -6,7 +6,8 @@ local_models
 playground.ipynb
 # C extensions
 *.so
-
+*.onnx
+*.data
 # Distribution / packaging
 .Python
 build/
