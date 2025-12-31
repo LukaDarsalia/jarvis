@@ -58,6 +58,8 @@ class TritonPythonModel:
             self._session_state_lock = threading.Lock()
             self._session_prev_frames: Dict[int, int] = {}
             self._session_audio_buffers: Dict[int, np.ndarray] = {}
+            self._session_chunk_counters: Dict[int, int] = {}
+            self._log_every_n_chunks = 50
 
             pb_utils.Logger.log_info("TTS Triton model initialized")
 
@@ -167,6 +169,7 @@ class TritonPythonModel:
             with self._session_state_lock:
                 self._session_prev_frames[seq_id] = 0
                 self._session_audio_buffers[seq_id] = np.zeros((0,), dtype=np.float32)
+                self._session_chunk_counters[seq_id] = 0
             pb_utils.Logger.log_info(f"[Seq {seq_id}] Cache initialized successfully")
             return
 
@@ -177,6 +180,7 @@ class TritonPythonModel:
             with self._session_state_lock:
                 self._session_prev_frames.pop(seq_id, None)
                 self._session_audio_buffers.pop(seq_id, None)
+                self._session_chunk_counters.pop(seq_id, None)
             self._send_final(sender)
             return
 
@@ -214,6 +218,10 @@ class TritonPythonModel:
                 if is_complete:
                     break
                 continue
+            if cur_num_frames > prev_num_frames + 1:
+                pb_utils.Logger.log_info(
+                    f"[Seq {seq_id}] Multiple frames generated at once: prev={prev_num_frames} cur={cur_num_frames}"
+                )
 
             # Decode full audio and stream only the newly generated frames.
             full_audio = self.tts_generator._decode_audio(codes)
@@ -249,6 +257,25 @@ class TritonPythonModel:
                 else:
                     chunk_np = audio_buf
                     audio_buf = np.zeros((0,), dtype=np.float32)
+                with self._session_state_lock:
+                    chunk_counter = self._session_chunk_counters.get(seq_id, 0) + 1
+                    self._session_chunk_counters[seq_id] = chunk_counter
+                log_chunk = (
+                    chunk_counter <= 3
+                    or chunk_counter % self._log_every_n_chunks == 0
+                    or chunk_np.size != chunk_len
+                )
+                if log_chunk and chunk_np.size > 0:
+                    min_val = float(np.min(chunk_np))
+                    max_val = float(np.max(chunk_np))
+                    rms_val = float(np.sqrt(np.mean(chunk_np ** 2))) if chunk_np.size > 0 else 0.0
+                    nan_count = int(np.isnan(chunk_np).sum())
+                    pb_utils.Logger.log_info(
+                        f"[Seq {seq_id}] AUDIO_FRAME {chunk_counter}: samples={chunk_np.size} "
+                        f"expected={chunk_len} min={min_val:.4f} max={max_val:.4f} "
+                        f"rms={rms_val:.4f} nan={nan_count} prev_frames={prev_num_frames} "
+                        f"cur_frames={cur_num_frames}"
+                    )
                 audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
                 sender.send(pb_utils.InferenceResponse(
                     output_tensors=[audio_tensor]

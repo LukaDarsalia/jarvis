@@ -58,6 +58,8 @@ class TTSSession:
         self._is_closed = False
         self._lock = threading.Lock()
         self._last_used: float = time.time()
+        self._audio_frame_count = 0
+        self._audio_log_every = 50
 
     @property
     def is_initialized(self) -> bool:
@@ -276,7 +278,28 @@ class TTSSession:
                             )
                             break
 
-                        audio = data.as_numpy("AUDIO_FRAME")
+                        audio = np.asarray(data.as_numpy("AUDIO_FRAME"))
+                        self._audio_frame_count += 1
+
+                        if audio.size > 0:
+                            log_frame = (
+                                self._audio_frame_count <= 3
+                                or self._audio_frame_count % self._audio_log_every == 0
+                                or (audio.size != self.config.chunk_samples)
+                                or (audio.dtype != np.float32)
+                                or (audio.ndim != 1)
+                            )
+                            if log_frame:
+                                min_val = float(np.min(audio))
+                                max_val = float(np.max(audio))
+                                rms_val = float(np.sqrt(np.mean(audio ** 2))) if audio.size > 0 else 0.0
+                                nan_count = int(np.isnan(audio).sum())
+                                logger.info(
+                                    f"TTS session {self.session_id} AUDIO_FRAME {self._audio_frame_count}: "
+                                    f"samples={audio.size} expected={self.config.chunk_samples} "
+                                    f"dtype={audio.dtype} ndim={audio.ndim} min={min_val:.4f} "
+                                    f"max={max_val:.4f} rms={rms_val:.4f} nan={nan_count}"
+                                )
 
                         if len(audio) > 0:
                             chunk_audio_count += 1

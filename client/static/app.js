@@ -42,6 +42,9 @@ class VoiceAssistant {
 
         // Frame buffer and playback - LARGER BUFFER to handle MuseTalk being slower than realtime
         this.frameBuffer = new Map();    // frame_index -> frame payload
+        this.replayFrames = new Map();   // last completed stream frames
+        this.pendingReplayFrames = new Map();
+        this.isReplaying = false;
         this.nextFrameIndex = null;
         this.highestFrameIndex = null;
         this.missingFrameSince = null;
@@ -57,6 +60,11 @@ class VoiceAssistant {
             duplicates: 0,
             gaps: 0,
             lateDrops: 0,
+        };
+        this.audioDecodeStats = {
+            count: 0,
+            logEvery: 50,
+            logFirst: 3,
         };
 
         // Buffer configuration - MuseTalk runs at ~1.45x realtime
@@ -163,6 +171,7 @@ class VoiceAssistant {
             micBtn: document.getElementById('micBtn'),
             vadStatus: document.getElementById('vadStatus'),
             stopBtn: document.getElementById('stopBtn'),
+            replayBtn: document.getElementById('replayBtn'),
             settingsBtn: document.getElementById('settingsBtn'),
             settingsPanel: document.getElementById('settingsPanel'),
             settingsOverlay: document.getElementById('settingsOverlay'),
@@ -197,6 +206,7 @@ class VoiceAssistant {
     bindEvents() {
         this.elements.micBtn?.addEventListener('click', () => this.toggleRecording());
         this.elements.stopBtn?.addEventListener('click', () => this.stopGeneration());
+        this.elements.replayBtn?.addEventListener('click', () => this.replayLastStream());
         this.elements.settingsBtn?.addEventListener('click', () => this.openSettings());
         this.elements.closeSettingsBtn?.addEventListener('click', () => this.closeSettings());
         this.elements.settingsOverlay?.addEventListener('click', () => this.closeSettings());
@@ -548,6 +558,7 @@ class VoiceAssistant {
                 this.currentAssistantMessage = this.addMessage('assistant', '', true);
                 this.wordsSpoken = [];
                 this.resetPlaybackState();
+                this.prepareReplayCapture();
                 this.startNewStreamMetrics();
                 this.applyInitialBufferConfig();
                 this.updateAvatarStatus('loading', 'იტვირთება...');
@@ -588,6 +599,7 @@ class VoiceAssistant {
                 this.streamComplete = true;
                 this.isGenerating = false;
                 this.hideStopButton();
+                this.finalizeReplayCapture();
 
                 // If still buffering or paused, force start/resume playback
                 if ((this.isBuffering || this.isPaused) && this.frameBuffer.size > 0) {
@@ -734,10 +746,64 @@ class VoiceAssistant {
         this.isBuffering = true;
         this.isPlaying = false;
         this.isPaused = false;
+        this.isReplaying = false;
         this.framesPlayed = 0;
         this.framesReceived = 0;
         this.lastVideoFrame = null;
         this.nextAudioTime = 0;
+    }
+
+    prepareReplayCapture() {
+        this.pendingReplayFrames = new Map();
+        this.updateReplayButtonState();
+    }
+
+    finalizeReplayCapture() {
+        if (this.pendingReplayFrames.size > 0) {
+            this.replayFrames = this.pendingReplayFrames;
+        }
+        this.pendingReplayFrames = new Map();
+        this.updateReplayButtonState();
+    }
+
+    updateReplayButtonState() {
+        const replayBtn = this.elements.replayBtn;
+        if (!replayBtn) return;
+
+        const hasReplay = this.replayFrames && this.replayFrames.size > 0;
+        if (!hasReplay) {
+            replayBtn.classList.add('hidden');
+            replayBtn.disabled = true;
+            return;
+        }
+
+        replayBtn.classList.remove('hidden');
+        const disabled = this.isGenerating || this.isPlaying || this.isReplaying;
+        replayBtn.disabled = disabled;
+    }
+
+    replayLastStream() {
+        if (!this.replayFrames || this.replayFrames.size === 0) {
+            this.log('Replay requested but no stored stream');
+            return;
+        }
+        if (this.isPlaying || this.isGenerating) {
+            this.log('Replay blocked: currently playing or generating');
+            return;
+        }
+
+        this.resetPlaybackState();
+        this.isReplaying = true;
+        this.streamComplete = true;
+        this.isGenerating = false;
+        this.wordsSpoken = [];
+
+        this.frameBuffer = new Map(this.replayFrames);
+        this.framesReceived = this.frameBuffer.size;
+        this.nextFrameIndex = this.getLowestBufferedIndex();
+        this.log(`Replaying last stream | Frames: ${this.framesReceived}`);
+        this.updateReplayButtonState();
+        this.startPlayback();
     }
 
     handleAVFrame(data) {
@@ -794,10 +860,10 @@ class VoiceAssistant {
         let audioFloat = null;
         if (data.audio) {
             audioFloat = this.decodeAudioBase64(data.audio);
+            this.logDecodedAudioStats(audioFloat, frameIndex, data.audio.length);
         }
 
-        // Store frame
-        this.frameBuffer.set(frameIndex, {
+        const payload = {
             audio: audioFloat,
             frame: data.frame,
             frameIndex: frameIndex,
@@ -806,7 +872,11 @@ class VoiceAssistant {
             rtf: data.rtf,
             generation_time_ms: data.generation_time_ms,
             audio_duration_ms: data.audio_duration_ms,
-        });
+        };
+
+        // Store frame
+        this.frameBuffer.set(frameIndex, payload);
+        this.pendingReplayFrames.set(frameIndex, payload);
         this.framesReceived++;
         this.updateStreamMetrics(data);
 
@@ -869,6 +939,7 @@ class VoiceAssistant {
             `Starting playback | Buffer: ${bufferedTotal} total, ${contiguous} contiguous | Min: ${this.bufferConfig.minFrames} | Next index: ${this.nextFrameIndex}`
         );
         this.updateAvatarStatus('speaking', 'საუბრობს');
+        this.updateReplayButtonState();
 
         this.playNextFrame();
     }
@@ -967,6 +1038,7 @@ class VoiceAssistant {
         this.isPaused = false;
         this.missingFrameSince = null;
         this.underrunLogged = false;
+        this.isReplaying = false;
 
         if (this.playbackTimer) {
             clearTimeout(this.playbackTimer);
@@ -974,6 +1046,7 @@ class VoiceAssistant {
         }
 
         this.nextAudioTime = 0;
+        this.updateReplayButtonState();
     }
 
     playAudio(audioFloat) {
@@ -1025,6 +1098,48 @@ class VoiceAssistant {
             console.error('Failed to decode audio:', e);
             return null;
         }
+    }
+
+    logDecodedAudioStats(audioFloat, frameIndex, base64Len) {
+        if (!audioFloat || audioFloat.length === 0) return;
+
+        this.audioDecodeStats.count += 1;
+        const count = this.audioDecodeStats.count;
+        const expectedSamples = Math.round(this.audioSampleRate / this.videoFps);
+        const shouldLog =
+            count <= this.audioDecodeStats.logFirst ||
+            count % this.audioDecodeStats.logEvery === 0 ||
+            audioFloat.length !== expectedSamples;
+
+        if (!shouldLog) return;
+
+        let minVal = Infinity;
+        let maxVal = -Infinity;
+        let sumSq = 0;
+        let nanCount = 0;
+
+        for (let i = 0; i < audioFloat.length; i++) {
+            const v = audioFloat[i];
+            if (!Number.isFinite(v)) {
+                nanCount += 1;
+                continue;
+            }
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+            sumSq += v * v;
+        }
+
+        if (minVal === Infinity) {
+            minVal = 0;
+            maxVal = 0;
+        }
+
+        const rmsVal = audioFloat.length > 0 ? Math.sqrt(sumSq / audioFloat.length) : 0;
+        this.log(
+            `Decoded audio ${count} frame=${frameIndex} samples=${audioFloat.length} ` +
+            `expected=${expectedSamples} min=${minVal.toFixed(4)} max=${maxVal.toFixed(4)} ` +
+            `rms=${rmsVal.toFixed(4)} nan=${nanCount} b64=${base64Len}`
+        );
     }
 
     displayFrame(frameBase64) {

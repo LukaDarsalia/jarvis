@@ -217,6 +217,8 @@ class AVPipeline:
 
                 audio_buffer = np.zeros((0,), dtype=np.float32)
                 local_frame_index = base_frame_index
+                audio_log_count = 0
+                expected_chunk = self.config.tts_config.chunk_samples
 
                 try:
                     while is_generating():
@@ -238,6 +240,7 @@ class AVPipeline:
 
                             # Normalize audio
                             audio_np = np.asarray(audio)
+                            audio_log_count += 1
                             if np.issubdtype(audio_np.dtype, np.integer):
                                 max_val = float(np.iinfo(audio_np.dtype).max)
                                 audio_np = audio_np.astype(np.float32) / max_val
@@ -247,6 +250,22 @@ class AVPipeline:
 
                             if audio_np.size == 0:
                                 continue
+
+                            log_audio = (
+                                audio_log_count <= 3
+                                or audio_log_count % 50 == 0
+                                or (expected_chunk > 0 and audio_np.size != expected_chunk)
+                            )
+                            if log_audio:
+                                min_val = float(np.min(audio_np))
+                                max_val = float(np.max(audio_np))
+                                rms_val = float(np.sqrt(np.mean(audio_np ** 2))) if audio_np.size > 0 else 0.0
+                                nan_count = int(np.isnan(audio_np).sum())
+                                logger.info(
+                                    f"TTS audio chunk {audio_log_count}: samples={audio_np.size} "
+                                    f"expected={expected_chunk} dtype={audio_np.dtype} "
+                                    f"min={min_val:.4f} max={max_val:.4f} rms={rms_val:.4f} nan={nan_count}"
+                                )
 
                             audio_buffer = np.concatenate([audio_buffer, audio_np])
 
@@ -416,6 +435,7 @@ class AVPipeline:
                 No timing delays - client handles all buffering and playback.
                 """
                 last_video_frame: Optional[bytes] = None
+                av_log_count = 0
 
                 try:
                     while True:
@@ -453,6 +473,20 @@ class AVPipeline:
                             timestamp_ms=frame.timestamp_ms,
                             metrics=frame.metrics,
                         )
+
+                        av_log_count += 1
+                        if av_log_count <= 3 or av_log_count % 50 == 0 or frame.samples.size != self._samples_per_frame:
+                            min_val = float(np.min(frame.samples)) if frame.samples.size > 0 else 0.0
+                            max_val = float(np.max(frame.samples)) if frame.samples.size > 0 else 0.0
+                            rms_val = (
+                                float(np.sqrt(np.mean(frame.samples ** 2))) if frame.samples.size > 0 else 0.0
+                            )
+                            nan_count = int(np.isnan(frame.samples).sum()) if frame.samples.size > 0 else 0
+                            logger.info(
+                                f"AV frame {av_log_count} idx={frame.index}: samples={frame.samples.size} "
+                                f"expected={self._samples_per_frame} min={min_val:.4f} max={max_val:.4f} "
+                                f"rms={rms_val:.4f} nan={nan_count} video={'yes' if video_bytes else 'no'}"
+                            )
 
                         report_frame(av_frame)
 
