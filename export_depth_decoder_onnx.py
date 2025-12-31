@@ -14,8 +14,8 @@ PROCESSOR_PATH = "local_models/tts_model/csm-1b-processor"
 AUDIO_CONTEXT_PATH = "local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav"
 JSON_CONTEXT_PATH = "local_models/tts_model/georgian-csm-1b/context_text_for_inference.json"
 
-DEPTH_DECODER_ONNX_PATH = "csm_depth_decoder_step_past31.onnx"
-BACKBONE_ONNX_PATH = "csm_backbone_step_past4095.onnx"
+DEPTH_DECODER_ONNX_PATH = "local_models/tts_model/georgian-csm-1b/csm_depth_decoder_step_past31.onnx"
+BACKBONE_ONNX_PATH = "local_models/tts_model/georgian-csm-1b/csm_backbone_step_past4095.onnx"
 
 DEPTH_DECODER_PAST_LEN = 31
 BACKBONE_PAST_LEN = 4095
