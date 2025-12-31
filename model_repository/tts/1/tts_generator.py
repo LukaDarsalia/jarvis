@@ -232,8 +232,8 @@ class ORTBackbonePastN:
         B2, S2, V = map(int, outs[0].shape)
         assert B2 == B and S2 == 1
 
-        B3, H = map(int, ins[0].shape)
-        assert B3 == B
+        B3, S3, H = map(int, ins[0].shape)
+        assert B3 == B and S3 == 1
 
         B4, H2 = map(int, outs[1].shape)
         assert B4 == B and H2 == H
