@@ -141,6 +141,15 @@ class TTSSession:
                         return False
 
                     self._is_initialized = True
+                    logger.info(
+                        "TTS session %s params: backbone_temp=%.3f backbone_top_p=%.3f "
+                        "depth_temp=%.3f depth_top_p=%.3f",
+                        self.session_id,
+                        self.config.backbone_temperature,
+                        self.config.backbone_top_p,
+                        self.config.depth_temperature,
+                        self.config.depth_top_p,
+                    )
                     logger.info(f"TTS session {self.session_id} initialized successfully")
                     return True
 

@@ -125,7 +125,7 @@ class VoiceAssistant {
         this.config = {
             vad: { speech_threshold_ms: 200, silence_threshold_ms: 1500 },
             llm: { temperature: 0.7, top_p: 0.9, max_new_tokens: 512, system_prompt: 'თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი' },
-            tts: { backbone_temperature: 0.8, backbone_top_p: 0.9, depth_temperature: 0.8, depth_top_p: 0.9 },
+            tts: { backbone_temperature: 0.01, backbone_top_p: 0.999, depth_temperature: 0.01, depth_top_p: 0.999 },
         };
 
         // DOM Elements
@@ -1398,7 +1398,7 @@ class VoiceAssistant {
         this.config = {
             vad: { speech_threshold_ms: 200, silence_threshold_ms: 1500 },
             llm: { temperature: 0.7, top_p: 0.9, max_new_tokens: 512, system_prompt: 'თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი' },
-            tts: { backbone_temperature: 0.8, backbone_top_p: 0.9, depth_temperature: 0.8, depth_top_p: 0.9 },
+            tts: { backbone_temperature: 0.01, backbone_top_p: 0.999, depth_temperature: 0.01, depth_top_p: 0.999 },
         };
         this.loadSettingsToUI();
     }

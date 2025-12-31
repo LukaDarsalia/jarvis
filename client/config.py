@@ -32,10 +32,10 @@ class LLMConfig:
 @dataclass
 class TTSConfig:
     """Text-to-Speech configuration."""
-    backbone_temperature: float = 0.8
-    backbone_top_p: float = 0.9
-    depth_temperature: float = 0.8
-    depth_top_p: float = 0.9
+    backbone_temperature: float = 0.01
+    backbone_top_p: float = 0.999
+    depth_temperature: float = 0.01
+    depth_top_p: float = 0.999
     sample_rate: int = 24000
     # TTS outputs 1920 samples per chunk (80ms @ 24kHz)
     chunk_samples: int = 1920

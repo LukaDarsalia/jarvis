@@ -14,10 +14,10 @@ from tts_generator import TTSGenerator
 
 @dataclass
 class TTSConfig:
-    temperature: float = 0.8
-    top_p: float = 0.9
-    decoder_temperature: float = 0.8
-    decoder_top_p: float = 0.9
+    temperature: float = 0.01
+    top_p: float = 0.999
+    decoder_temperature: float = 0.01
+    decoder_top_p: float = 0.999
     model_id: str = "/local_models/tts_model/csm-1b-base"
     model_path: str = "/local_models/tts_model/georgian-csm-1b"
     device: str = "cuda"
