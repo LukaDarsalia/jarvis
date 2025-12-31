@@ -57,7 +57,6 @@ class TritonPythonModel:
 
             self._session_state_lock = threading.Lock()
             self._session_prev_frames: Dict[int, int] = {}
-            self._session_prev_audio_samples: Dict[int, int] = {}
             self._session_audio_buffers: Dict[int, np.ndarray] = {}
 
             pb_utils.Logger.log_info("TTS Triton model initialized")
@@ -167,7 +166,6 @@ class TritonPythonModel:
                 raise RuntimeError(f"[Seq {seq_id}] Failed to start session: max concurrent reached")
             with self._session_state_lock:
                 self._session_prev_frames[seq_id] = 0
-                self._session_prev_audio_samples[seq_id] = 0
                 self._session_audio_buffers[seq_id] = np.zeros((0,), dtype=np.float32)
             pb_utils.Logger.log_info(f"[Seq {seq_id}] Cache initialized successfully")
             return
@@ -178,7 +176,6 @@ class TritonPythonModel:
             self.tts_generator.end_session(seq_id)
             with self._session_state_lock:
                 self._session_prev_frames.pop(seq_id, None)
-                self._session_prev_audio_samples.pop(seq_id, None)
                 self._session_audio_buffers.pop(seq_id, None)
             self._send_final(sender)
             return
@@ -193,8 +190,10 @@ class TritonPythonModel:
         # If model loops and never returns eos token, max_steps will stop it!
         with self._session_state_lock:
             prev_num_frames = self._session_prev_frames.get(seq_id, 0)
-            prev_audio_samples = self._session_prev_audio_samples.get(seq_id, 0)
             audio_buf = self._session_audio_buffers.get(seq_id, np.zeros((0,), dtype=np.float32))
+
+        # Chunk length = 1920 @ 24k scaled by target_sr
+        chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
 
         for cur_step in range(self.config.max_steps):
             is_complete = self.tts_generator.step_session(
@@ -216,30 +215,32 @@ class TritonPythonModel:
                     break
                 continue
 
-            # Decode full audio to preserve codec overlap continuity, then stream the new tail.
+            # Decode full audio and stream only the newly generated frames.
             full_audio = self.tts_generator._decode_audio(codes)
             if full_audio is not None:
                 audio_np = full_audio.cpu().float().numpy().astype(np.float32)
-                if audio_np.size > prev_audio_samples:
-                    delta_np = audio_np[prev_audio_samples:]
-                    if delta_np.size > 0:
-                        max_abs = float(np.max(np.abs(delta_np)))
-                        if max_abs < 1e-4:
-                            pb_utils.Logger.log_info(
-                                f"[Seq {seq_id}] Audio chunk near-silent: samples={delta_np.size} max_abs={max_abs:.6f}"
-                            )
-                        elif max_abs > 1.2:
-                            pb_utils.Logger.log_info(
-                                f"[Seq {seq_id}] Audio chunk high amplitude: samples={delta_np.size} max_abs={max_abs:.3f}"
-                            )
-                    if audio_buf.size == 0:
-                        audio_buf = delta_np
-                    else:
-                        audio_buf = np.concatenate([audio_buf, delta_np])
-                    prev_audio_samples = audio_np.size
+                delta_frames = cur_num_frames - prev_num_frames
+                if delta_frames > 0:
+                    tail_samples = delta_frames * chunk_len
+                    if tail_samples > 0:
+                        if tail_samples > audio_np.size:
+                            tail_samples = audio_np.size
+                        delta_np = audio_np[-tail_samples:]
+                        if delta_np.size > 0:
+                            max_abs = float(np.max(np.abs(delta_np)))
+                            if max_abs < 1e-4:
+                                pb_utils.Logger.log_info(
+                                    f"[Seq {seq_id}] Audio chunk near-silent: samples={delta_np.size} max_abs={max_abs:.6f}"
+                                )
+                            elif max_abs > 1.2:
+                                pb_utils.Logger.log_info(
+                                    f"[Seq {seq_id}] Audio chunk high amplitude: samples={delta_np.size} max_abs={max_abs:.3f}"
+                                )
+                        if audio_buf.size == 0:
+                            audio_buf = delta_np
+                        else:
+                            audio_buf = np.concatenate([audio_buf, delta_np])
 
-            # Chunk length = 1920 @ 24k scaled by target_sr
-            chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
             force_flush = bool(is_complete)
             while audio_buf.size >= chunk_len or (force_flush and audio_buf.size > 0):
                 if audio_buf.size >= chunk_len:
@@ -257,7 +258,6 @@ class TritonPythonModel:
             prev_num_frames = cur_num_frames
             with self._session_state_lock:
                 self._session_prev_frames[seq_id] = prev_num_frames
-                self._session_prev_audio_samples[seq_id] = prev_audio_samples
                 self._session_audio_buffers[seq_id] = audio_buf
 
             # Means model returned eos token
