@@ -24,3 +24,7 @@ pip install opencv-python-headless==4.10.0.84 \
     diffusers==0.30.2 \
     einops==0.8.1 \
     sounddevice==0.5.3 
+
+pip install gdown
+pip install coloredlogs flatbuffers numpy packaging protobuf sympy
+pip install -U --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu

@@ -2,32 +2,374 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from pathlib import Path
+import numpy as np
+import onnxruntime as ort
 import torch
 import torch.nn.functional as F
 import soundfile as sf
 from transformers import CsmForConditionalGeneration, AutoProcessor
-from transformers.cache_utils import StaticCache
 
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+BACKBONE_ONNX_FILENAME = "csm_backbone_step_past4095.onnx"
+DEPTH_DECODER_ONNX_FILENAME = "csm_depth_decoder_step_past31.onnx"
+BACKBONE_PAST_LEN = 4095
+DEPTH_DECODER_PAST_LEN = 31
+
+
+def sample_from_logits(
+    logits: torch.Tensor,
+    method: str = "nucleus",
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+) -> torch.Tensor:
+    if method == "greedy":
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    temperature = max(float(temperature), 1e-8)
+    probs = F.softmax(logits / temperature, dim=-1)
+
+    if method == "multinomial":
+        return torch.multinomial(probs, num_samples=1)
+
+    if method == "topk":
+        topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+        sampled = torch.multinomial(topk_probs, num_samples=1)
+        return topk_idx.gather(-1, sampled)
+
+    if method == "nucleus":
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cumprobs = sorted_probs.cumsum(dim=-1)
+        mask = cumprobs <= top_p
+        mask[..., 0] = True
+        filtered_probs = sorted_probs * mask
+        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+        sampled = torch.multinomial(filtered_probs, num_samples=1)
+        return sorted_idx.gather(-1, sampled)
+
+    raise ValueError(f"Unknown sampling method: {method}")
+
+
+def _pick_providers(device_id: int):
+    provs = ort.get_available_providers()
+    torch_stream = torch.cuda.current_stream(device_id).cuda_stream
+
+    providers = []
+    if "TensorrtExecutionProvider" in provs:
+        providers.append(("TensorrtExecutionProvider", {"device_id": device_id}))
+    providers.append((
+        "CUDAExecutionProvider",
+        {"device_id": device_id, "user_compute_stream": torch_stream},
+    ))
+    providers.append("CPUExecutionProvider")
+    return providers
+
+
+class ORTDepthDecoder:
+    def __init__(self, onnx_path: str, past_len: int, device_id: int = 0):
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.device_id = int(device_id)
+        self.device = torch.device(f"cuda:{self.device_id}")
+
+        self.sess = ort.InferenceSession(
+            onnx_path,
+            sess_options=so,
+            providers=_pick_providers(self.device_id),
+        )
+
+        ins = self.sess.get_inputs()
+        outs = self.sess.get_outputs()
+
+        self.L = (len(ins) - 4) // 2
+        B, KVH, P, HD = map(int, ins[4].shape)
+        assert P == past_len
+
+        B2, S2, V = map(int, outs[0].shape)
+        assert B2 == B and S2 == 1
+
+        B3, Hbb = map(int, ins[1].shape)
+        assert B3 == B
+
+        self.B, self.KVH, self.HD, self.V, self.Hbb = B, KVH, HD, V, Hbb
+        self.past_len = past_len
+
+        self.token_buf = torch.zeros((B, 1), device=self.device, dtype=torch.long)
+        self.bb_buf = torch.zeros((B, Hbb), device=self.device, dtype=torch.float16)
+        self.cache_pos = torch.zeros((1,), device=self.device, dtype=torch.long)
+        self.mask_buf = torch.zeros((B, 1, 1, past_len + 1), device=self.device, dtype=torch.float16)
+
+        self.past = [
+            torch.zeros((B, KVH, past_len, HD), device=self.device, dtype=torch.float16)
+            for _ in range(2 * self.L)
+        ]
+        self.present = [
+            torch.empty((B, KVH, past_len + 1, HD), device=self.device, dtype=torch.float16)
+            for _ in range(2 * self.L)
+        ]
+        self.out_logits = torch.empty((B, 1, V), device=self.device, dtype=torch.float16)
+
+        self.io = self.sess.io_binding()
+        self.io.bind_input("input_ids", "cuda", self.device_id, np.int64, self.token_buf.shape, self.token_buf.data_ptr())
+        self.io.bind_input(
+            "backbone_last_hidden_state",
+            "cuda",
+            self.device_id,
+            np.float16,
+            self.bb_buf.shape,
+            self.bb_buf.data_ptr(),
+        )
+        self.io.bind_input(
+            "attention_mask",
+            "cuda",
+            self.device_id,
+            np.float16,
+            self.mask_buf.shape,
+            self.mask_buf.data_ptr(),
+        )
+        self.io.bind_input("cache_position", "cuda", self.device_id, np.int64, self.cache_pos.shape, self.cache_pos.data_ptr())
+
+        for i in range(2 * self.L):
+            t = self.past[i]
+            self.io.bind_input(f"past_{i}", "cuda", self.device_id, np.float16, t.shape, t.data_ptr())
+
+        self.io.bind_output("logits", "cuda", self.device_id, np.float16, self.out_logits.shape, self.out_logits.data_ptr())
+        for i in range(2 * self.L):
+            t = self.present[i]
+            self.io.bind_output(f"present_{i}", "cuda", self.device_id, np.float16, t.shape, t.data_ptr())
+
+    @torch.no_grad()
+    def _set_mask_for_pos(self, pos: int):
+        valid = min(int(pos), self.past_len)
+        start = self.past_len - valid
+        self.mask_buf.zero_()
+        if start > 0:
+            self.mask_buf[..., :start] = -1e4
+
+    @torch.no_grad()
+    def reset(self):
+        for t in self.past:
+            t.zero_()
+
+    @torch.no_grad()
+    def step(self, token_id: torch.Tensor, h_last: torch.Tensor, pos: int) -> torch.Tensor:
+        if token_id.dim() == 1:
+            token_id = token_id.view(self.B, 1)
+        self.token_buf.copy_(token_id)
+        self.bb_buf.copy_(h_last)
+        self.cache_pos.fill_(int(pos))
+        self._set_mask_for_pos(pos)
+
+        self.sess.run_with_iobinding(self.io)
+
+        for i in range(2 * self.L):
+            self.past[i].copy_(self.present[i][:, :, 1:, :])
+
+        return self.out_logits[:, 0, :]
+
+    @torch.no_grad()
+    def generate_frame(
+        self,
+        c0: torch.Tensor,
+        h_last: torch.Tensor,
+        method: str = "nucleus",
+        temperature: float = 0.1,
+        top_p: float = 0.999,
+    ):
+        if c0.dim() == 2:
+            c0 = c0[:, 0]
+        c0 = c0.to(device=self.device, dtype=torch.long).view(self.B, 1)
+
+        self.reset()
+
+        dummy = torch.zeros((self.B, 1), device=self.device, dtype=torch.long)
+        _ = self.step(dummy, h_last, pos=0)
+
+        logits = self.step(c0, h_last, pos=1)
+        c1 = sample_from_logits(logits, method=method, temperature=temperature, top_p=top_p)
+
+        outs = [c1]
+        prev = c1
+        for pos in range(2, 32):
+            logits = self.step(prev, h_last, pos=pos)
+            nxt = sample_from_logits(logits, method=method, temperature=temperature, top_p=top_p)
+            outs.append(nxt)
+            prev = nxt
+
+        rest = torch.cat(outs, dim=1)
+        return torch.cat([c0, rest], dim=1)
+
+
+class ORTBackbonePastN:
+    def __init__(self, onnx_path: str, past_len: int, device_id: int = 0):
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.device_id = int(device_id)
+        self.device = torch.device(f"cuda:{self.device_id}")
+
+        self.sess = ort.InferenceSession(
+            onnx_path,
+            sess_options=so,
+            providers=_pick_providers(self.device_id),
+        )
+
+        ins = self.sess.get_inputs()
+        outs = self.sess.get_outputs()
+
+        self.L = (len(ins) - 3) // 2
+
+        B, KVH, P, HD = map(int, ins[3].shape)
+        assert P == past_len
+
+        B2, S2, V = map(int, outs[0].shape)
+        assert B2 == B and S2 == 1
+
+        B3, H = map(int, ins[0].shape)
+        assert B3 == B
+
+        B4, H2 = map(int, outs[1].shape)
+        assert B4 == B and H2 == H
+
+        B5, KVH2, ONE, HD2 = map(int, outs[2].shape)
+        assert B5 == B and KVH2 == KVH and ONE == 1 and HD2 == HD
+
+        self.B, self.KVH, self.HD, self.V, self.H = B, KVH, HD, V, H
+        self.past_len = past_len
+
+        self.embed_buf = torch.zeros((B, 1, H), device=self.device, dtype=torch.float16)
+        self.mask_buf = torch.zeros((B, 1, 1, past_len + 1), device=self.device, dtype=torch.float16)
+        self.cache_pos = torch.zeros((1,), device=self.device, dtype=torch.long)
+
+        self.past = [
+            torch.zeros((B, KVH, past_len, HD), device=self.device, dtype=torch.float16)
+            for _ in range(2 * self.L)
+        ]
+        self.out_logits = torch.empty((B, 1, V), device=self.device, dtype=torch.float16)
+        self.out_hidden = torch.empty((B, H), device=self.device, dtype=torch.float16)
+        self.new_kv = [
+            torch.empty((B, KVH, 1, HD), device=self.device, dtype=torch.float16)
+            for _ in range(2 * self.L)
+        ]
+
+        self.io = self.sess.io_binding()
+        self.io.bind_input(
+            "inputs_embeds",
+            "cuda",
+            self.device_id,
+            np.float16,
+            self.embed_buf.shape,
+            self.embed_buf.data_ptr(),
+        )
+        self.io.bind_input(
+            "attention_mask",
+            "cuda",
+            self.device_id,
+            np.float16,
+            self.mask_buf.shape,
+            self.mask_buf.data_ptr(),
+        )
+        self.io.bind_input(
+            "cache_position",
+            "cuda",
+            self.device_id,
+            np.int64,
+            self.cache_pos.shape,
+            self.cache_pos.data_ptr(),
+        )
+
+        for i in range(2 * self.L):
+            t = self.past[i]
+            self.io.bind_input(f"past_{i}", "cuda", self.device_id, np.float16, t.shape, t.data_ptr())
+
+        self.io.bind_output("logits", "cuda", self.device_id, np.float16, self.out_logits.shape, self.out_logits.data_ptr())
+        self.io.bind_output(
+            "last_hidden_state",
+            "cuda",
+            self.device_id,
+            np.float16,
+            self.out_hidden.shape,
+            self.out_hidden.data_ptr(),
+        )
+
+        for i in range(2 * self.L):
+            t = self.new_kv[i]
+            self.io.bind_output(f"new_{i}", "cuda", self.device_id, np.float16, t.shape, t.data_ptr())
+
+        self._all_valid_mask = False
+        self.mask_buf.zero_()
+
+    @torch.no_grad()
+    def reset(self):
+        for t in self.past:
+            t.zero_()
+        self.mask_buf.zero_()
+        self._all_valid_mask = False
+
+    @torch.no_grad()
+    def _set_mask_for_pos(self, pos: int):
+        pos = int(pos)
+        if pos >= self.past_len:
+            if not self._all_valid_mask:
+                self.mask_buf.zero_()
+                self._all_valid_mask = True
+            return
+
+        self._all_valid_mask = False
+        valid = pos
+        self.mask_buf.zero_()
+        if valid < self.past_len:
+            self.mask_buf[..., valid:self.past_len] = -1e4
+
+    @torch.no_grad()
+    def step(self, inputs_embeds: torch.Tensor, pos: int):
+        if inputs_embeds.dim() == 2:
+            inputs_embeds = inputs_embeds.unsqueeze(1)
+        self.embed_buf.copy_(inputs_embeds)
+        self.cache_pos.fill_(int(pos))
+        self._set_mask_for_pos(pos)
+
+        self.sess.run_with_iobinding(self.io)
+
+        idx = int(pos) % self.past_len
+        for i in range(2 * self.L):
+            self.past[i][:, :, idx:idx + 1, :].copy_(self.new_kv[i])
+
+        return self.out_logits, self.out_hidden
+
+
+@torch.no_grad()
+def prefill_backbone_with_onnx(ort_bb: ORTBackbonePastN, inputs_embeds: torch.Tensor):
+    seq_len = inputs_embeds.shape[1]
+    logits_next = None
+    h_last = None
+    for i in range(seq_len):
+        token_embed = inputs_embeds[:, i:i + 1, :]
+        ort_logits, h_last = ort_bb.step(token_embed, pos=i)
+        logits_next = ort_logits[:, 0, :]
+    return logits_next, h_last, seq_len
 
 
 @dataclass
 class GenerationState:
     """State for a single generation session."""
-    bb_pkv: StaticCache
-    dd_pkv: StaticCache
-    attn_mask: torch.Tensor
+    ort_bb: ORTBackbonePastN
+    ort_dd: ORTDepthDecoder
     h_last: torch.Tensor
+    logits_next: torch.Tensor
     seq_len: int
     cur_step: int
     frames: List[torch.Tensor]
     input_queue: List[Dict[str, Any]]
     counter: int                # index of next text chunk to inject
     eos: torch.Tensor
-    cache_pos: torch.Tensor
     has_active_text: bool       # True if currently generating for a chunk
     last_activity_time: float = field(default_factory=time.time)  # Track last activity
 
@@ -53,7 +395,11 @@ class TTSGenerator:
         max_concurrent_sessions: int = 4,
         idle_timeout_seconds: float = 300.0,  # 5 minutes default
     ):
-        self.device = device
+        _ = compile_model  # kept for API compatibility
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise RuntimeError("ONNX TTSGenerator requires a CUDA device.")
+        self.device_id = 0 if self.device.index is None else int(self.device.index)
         self.temperature = temperature
         self.top_p = top_p
         self.decoder_temperature = decoder_temperature
@@ -70,23 +416,29 @@ class TTSGenerator:
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = CsmForConditionalGeneration.from_pretrained(
             model_path,
-            device_map=device,
+            device_map="cpu",
             attn_implementation="sdpa",
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
+        ).eval()
+
+        self.model.embed_text_tokens = self.model.embed_text_tokens.to(
+            device=self.device, dtype=torch.float16
         )
-        self.model.eval()
+        self.model.backbone_model.embed_tokens = self.model.backbone_model.embed_tokens.to(
+            device=self.device, dtype=torch.float16
+        )
+        self.model.codec_model = self.model.codec_model.to(self.device)
 
-        if compile_model:
-            self.model = torch.compile(
-                self.model,
-                mode="max-autotune",
-                fullgraph=True,
-                dynamic=False,
-                backend="inductor",
-            )
+        self.text_embed = self.model.embed_text_tokens
+        self.audio_embed = self.model.backbone_model.embed_tokens
+        self.codec_model = self.model.codec_model
 
-        self.model.config.use_cache = True
-        self.model.backbone_model.config.use_cache = True
+        self.backbone_onnx_path = os.path.join(model_path, BACKBONE_ONNX_FILENAME)
+        self.depth_decoder_onnx_path = os.path.join(model_path, DEPTH_DECODER_ONNX_FILENAME)
+        if not os.path.exists(self.backbone_onnx_path):
+            raise FileNotFoundError(f"Missing backbone ONNX: {self.backbone_onnx_path}")
+        if not os.path.exists(self.depth_decoder_onnx_path):
+            raise FileNotFoundError(f"Missing depth decoder ONNX: {self.depth_decoder_onnx_path}")
 
         # Reference
         self.reference_audio = None
@@ -171,7 +523,7 @@ class TTSGenerator:
     def _load_reference(self, audio_path: str, json_path: str):
         import json
 
-        audio, _ = sf.read(audio_path)
+        audio, _ = sf.read(audio_path, dtype="float32")
         audio = torch.from_numpy(audio).unsqueeze(0)  # [1, T]
         with open(json_path) as f:
             audio_transcript = json.load(f)
@@ -190,32 +542,13 @@ class TTSGenerator:
         top_k: int = 0,
     ) -> torch.Tensor:
         """Sample from logits using different methods."""
-        if method == "greedy":
-            return torch.argmax(logits, dim=-1, keepdim=True)
-
-        logits = logits / temperature
-        probs = F.softmax(logits, dim=-1)
-
-        if method == "multinomial":
-            return torch.multinomial(probs, num_samples=1)
-
-        if method == "topk":
-            topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
-            topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
-            sampled = torch.multinomial(topk_probs, num_samples=1)
-            return topk_idx.gather(-1, sampled)
-
-        if method == "nucleus":
-            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-            cumprobs = sorted_probs.cumsum(dim=-1)
-            mask = cumprobs <= top_p
-            mask[..., 0] = True
-            filtered_probs = sorted_probs * mask
-            filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
-            sampled = torch.multinomial(filtered_probs, num_samples=1)
-            return sorted_idx.gather(-1, sampled)
-
-        raise ValueError(f"Unknown sampling method: {method}")
+        return sample_from_logits(
+            logits,
+            method=method,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
 
     def append_texts(self, session_id: int, texts: List[str], speaker_id: int = 0) -> bool:
         """
@@ -290,61 +623,41 @@ class TTSGenerator:
             inputs["input_values"] = inputs["input_values"].to(torch.bfloat16)
 
         model_inputs = self.model.prepare_inputs_for_generation(**inputs)
-        ref_embeds = model_inputs["inputs_embeds"]  # [B, T_ref, D]
-        attn_mask = inputs["attention_mask"].clone()
+        ref_embeds = model_inputs["inputs_embeds"].to(device=self.device, dtype=torch.float16)
 
-        dtype = self.model.dtype
-        bb_pkv = StaticCache(
-            config=self.model.config,
-            batch_size=1,
-            max_cache_len=4096,
-            device=self.model.device,
-            dtype=dtype,
+        ort_bb = ORTBackbonePastN(
+            self.backbone_onnx_path,
+            past_len=BACKBONE_PAST_LEN,
+            device_id=self.device_id,
         )
-        dd_pkv = StaticCache(
-            config=self.model.depth_decoder.config,
-            batch_size=1,
-            max_cache_len=32,
-            device=self.model.device,
-            dtype=dtype,
+        ort_dd = ORTDepthDecoder(
+            self.depth_decoder_onnx_path,
+            past_len=DEPTH_DECODER_PAST_LEN,
+            device_id=self.device_id,
         )
+        ort_bb.reset()
 
-        B, T_ref, _ = ref_embeds.shape
-        pos_ids = torch.arange(T_ref, device=self.device).unsqueeze(0)  # [1, T_ref]
-
-        with torch.no_grad():
-            bb_out = self.model.backbone_model(
-                inputs_embeds=ref_embeds,
-                attention_mask=attn_mask,
-                position_ids=pos_ids,
-                past_key_values=bb_pkv,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-
-        pkv = bb_out.past_key_values
-        h_last = bb_out.hidden_states[-1][:, -1, :]  # [B, D]
-        seq_len = T_ref
+        logits_next, h_last, seq_len = prefill_backbone_with_onnx(ort_bb, ref_embeds)
+        if logits_next is None or h_last is None:
+            raise RuntimeError("Reference prefill produced no logits; check reference inputs.")
 
         eos = torch.tensor(
             [self.model.config.codebook_eos_token_id],
-            device=self.model.device,
+            device=self.device,
             dtype=torch.long,
         )
-        cache_pos = torch.arange(0, 2, device=self.device)
 
         state = GenerationState(
-            bb_pkv=pkv,
-            dd_pkv=dd_pkv,
-            attn_mask=attn_mask,
+            ort_bb=ort_bb,
+            ort_dd=ort_dd,
             h_last=h_last,
+            logits_next=logits_next,
             seq_len=seq_len,
             cur_step=0,
             frames=[],
             input_queue=[],
             counter=0,               # next text index to inject
             eos=eos,
-            cache_pos=cache_pos,
             has_active_text=False,   # no text chunk yet
         )
 
@@ -352,38 +665,6 @@ class TTSGenerator:
             self.sessions[session_id] = state
 
         return True
-
-    def _step_backbone_with_cache(
-        self,
-        new_embeds: torch.Tensor,
-        attn_mask: torch.Tensor,
-        pkv: StaticCache,
-        seq_len: int,
-    ):
-        """Run backbone on new tokens with cache."""
-        bsz, n_new, _ = new_embeds.shape
-        new_pos = (
-            torch.arange(seq_len, seq_len + n_new, device=new_embeds.device)
-            .unsqueeze(0)
-            .expand(bsz, n_new)
-        )
-        new_mask = torch.ones(
-            bsz, n_new, device=attn_mask.device, dtype=attn_mask.dtype
-        )
-        attn_mask = torch.cat([attn_mask, new_mask], dim=1)
-
-        out = self.model.backbone_model(
-            inputs_embeds=new_embeds,
-            attention_mask=attn_mask,
-            position_ids=new_pos,
-            past_key_values=pkv,
-            use_cache=True,
-            output_hidden_states=True,
-        )
-        pkv = out.past_key_values
-        h_last = out.hidden_states[-1][:, -1, :]
-        seq_len += n_new
-        return h_last, pkv, seq_len, attn_mask
 
     def step_session(self, 
                      session_id: int, 
@@ -426,20 +707,16 @@ class TTSGenerator:
                 if not state.has_active_text:
                     if state.counter < len(state.input_queue):
                         inject_inputs = state.input_queue[state.counter]
-                        inject_embeds = self.model.embed_text_tokens(
-                            inject_inputs["input_ids"]
-                        )
-                        (
-                            state.h_last,
-                            state.bb_pkv,
-                            state.seq_len,
-                            state.attn_mask,
-                        ) = self._step_backbone_with_cache(
-                            inject_embeds,
-                            state.attn_mask,
-                            state.bb_pkv,
-                            state.seq_len,
-                        )
+                        inject_embeds = self.text_embed(inject_inputs["input_ids"])
+                        for i in range(inject_embeds.shape[1]):
+                            token_embed = inject_embeds[:, i:i + 1, :]
+                            ort_logits, h_last = state.ort_bb.step(
+                                token_embed,
+                                pos=state.seq_len,
+                            )
+                            state.seq_len += 1
+                            state.logits_next = ort_logits[:, 0, :]
+                            state.h_last = h_last
                         state.has_active_text = True
                         state.cur_step = 0
                         state.counter += 1  # consumed this text chunk
@@ -449,15 +726,14 @@ class TTSGenerator:
                         break
 
                 # 2) We have an active text chunk: generate one frame
-                logits0 = self.model.lm_head(state.h_last.unsqueeze(1))[:, -1:, :]
                 c0 = self.sample_from_logits(
-                    logits0[:, -1, :],
+                    state.logits_next,
                     method="nucleus",
                     temperature=self.temperature,
                     top_p=self.top_p,
                 )
-
-                reached_eos = (c0 == state.eos).all()
+                c0_1d = c0.view(-1).to(torch.long)
+                reached_eos = (c0_1d == state.eos.view(-1)).any()
 
                 if bool(reached_eos):
                     # End of this text chunk; next loop may inject new chunk
@@ -467,36 +743,22 @@ class TTSGenerator:
                     continue
 
                 # Depth decoder for codebooks 1..N
-                depth_prompt = torch.nn.functional.pad(c0, (1, 0), value=0)
-                dd_out = self.model.depth_decoder.generate(
-                    input_ids=depth_prompt,
-                    backbone_last_hidden_state=state.h_last.clone(),
-                    max_new_tokens=self.model.config.num_codebooks - 1,
+                frame = state.ort_dd.generate_frame(
+                    c0=c0_1d,
+                    h_last=state.h_last,
+                    method="nucleus",
                     temperature=self.decoder_temperature,
                     top_p=self.decoder_top_p,
-                    cache_position=state.cache_pos,
-                    logits_to_keep=1,
-                    use_cache=True,
-                    past_key_values=state.dd_pkv,
-                    return_dict_in_generate=False,
                 )
-                frame = dd_out[:, 1:]  # [B, num_codebooks]
                 state.frames.append(frame)
 
                 # Feed new audio frame back into backbone
                 frame_3d = frame.unsqueeze(1)  # [B,1,C]
-                audio_embeds = self.model.backbone_model.embed_tokens(frame_3d)
-                (
-                    state.h_last,
-                    state.bb_pkv,
-                    state.seq_len,
-                    state.attn_mask,
-                ) = self._step_backbone_with_cache(
-                    audio_embeds,
-                    state.attn_mask,
-                    state.bb_pkv,
-                    state.seq_len,
-                )
+                audio_embeds = self.audio_embed(frame_3d)
+                ort_logits, h_last = state.ort_bb.step(audio_embeds, pos=state.seq_len)
+                state.seq_len += 1
+                state.logits_next = ort_logits[:, 0, :]
+                state.h_last = h_last
 
                 state.cur_step += 1
                 steps_taken += 1
@@ -507,9 +769,23 @@ class TTSGenerator:
         )
         return is_complete
 
+    def increment_state_counter(self, session_id: int) -> bool:
+        """
+        Force the current text chunk to finish and allow the next one to inject.
+        Useful when max_steps stops generation without EOS.
+        """
+        with self.session_lock:
+            if session_id not in self.sessions:
+                return False
+            state = self.sessions[session_id]
+            state.has_active_text = False
+            state.cur_step = 0
+            state.last_activity_time = time.time()
+        return True
+
     def _decode_audio(self, audio_codes: torch.Tensor) -> torch.Tensor:
         """Decode audio codes to waveform."""
-        audio_codes = audio_codes.unsqueeze(0).to(self.model.device)
+        audio_codes = audio_codes.unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             audio_list = []
@@ -525,7 +801,7 @@ class TTSGenerator:
                     cutoff_idx = audio_codes_batch.shape[0]
                 audio_codes_batch = audio_codes_batch[:cutoff_idx]
 
-                codec_decode_output = self.model.codec_model.decode(
+                codec_decode_output = self.codec_model.decode(
                     audio_codes_batch.transpose(0, 1).unsqueeze(0)
                 )
                 audio_list.append(codec_decode_output.audio_values[0, 0])
@@ -630,7 +906,7 @@ if __name__ == "__main__":
     prev_num_frames = 0
 
     while True:
-        is_complete, steps_taken = tts_generator.step_session(
+        is_complete = tts_generator.step_session(
             seq_id,
             max_steps=10,
         )
@@ -646,7 +922,7 @@ if __name__ == "__main__":
 
         if is_complete:
             break
-        # Optional: if steps_taken == 0, you may sleep or wait for new text.
+        # Optional: if no new frames arrived, you may sleep or wait for new text.
 
     if not all_audio_chunks:
         raise RuntimeError("No audio was generated.")
