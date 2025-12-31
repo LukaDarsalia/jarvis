@@ -866,9 +866,9 @@ class TTSGenerator:
 
 @dataclass
 class TTSConfig:
-    temperature: float = 0.0001
+    temperature: float = 0.01
     top_p: float = 0.999
-    decoder_temperature: float = 0.0001
+    decoder_temperature: float = 0.01
     decoder_top_p: float = 0.999
     model_id: str = "local_models/tts_model/csm-1b-base"
     model_path: str = "local_models/tts_model/georgian-csm-1b"
@@ -964,10 +964,10 @@ if __name__ == "__main__":
                     chunk_np = audio_np[-chunk_len:].astype(np.float32)
                     audio_ms = (audio_np.size / output_sample_rate) * 1000.0
                     chunk_ms = (chunk_np.size / output_sample_rate) * 1000.0
-                    print(
-                        f"[Turn {turn_idx}][Chunk {chunk_idx}][Step {cur_step + 1}] "
-                        f"audio={audio_ms:.1f}ms last_chunk={chunk_ms:.1f}ms"
-                    )
+                    # print(
+                    #     f"[Turn {turn_idx}][Chunk {chunk_idx}][Step {cur_step + 1}] "
+                    #     f"audio={audio_ms:.1f}ms last_chunk={chunk_ms:.1f}ms"
+                    # )
                     prev_audio_len = audio_np.size
 
                 if is_complete:

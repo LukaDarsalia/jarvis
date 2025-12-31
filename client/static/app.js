@@ -18,6 +18,8 @@ class VoiceAssistant {
         this.mediaStream = null;
         this.isRecording = false;
         this.currentPlaybackNode = null;
+        this.audioSampleRate = 24000;
+        this.nextAudioTime = 0;
         
         // Video/Avatar
         this.videoEnabled = false;
@@ -510,7 +512,7 @@ class VoiceAssistant {
     async initAudioContext() {
         try {
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: 24000
+                sampleRate: this.audioSampleRate
             });
             console.log('AudioContext initialized with sample rate:', this.audioContext.sampleRate);
         } catch (e) {
@@ -670,6 +672,7 @@ class VoiceAssistant {
             } catch (e) {}
             this.currentPlaybackNode = null;
         }
+        this.nextAudioTime = 0;
     }
     
     // ============ Video/Avatar ============
@@ -713,6 +716,7 @@ class VoiceAssistant {
         // Queue the synced pair
         this.syncedQueue.push({
             audio: data.audio,
+            audioFloat: decodedAudio,
             frame: data.frame,
             frameIndex: data.frame_index,
             timestampMs: data.timestamp_ms,
@@ -776,6 +780,11 @@ class VoiceAssistant {
         this.isDisplayingVideo = true;
         this.videoStartTime = performance.now();
         this.isBuffering = false;
+        if (this.audioContext) {
+            this.nextAudioTime = this.audioContext.currentTime;
+        } else {
+            this.nextAudioTime = 0;
+        }
         
         let framesPlayed = 0;
         
@@ -796,8 +805,8 @@ class VoiceAssistant {
                 framesPlayed++;
                 
                 // Play audio immediately
-                if (syncedData.audio) {
-                    this.playSyncedAudio(syncedData.audio);
+                if (syncedData.audioFloat || syncedData.audio) {
+                    this.playSyncedAudio(syncedData.audioFloat || syncedData.audio);
                 }
                 
                 // Display video frame immediately
@@ -910,28 +919,35 @@ class VoiceAssistant {
         this.renderBufferHint();
     }
     
-    playSyncedAudio(audioBase64) {
+    playSyncedAudio(audioData) {
         /**
          * Play a single 40ms audio chunk immediately.
          * This is synchronized with video frame display.
          */
-        if (!this.audioContext || !audioBase64) return;
-        
+        if (!this.audioContext) return;
+
         try {
-            const float32 = this.decodeAudioBase64(audioBase64);
-            if (!float32) return;
-            
-            // Create audio buffer (40ms at 24kHz = 960 samples)
-            const audioBuffer = this.audioContext.createBuffer(1, float32.length, 24000);
+            if (this.audioContext.state === 'suspended') {
+                this.audioContext.resume().catch(() => {});
+            }
+
+            const float32 = audioData instanceof Float32Array
+                ? audioData
+                : this.decodeAudioBase64(audioData);
+            if (!float32 || float32.length === 0) return;
+
+            const audioBuffer = this.audioContext.createBuffer(1, float32.length, this.audioSampleRate);
             audioBuffer.getChannelData(0).set(float32);
-            
-            // Play immediately
+
             const source = this.audioContext.createBufferSource();
             source.buffer = audioBuffer;
             source.connect(this.audioContext.destination);
-            source.start();
-            
-            // Store for potential cleanup
+
+            const now = this.audioContext.currentTime;
+            const startAt = this.nextAudioTime > now ? this.nextAudioTime : now;
+            source.start(startAt);
+            this.nextAudioTime = startAt + (float32.length / this.audioSampleRate);
+
             this.currentPlaybackNode = source;
         } catch (e) {
             console.error('Failed to play synced audio:', e);
@@ -945,7 +961,20 @@ class VoiceAssistant {
             for (let i = 0; i < binaryString.length; i++) {
                 bytes[i] = binaryString.charCodeAt(i);
             }
-            return new Float32Array(bytes.buffer);
+            const rawBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+
+            if (rawBuffer.byteLength % 4 === 0) {
+                return new Float32Array(rawBuffer);
+            }
+            if (rawBuffer.byteLength % 2 === 0) {
+                const int16 = new Int16Array(rawBuffer);
+                const float32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) {
+                    float32[i] = int16[i] / 32768;
+                }
+                return float32;
+            }
+            return null;
         } catch (e) {
             console.error('Failed to decode audio base64:', e);
             return null;
@@ -970,6 +999,7 @@ class VoiceAssistant {
             clearTimeout(this.frameReplayTimer);
             this.frameReplayTimer = null;
         }
+        this.nextAudioTime = 0;
         
         // Log playback stats
         if (this.playbackStutters > 0) {
@@ -1006,6 +1036,7 @@ class VoiceAssistant {
             clearTimeout(this.videoDisplayTimer);
             this.videoDisplayTimer = null;
         }
+        this.nextAudioTime = 0;
         
         // Log playback stats
         if (this.playbackStutters > 0) {
@@ -1085,7 +1116,7 @@ class VoiceAssistant {
         }
         
         // Create and play buffer
-        const audioBuffer = this.audioContext.createBuffer(1, fullAudio.length, 24000);
+        const audioBuffer = this.audioContext.createBuffer(1, fullAudio.length, this.audioSampleRate);
         audioBuffer.getChannelData(0).set(fullAudio);
         
         const source = this.audioContext.createBufferSource();

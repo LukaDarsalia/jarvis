@@ -1218,5 +1218,5 @@ async def process_llm_and_tts(state: "ConnectionState", user_input: str):
 if __name__ == "__main__":
     import uvicorn
     import os
-    os.environ['TRITON_URL'] = '185.151.171.35:50135'
+    os.environ['TRITON_URL'] = '185.151.171.35:51954'
     uvicorn.run(app, host="0.0.0.0", port=8080)
