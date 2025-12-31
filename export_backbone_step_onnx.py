@@ -40,10 +40,10 @@ def main():
     B = 1
     S = 1
     past_len = BACKBONE_PAST_LEN
-    k_len = past_len + S
+    k_len = past_len + 1
 
     print(
-        "Export:",
+        "Export backbone static-KV:",
         f"L={L}",
         f"kv_heads={kv_heads}",
         f"hd={hd}",
@@ -57,13 +57,14 @@ def main():
     attention_mask = torch.zeros((B, 1, 1, k_len), dtype=dtype, device=device)
     cache_position = torch.zeros((S,), dtype=torch.long, device=device)
 
+    # STATIC cache buffers (fixed past_len)
     past_kv = []
     for _ in range(L):
         past_kv.append(torch.zeros((B, kv_heads, past_len, hd), dtype=dtype, device=device))
         past_kv.append(torch.zeros((B, kv_heads, past_len, hd), dtype=dtype, device=device))
 
     input_names = ["inputs_embeds", "attention_mask", "cache_position"] + [f"past_{i}" for i in range(2 * L)]
-    output_names = ["logits", "last_hidden_state"] + [f"present_{i}" for i in range(2 * L)]
+    output_names = ["logits", "last_hidden_state"] + [f"new_{i}" for i in range(2 * L)]
 
     torch.onnx.export(
         wrapper,

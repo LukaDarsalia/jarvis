@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
 # generate_with_backbone_and_depth_onnx.py
-#
-# Uses:
-#   - Backbone one-step ONNXRuntime (fixed past_len)
-#   - Depth decoder one-step ONNXRuntime (fixed past_len=31)
-#   - Codec + embeddings in PyTorch
-#
-# Export expected:
-#   - csm_backbone_step_past4095.onnx
-#   - csm_depth_decoder_step_past31.onnx
 
 import os
 import json
@@ -37,14 +28,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
 
-# -------------------------
-# Sampling
-# -------------------------
 def sample_from_logits(logits, method="greedy", temperature=1.0, top_k=0, top_p=1.0):
-    # logits: [B, V]
     if method == "greedy":
         return torch.argmax(logits, dim=-1, keepdim=True)
-
     temperature = max(float(temperature), 1e-8)
     probs = F.softmax(logits / temperature, dim=-1)
 
@@ -71,16 +57,12 @@ def sample_from_logits(logits, method="greedy", temperature=1.0, top_k=0, top_p=
     raise ValueError(f"Unknown method: {method}")
 
 
-# -------------------------
-# Decode audio from frames
-# -------------------------
 @torch.no_grad()
 def generate_audio_from_frames(codec_model, codebook_eos_token_id, device, frames_list):
-    x = torch.stack(frames_list, dim=1)  # [B,T,32]
-    x = x.to(device=device, dtype=torch.long)
+    x = torch.stack(frames_list, dim=1).to(device=device, dtype=torch.long)  # [B,T,32]
 
     eos_id = int(codebook_eos_token_id)
-    eos_mask = (x == eos_id).all(dim=-1)  # [B,T]
+    eos_mask = (x == eos_id).all(dim=-1)
 
     audios = []
     for b in range(x.shape[0]):
@@ -88,49 +70,51 @@ def generate_audio_from_frames(codec_model, codebook_eos_token_id, device, frame
             cutoff = int(torch.nonzero(eos_mask[b], as_tuple=False)[0].item())
         else:
             cutoff = x.shape[1]
-        xb = x[b, :cutoff, :]                      # [T,32]
+        xb = x[b, :cutoff, :]
         codec_in = xb.transpose(0, 1).unsqueeze(0)  # [1,32,T]
         out = codec_model.decode(codec_in)
         audios.append(out.audio_values[0, 0])
     return audios
 
 
-# -------------------------
-# ORT Depth Decoder (fixed past_len)
-# -------------------------
+def _pick_providers(device_id: int):
+    provs = ort.get_available_providers()
+    torch_stream = torch.cuda.current_stream(device_id).cuda_stream
+
+    providers = []
+    # If you have ORT built with TensorRT EP, this is the only realistic way to approach PyTorch SDPA speed.
+    if "TensorrtExecutionProvider" in provs:
+        providers.append(("TensorrtExecutionProvider", {"device_id": device_id}))
+    providers.append((
+        "CUDAExecutionProvider",
+        {"device_id": device_id, "user_compute_stream": torch_stream},
+    ))
+    providers.append("CPUExecutionProvider")
+    return providers
+
+
 class ORTDepthDecoder:
     def __init__(self, onnx_path: str, past_len: int, device_id: int = 0):
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        torch_stream = torch.cuda.current_stream(device_id).cuda_stream
-
         self.sess = ort.InferenceSession(
             onnx_path,
             sess_options=so,
-            providers=[
-                ("CUDAExecutionProvider", {
-                    "device_id": device_id,
-                    "user_compute_stream": torch_stream,
-                }),
-                "CPUExecutionProvider",
-            ],
+            providers=_pick_providers(device_id),
         )
 
         ins = self.sess.get_inputs()
         outs = self.sess.get_outputs()
 
         self.L = (len(ins) - 4) // 2
-        past0 = ins[4].shape
-        B, KVH, P, HD = map(int, past0)
+        B, KVH, P, HD = map(int, ins[4].shape)
         assert P == past_len
 
-        logits_shape = outs[0].shape
-        B2, S2, V = map(int, logits_shape)
+        B2, S2, V = map(int, outs[0].shape)
         assert B2 == B and S2 == 1
 
-        bb_shape = ins[1].shape
-        B3, Hbb = map(int, bb_shape)
+        B3, Hbb = map(int, ins[1].shape)
         assert B3 == B
 
         self.B, self.KVH, self.HD, self.V, self.Hbb = B, KVH, HD, V, Hbb
@@ -177,18 +161,12 @@ class ORTDepthDecoder:
     def step(self, token_id: torch.Tensor, h_last: torch.Tensor, pos: int) -> torch.Tensor:
         if token_id.dim() == 1:
             token_id = token_id.view(self.B, 1)
-        self.token_buf.copy_(token_id.to(torch.long))
+        self.token_buf.copy_(token_id)
         self.bb_buf.copy_(h_last.to(torch.float16))
         self.cache_pos.fill_(int(pos))
         self._set_mask_for_pos(pos)
 
-        if hasattr(self.io, "synchronize_inputs"):
-            self.io.synchronize_inputs()
-
         self.sess.run_with_iobinding(self.io)
-
-        if hasattr(self.io, "synchronize_outputs"):
-            self.io.synchronize_outputs()
 
         for i in range(2 * self.L):
             self.past[i].copy_(self.present[i][:, :, 1:, :])
@@ -196,14 +174,7 @@ class ORTDepthDecoder:
         return self.out_logits[:, 0, :]
 
     @torch.no_grad()
-    def generate_frame(
-        self,
-        c0: torch.Tensor,
-        h_last: torch.Tensor,
-        method="nucleus",
-        temperature=0.1,
-        top_p=0.999,
-    ) -> torch.Tensor:
+    def generate_frame(self, c0: torch.Tensor, h_last: torch.Tensor, method="nucleus", temperature=0.1, top_p=0.999):
         B = self.B
         if c0.dim() == 2:
             c0 = c0[:, 0]
@@ -215,62 +186,51 @@ class ORTDepthDecoder:
         _ = self.step(dummy, h_last, pos=0)
 
         logits = self.step(c0, h_last, pos=1)
-        c1 = sample_from_logits(logits, method=method, temperature=temperature, top_p=top_p)  # [B,1]
+        c1 = sample_from_logits(logits, method=method, temperature=temperature, top_p=top_p)
 
         outs = [c1]
         prev = c1
-
         for pos in range(2, 32):
             logits = self.step(prev, h_last, pos=pos)
             nxt = sample_from_logits(logits, method=method, temperature=temperature, top_p=top_p)
             outs.append(nxt)
             prev = nxt
 
-        rest = torch.cat(outs, dim=1)        # [B,31]
-        return torch.cat([c0, rest], dim=1)  # [B,32]
+        rest = torch.cat(outs, dim=1)
+        return torch.cat([c0, rest], dim=1)
 
 
-# -------------------------
-# ORT Backbone (fixed past_len)
-# -------------------------
 class ORTBackbonePastN:
     def __init__(self, onnx_path: str, past_len: int, device_id: int = 0):
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        torch_stream = torch.cuda.current_stream(device_id).cuda_stream
-
         self.sess = ort.InferenceSession(
             onnx_path,
             sess_options=so,
-            providers=[
-                ("CUDAExecutionProvider", {
-                    "device_id": device_id,
-                    "user_compute_stream": torch_stream,
-                }),
-                "CPUExecutionProvider",
-            ],
+            providers=_pick_providers(device_id),
         )
 
         ins = self.sess.get_inputs()
         outs = self.sess.get_outputs()
 
         self.L = (len(ins) - 3) // 2
-        past0 = ins[3].shape
-        B, KVH, P, HD = map(int, past0)
+
+        B, KVH, P, HD = map(int, ins[3].shape)
         assert P == past_len
 
-        embed_shape = ins[0].shape
-        B2, S2, H = map(int, embed_shape)
+        B2, S2, H = map(int, ins[0].shape)
         assert B2 == B and S2 == 1
 
-        logits_shape = outs[0].shape
-        B3, S3, V = map(int, logits_shape)
+        B3, S3, V = map(int, outs[0].shape)
         assert B3 == B and S3 == 1
 
-        hidden_shape = outs[1].shape
-        B4, H2 = map(int, hidden_shape)
+        B4, H2 = map(int, outs[1].shape)
         assert B4 == B and H2 == H
+
+        # new_0 exists at outs[2]
+        B5, KVH2, ONE, HD2 = map(int, outs[2].shape)
+        assert B5 == B and KVH2 == KVH and ONE == 1 and HD2 == HD
 
         self.B, self.KVH, self.HD, self.V, self.H = B, KVH, HD, V, H
         self.past_len = past_len
@@ -280,10 +240,9 @@ class ORTBackbonePastN:
         self.cache_pos = torch.zeros((1,), device="cuda", dtype=torch.long)
 
         self.past = [torch.zeros((B, KVH, past_len, HD), device="cuda", dtype=torch.float16) for _ in range(2 * self.L)]
-        self.present = [torch.empty((B, KVH, past_len + 1, HD), device="cuda", dtype=torch.float16) for _ in range(2 * self.L)]
-
         self.out_logits = torch.empty((B, 1, V), device="cuda", dtype=torch.float16)
         self.out_hidden = torch.empty((B, H), device="cuda", dtype=torch.float16)
+        self.new_kv = [torch.empty((B, KVH, 1, HD), device="cuda", dtype=torch.float16) for _ in range(2 * self.L)]
 
         self.io = self.sess.io_binding()
         self.io.bind_input("inputs_embeds", "cuda", 0, np.float16, self.embed_buf.shape, self.embed_buf.data_ptr())
@@ -296,48 +255,51 @@ class ORTBackbonePastN:
 
         self.io.bind_output("logits", "cuda", 0, np.float16, self.out_logits.shape, self.out_logits.data_ptr())
         self.io.bind_output("last_hidden_state", "cuda", 0, np.float16, self.out_hidden.shape, self.out_hidden.data_ptr())
+
         for i in range(2 * self.L):
-            t = self.present[i]
-            self.io.bind_output(f"present_{i}", "cuda", 0, np.float16, t.shape, t.data_ptr())
+            t = self.new_kv[i]
+            self.io.bind_output(f"new_{i}", "cuda", 0, np.float16, t.shape, t.data_ptr())
+
+        self._all_valid_mask = False
+        self.mask_buf.zero_()  # default for warm state once it becomes all-valid
+
+    @torch.no_grad()
+    def reset(self):
+        for t in self.past:
+            t.zero_()
+        self.mask_buf.zero_()
+        self._all_valid_mask = False
 
     @torch.no_grad()
     def _set_mask_for_pos(self, pos: int):
-        valid = min(int(pos), self.past_len)
-        start = self.past_len - valid
-        self.mask_buf.zero_()
-        if start > 0:
-            self.mask_buf[..., :start] = -1e4
+        pos = int(pos)
+        if pos >= self.past_len:
+            if not self._all_valid_mask:
+                self.mask_buf.zero_()
+                self._all_valid_mask = True
+            return
 
-    @torch.no_grad()
-    def load_past_from_hf(self, hf_cache, seq_len: int):
-        n_valid = min(seq_len, self.past_len)
-        start = self.past_len - n_valid
-        for i in range(self.L):
-            self.past[2 * i + 0].zero_()
-            self.past[2 * i + 1].zero_()
-            keys = hf_cache.layers[i].keys[:, :, :seq_len, :]
-            vals = hf_cache.layers[i].values[:, :, :seq_len, :]
-            self.past[2 * i + 0][:, :, start:, :].copy_(keys[:, :, -n_valid:, :].to(torch.float16))
-            self.past[2 * i + 1][:, :, start:, :].copy_(vals[:, :, -n_valid:, :].to(torch.float16))
+        # early steps only
+        self._all_valid_mask = False
+        valid = pos
+        self.mask_buf.zero_()
+        if valid < self.past_len:
+            self.mask_buf[..., valid:self.past_len] = -1e4  # do not touch last slot (current)
 
     @torch.no_grad()
     def step(self, inputs_embeds: torch.Tensor, pos: int):
         if inputs_embeds.dim() == 2:
             inputs_embeds = inputs_embeds.unsqueeze(1)
-        self.embed_buf.copy_(inputs_embeds.to(torch.float16))
+        # expect fp16 already
+        self.embed_buf.copy_(inputs_embeds)
         self.cache_pos.fill_(int(pos))
         self._set_mask_for_pos(pos)
 
-        if hasattr(self.io, "synchronize_inputs"):
-            self.io.synchronize_inputs()
-
         self.sess.run_with_iobinding(self.io)
 
-        if hasattr(self.io, "synchronize_outputs"):
-            self.io.synchronize_outputs()
-
+        idx = int(pos) % self.past_len
         for i in range(2 * self.L):
-            self.past[i].copy_(self.present[i][:, :, 1:, :])
+            self.past[i][:, :, idx:idx + 1, :].copy_(self.new_kv[i])
 
         return self.out_logits, self.out_hidden
 
@@ -348,15 +310,12 @@ def prefill_backbone_with_onnx(ort_bb, inputs_embeds):
     logits_next = None
     h_last = None
     for i in range(seq_len):
-        token_embed = inputs_embeds[:, i : i + 1, :]
+        token_embed = inputs_embeds[:, i:i+1, :]
         ort_logits, h_last = ort_bb.step(token_embed, pos=i)
         logits_next = ort_logits[:, 0, :]
     return logits_next, h_last, seq_len
 
 
-# -------------------------
-# Main
-# -------------------------
 def main():
     device = "cuda"
 
@@ -366,21 +325,26 @@ def main():
     MAX_STEPS = 125 // 2
 
     processor = AutoProcessor.from_pretrained(PROCESSOR_PATH)
+
+    # Keep model mostly on CPU, but make embedding/codec fp16 on GPU to avoid casts
     model = CsmForConditionalGeneration.from_pretrained(
         MODEL_PATH,
         device_map="cpu",
         attn_implementation="sdpa",
         torch_dtype=torch.bfloat16,
     ).eval()
-    model.embed_text_tokens = model.embed_text_tokens.to(device)
-    model.backbone_model.embed_tokens = model.backbone_model.embed_tokens.to(device)
+
+    model.embed_text_tokens = model.embed_text_tokens.to(device=device, dtype=torch.float16)
+    model.backbone_model.embed_tokens = model.backbone_model.embed_tokens.to(device=device, dtype=torch.float16)
     model.codec_model = model.codec_model.to(device)
+
     text_embed = model.embed_text_tokens
     audio_embed = model.backbone_model.embed_tokens
     codec_model = model.codec_model
 
     ort_dd = ORTDepthDecoder(DEPTH_DECODER_ONNX_PATH, past_len=DEPTH_DECODER_PAST_LEN, device_id=0)
     ort_bb = ORTBackbonePastN(BACKBONE_ONNX_PATH, past_len=BACKBONE_PAST_LEN, device_id=0)
+    ort_bb.reset()
 
     whole_text = (
         "ქართველური ტომების გაერთიანების უმთავრეს მიზეზად ამ ტომთა საერთო საქმიანობა უნდა "
@@ -420,11 +384,11 @@ def main():
     inputs = all_inputs[counter]
 
     model_inputs = model.prepare_inputs_for_generation(**inputs)
-    inputs_embeds = model_inputs["inputs_embeds"]
+    inputs_embeds = model_inputs["inputs_embeds"].to(torch.float16)
+
     logits_next, h_last, seq_len = prefill_backbone_with_onnx(ort_bb, inputs_embeds)
 
     eos = torch.tensor([model.config.codebook_eos_token_id], device=device, dtype=torch.long)
-
     frames = []
 
     start = torch.cuda.Event(enable_timing=True)
@@ -433,7 +397,7 @@ def main():
 
     cur_step = 0
     while cur_step < MAX_STEPS:
-        c0 = sample_from_logits(logits_next, method=SAMPLE_METHOD, temperature=TEMPERATURE, top_p=TOP_P)  # [B,1]
+        c0 = sample_from_logits(logits_next, method=SAMPLE_METHOD, temperature=TEMPERATURE, top_p=TOP_P)
         c0_1d = c0.view(-1).to(torch.long)
 
         reached_eos = (c0_1d == eos.view(-1)).any()
@@ -443,9 +407,9 @@ def main():
                 break
             cur_step = 0
             inject_inputs = all_inputs[counter]
-            inject_embeds = text_embed(inject_inputs["input_ids"])
+            inject_embeds = text_embed(inject_inputs["input_ids"])  # fp16
             for i in range(inject_embeds.shape[1]):
-                token_embed = inject_embeds[:, i : i + 1, :]
+                token_embed = inject_embeds[:, i:i+1, :]
                 ort_logits, h_last = ort_bb.step(token_embed, pos=seq_len)
                 seq_len += 1
                 logits_next = ort_logits[:, 0, :]
@@ -453,15 +417,15 @@ def main():
 
         frame = ort_dd.generate_frame(
             c0=c0_1d,
-            h_last=h_last,
+            h_last=h_last,  # fp16 ok (dd casts to fp16)
             method=SAMPLE_METHOD,
             temperature=TEMPERATURE,
             top_p=TOP_P,
         )
         frames.append(frame)
 
-        frame_3d = frame.unsqueeze(1)  # [B,1,32]
-        audio_embeds = audio_embed(frame_3d)
+        frame_3d = frame.unsqueeze(1)
+        audio_embeds = audio_embed(frame_3d)  # fp16
         ort_logits, h_last = ort_bb.step(audio_embeds, pos=seq_len)
         seq_len += 1
         logits_next = ort_logits[:, 0, :]
@@ -472,9 +436,8 @@ def main():
     torch.cuda.synchronize()
     gen_time = start.elapsed_time(end) / 1000.0
 
-    audio = generate_audio_from_frames(
-        codec_model, model.config.codebook_eos_token_id, device, frames
-    )[0].to(torch.float32).cpu()
+    audio = generate_audio_from_frames(codec_model, model.config.codebook_eos_token_id, device, frames)[0]
+    audio = audio.to(torch.float32).cpu()
 
     sr = 24_000
     audio_dur = len(audio) / sr

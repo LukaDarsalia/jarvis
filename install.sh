@@ -1,8 +1,8 @@
 pip install \
-    torch==2.9.0+cu128 \
-    torchaudio==2.9.0+cu128 \
-    torchvision==0.24.0+cu128 \
-    --index-url https://download.pytorch.org/whl/cu128
+    torch==2.9.0+cu130 \
+    torchaudio==2.9.0+cu130 \
+    torchvision==0.24.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130
 
 # Install NeMo and other dependencies
 pip install \
