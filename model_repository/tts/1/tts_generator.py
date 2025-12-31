@@ -895,6 +895,7 @@ def _split_text_for_streaming(text: str) -> List[str]:
 
 if __name__ == "__main__":
     config = TTSConfig()
+
     tts_generator = TTSGenerator(
         model_id=config.model_id,
         model_path=config.model_path,
@@ -908,53 +909,100 @@ if __name__ == "__main__":
         reference_json_path="local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
     )
 
-    text = "გამარჯობა, რით შემიძლია დაგეხმაროთ?"
-    all_chunks = _split_text_for_streaming(text)
+    assistant_texts = [
+        "გამარჯობა! როგორ შემიძლია დაგეხმაროთ?",
+        "თუ გსურთ ბალანსის შემოწმება, გთხოვთ მითხრათ.",
+        "დავიწყოთ გადარიცხვა — მიუთითეთ თანხა და მიმღები.",
+        "თქვენი მოთხოვნა მიღებულია და მალე დასრულდება.",
+        "სხვა რამით ხომ არ დაგეხმაროთ?",
+    ]
 
-    seq_id = 123
+    output_sample_rate = 24_000
+    stream_chunk_duration = 1920.0 / float(output_sample_rate)
+    chunk_len = int(stream_chunk_duration * float(output_sample_rate))
 
-    # 1) Initialize session using ONLY reference (text + audio)
-    ok = tts_generator.initialize_session(seq_id, speaker_id=0)
-    if not ok:
-        raise RuntimeError("Failed to initialize TTS session.")
+    total_audio_samples = 0
+    total_gen_time = 0.0
 
-    # 2) Add all text chunks via append_texts
-    appended = tts_generator.append_texts(seq_id, all_chunks, speaker_id=0)
-    if not appended:
-        raise RuntimeError("Failed to append texts to session.")
+    for turn_idx, text in enumerate(assistant_texts, start=1):
+        seq_id = 100 + turn_idx
+        all_chunks = _split_text_for_streaming(text)
 
-    # 3) Stream generation
-    all_audio_chunks: List[torch.Tensor] = []
-    prev_num_frames = 0
+        ok = tts_generator.initialize_session(seq_id, speaker_id=0)
+        if not ok:
+            raise RuntimeError(f"Failed to initialize TTS session {seq_id}.")
 
-    while True:
-        is_complete = tts_generator.step_session(
-            seq_id,
-            max_steps=10,
-        )
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        first_chunk_time = None
+        prev_audio_len = 0
 
-        codes = tts_generator.get_session_audio(seq_id, return_codes=True)
-        if codes is not None:
-            cur_num_frames = codes.shape[0]
-            if cur_num_frames > prev_num_frames:
-                delta_codes = codes[prev_num_frames:cur_num_frames]
-                delta_audio = tts_generator._decode_audio(delta_codes)
-                all_audio_chunks.append(delta_audio.cpu())
-                prev_num_frames = cur_num_frames
+        print(f"\n[Turn {turn_idx}] {text}")
 
-        if is_complete:
-            break
-        # Optional: if no new frames arrived, you may sleep or wait for new text.
+        for chunk_idx, chunk in enumerate(all_chunks, start=1):
+            appended = tts_generator.append_texts(seq_id, [chunk], speaker_id=0)
+            if not appended:
+                raise RuntimeError(f"Failed to append text for session {seq_id}.")
 
-    if not all_audio_chunks:
-        raise RuntimeError("No audio was generated.")
+            for cur_step in range(config.max_steps):
+                is_complete = tts_generator.step_session(seq_id, max_steps=1)
 
-    full_audio = torch.cat(all_audio_chunks, dim=-1)
+                codes = tts_generator.get_session_audio(seq_id, return_codes=True)
+                if codes is None:
+                    continue
 
-    final_audio = tts_generator.end_session(seq_id)
+                audio_24k = tts_generator._decode_audio(codes)
+                audio_24k = audio_24k.cpu().float()
+                audio_np = audio_24k.numpy()
+                if audio_np.size == 0:
+                    continue
 
-    print(f"Streamed audio length: {full_audio.shape[-1]} samples")
+                if first_chunk_time is None:
+                    first_chunk_time = time.perf_counter() - start_time
 
-    sr = 24_000
-    sf.write("streamed_output.wav", full_audio.to(torch.float32).numpy(), sr)
-    print("Saved streamed_output.wav")
+                if audio_np.size > prev_audio_len:
+                    chunk_np = audio_np[-chunk_len:].astype(np.float32)
+                    audio_ms = (audio_np.size / output_sample_rate) * 1000.0
+                    chunk_ms = (chunk_np.size / output_sample_rate) * 1000.0
+                    print(
+                        f"[Turn {turn_idx}][Chunk {chunk_idx}][Step {cur_step + 1}] "
+                        f"audio={audio_ms:.1f}ms last_chunk={chunk_ms:.1f}ms"
+                    )
+                    prev_audio_len = audio_np.size
+
+                if is_complete:
+                    break
+
+            if cur_step == config.max_steps - 1 and not is_complete:
+                tts_generator.increment_state_counter(seq_id)
+
+        torch.cuda.synchronize()
+        gen_time = time.perf_counter() - start_time
+
+        final_audio = tts_generator.end_session(seq_id)
+        if final_audio is None:
+            raise RuntimeError(f"No audio generated for session {seq_id}.")
+
+        final_audio = final_audio.cpu().float()
+        audio_samples = final_audio.shape[-1]
+        audio_dur = audio_samples / output_sample_rate
+        rtf = gen_time / max(audio_dur, 1e-9)
+
+        total_audio_samples += audio_samples
+        total_gen_time += gen_time
+
+        first_chunk_ms = 0.0 if first_chunk_time is None else first_chunk_time * 1000.0
+        print(f"[Turn {turn_idx}] First output latency: {first_chunk_ms:.1f} ms")
+        print(f"[Turn {turn_idx}] Generation time: {gen_time:.3f} s")
+        print(f"[Turn {turn_idx}] Audio duration: {audio_dur:.3f} s")
+        print(f"[Turn {turn_idx}] RTF: {rtf:.3f}")
+
+        out_path = f"standalone_turn_{turn_idx}.wav"
+        sf.write(out_path, final_audio.numpy(), output_sample_rate)
+        print(f"[Turn {turn_idx}] Saved {out_path}")
+
+    total_audio_dur = total_audio_samples / output_sample_rate
+    total_rtf = total_gen_time / max(total_audio_dur, 1e-9)
+    print("\n[Total] Generation time: {:.3f} s".format(total_gen_time))
+    print("[Total] Audio duration: {:.3f} s".format(total_audio_dur))
+    print("[Total] RTF: {:.3f}".format(total_rtf))
