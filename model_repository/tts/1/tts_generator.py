@@ -58,7 +58,7 @@ def sample_from_logits(
 
 def _pick_providers(device_id: int):
     provs = ort.get_available_providers()
-    torch_stream = torch.cuda.current_stream(device_id).cuda_stream
+    torch_stream = torch.cuda.default_stream(device_id).cuda_stream
 
     providers = []
     if "TensorrtExecutionProvider" in provs:
@@ -176,7 +176,11 @@ class ORTDepthDecoder:
         self.cache_pos.fill_(int(pos))
         self._set_mask_for_pos(pos)
 
+        if hasattr(self.io, "synchronize_inputs"):
+            self.io.synchronize_inputs()
         self.sess.run_with_iobinding(self.io)
+        if hasattr(self.io, "synchronize_outputs"):
+            self.io.synchronize_outputs()
 
         for i in range(2 * self.L):
             self.past[i].copy_(self.present[i][:, :, 1:, :])
@@ -344,7 +348,11 @@ class ORTBackbonePastN:
         self.cache_pos.fill_(int(pos))
         self._set_mask_for_pos(pos)
 
+        if hasattr(self.io, "synchronize_inputs"):
+            self.io.synchronize_inputs()
         self.sess.run_with_iobinding(self.io)
+        if hasattr(self.io, "synchronize_outputs"):
+            self.io.synchronize_outputs()
 
         idx = int(pos) % self.past_len
         for i in range(2 * self.L):
