@@ -71,19 +71,28 @@ def _pick_providers(device_id: int):
     return providers
 
 
-class ORTDepthDecoder:
-    def __init__(self, onnx_path: str, past_len: int, device_id: int = 0):
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+def _create_ort_session(onnx_path: str, device_id: int) -> ort.InferenceSession:
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(
+        onnx_path,
+        sess_options=so,
+        providers=_pick_providers(device_id),
+    )
 
+
+class ORTDepthDecoder:
+    def __init__(
+        self,
+        onnx_path: str,
+        past_len: int,
+        device_id: int = 0,
+        sess: Optional[ort.InferenceSession] = None,
+    ):
         self.device_id = int(device_id)
         self.device = torch.device(f"cuda:{self.device_id}")
 
-        self.sess = ort.InferenceSession(
-            onnx_path,
-            sess_options=so,
-            providers=_pick_providers(self.device_id),
-        )
+        self.sess = sess if sess is not None else _create_ort_session(onnx_path, self.device_id)
 
         ins = self.sess.get_inputs()
         outs = self.sess.get_outputs()
@@ -208,18 +217,17 @@ class ORTDepthDecoder:
 
 
 class ORTBackbonePastN:
-    def __init__(self, onnx_path: str, past_len: int, device_id: int = 0):
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
+    def __init__(
+        self,
+        onnx_path: str,
+        past_len: int,
+        device_id: int = 0,
+        sess: Optional[ort.InferenceSession] = None,
+    ):
         self.device_id = int(device_id)
         self.device = torch.device(f"cuda:{self.device_id}")
 
-        self.sess = ort.InferenceSession(
-            onnx_path,
-            sess_options=so,
-            providers=_pick_providers(self.device_id),
-        )
+        self.sess = sess if sess is not None else _create_ort_session(onnx_path, self.device_id)
 
         ins = self.sess.get_inputs()
         outs = self.sess.get_outputs()
@@ -439,6 +447,8 @@ class TTSGenerator:
             raise FileNotFoundError(f"Missing backbone ONNX: {self.backbone_onnx_path}")
         if not os.path.exists(self.depth_decoder_onnx_path):
             raise FileNotFoundError(f"Missing depth decoder ONNX: {self.depth_decoder_onnx_path}")
+        self.ort_bb_sess = _create_ort_session(self.backbone_onnx_path, self.device_id)
+        self.ort_dd_sess = _create_ort_session(self.depth_decoder_onnx_path, self.device_id)
 
         # Reference
         self.reference_audio = None
@@ -629,11 +639,13 @@ class TTSGenerator:
             self.backbone_onnx_path,
             past_len=BACKBONE_PAST_LEN,
             device_id=self.device_id,
+            sess=self.ort_bb_sess,
         )
         ort_dd = ORTDepthDecoder(
             self.depth_decoder_onnx_path,
             past_len=DEPTH_DECODER_PAST_LEN,
             device_id=self.device_id,
+            sess=self.ort_dd_sess,
         )
         ort_bb.reset()
 
@@ -833,8 +845,10 @@ class TTSGenerator:
         """
         audio = self.get_session_audio(session_id, return_codes=False)
         with self.session_lock:
-            if session_id in self.sessions:
-                del self.sessions[session_id]
+            state = self.sessions.pop(session_id, None)
+        if state is not None:
+            state.ort_bb.reset()
+            state.ort_dd.reset()
         return audio
 
     def get_active_sessions(self) -> List[int]:
@@ -882,8 +896,8 @@ if __name__ == "__main__":
         decoder_temperature=config.decoder_temperature,
         decoder_top_p=config.decoder_top_p,
         compile_model=True,
-        reference_audio_path="context_audio_for_inference.wav",
-        reference_json_path="context_text_for_inference.json",
+        reference_audio_path="local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav",
+        reference_json_path="local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
     )
 
     text = "გამარჯობა, რით შემიძლია დაგეხმაროთ?"
