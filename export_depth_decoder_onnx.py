@@ -9,12 +9,27 @@ from csm_depth_decoder_wrapper import DepthDecoderOneStepExport
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.set_grad_enabled(False)
 
-def main():
-    device = "cuda"
-    dtype = torch.float16
+MODEL_PATH = "local_models/tts_model/georgian-csm-1b"
+PROCESSOR_PATH = "local_models/tts_model/csm-1b-processor"
+AUDIO_CONTEXT_PATH = "local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav"
+JSON_CONTEXT_PATH = "local_models/tts_model/georgian-csm-1b/context_text_for_inference.json"
 
-    model_path = "local_models/tts_model/georgian-csm-1b"
-    out_path = "csm_depth_decoder_step_past31.onnx"
+DEPTH_DECODER_ONNX_PATH = "csm_depth_decoder_step_past31.onnx"
+BACKBONE_ONNX_PATH = "csm_backbone_step_past4095.onnx"
+
+DEPTH_DECODER_PAST_LEN = 31
+BACKBONE_PAST_LEN = 4095
+
+EXPORT_DEVICE = "cuda"
+EXPORT_DTYPE = torch.float16
+
+def main():
+    device = EXPORT_DEVICE
+    dtype = EXPORT_DTYPE
+
+    model_path = MODEL_PATH
+    out_path = DEPTH_DECODER_ONNX_PATH
+    past_len = DEPTH_DECODER_PAST_LEN
 
     model = CsmForConditionalGeneration.from_pretrained(
         model_path,
@@ -34,7 +49,6 @@ def main():
 
     B = 1
     S = 1
-    past_len = 31
     k_len = past_len + S  # 32
 
     print(f"Export: L={L} kv_heads={kv_heads} hd={hd} Hbb={Hbb} V={V} past_len={past_len} k_len={k_len}")
