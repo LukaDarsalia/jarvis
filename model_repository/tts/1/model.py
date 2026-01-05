@@ -1,6 +1,5 @@
 import json
 import os
-import threading
 import traceback
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
@@ -54,12 +53,6 @@ class TritonPythonModel:
                 reference_audio_path="/local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav",
                 reference_json_path="/local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
             )
-
-            self._session_state_lock = threading.Lock()
-            self._session_prev_frames: Dict[int, int] = {}
-            self._session_audio_buffers: Dict[int, np.ndarray] = {}
-            self._session_chunk_counters: Dict[int, int] = {}
-            self._log_every_n_chunks = 50
 
             pb_utils.Logger.log_info("TTS Triton model initialized")
 
@@ -166,10 +159,6 @@ class TritonPythonModel:
             self._send_final(sender)
             if not is_initialized:
                 raise RuntimeError(f"[Seq {seq_id}] Failed to start session: max concurrent reached")
-            with self._session_state_lock:
-                self._session_prev_frames[seq_id] = 0
-                self._session_audio_buffers[seq_id] = np.zeros((0,), dtype=np.float32)
-                self._session_chunk_counters[seq_id] = 0
             pb_utils.Logger.log_info(f"[Seq {seq_id}] Cache initialized successfully")
             return
 
@@ -177,10 +166,6 @@ class TritonPythonModel:
         if is_end:
             pb_utils.Logger.log_info(f"[Seq {seq_id}] Session successfully ended!")
             self.tts_generator.end_session(seq_id)
-            with self._session_state_lock:
-                self._session_prev_frames.pop(seq_id, None)
-                self._session_audio_buffers.pop(seq_id, None)
-                self._session_chunk_counters.pop(seq_id, None)
             self._send_final(sender)
             return
 
@@ -192,13 +177,6 @@ class TritonPythonModel:
 
         # Processes one word audio
         # If model loops and never returns eos token, max_steps will stop it!
-        with self._session_state_lock:
-            prev_num_frames = self._session_prev_frames.get(seq_id, 0)
-            audio_buf = self._session_audio_buffers.get(seq_id, np.zeros((0,), dtype=np.float32))
-
-        # Chunk length = 1920 @ 24k scaled by target_sr
-        chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
-
         for cur_step in range(self.config.max_steps):
             is_complete = self.tts_generator.step_session(
                 seq_id,
@@ -213,79 +191,22 @@ class TritonPythonModel:
             codes = self.tts_generator.get_session_audio(seq_id, return_codes=True)
             if codes is None:
                 continue
-            cur_num_frames = codes.shape[0]
-            if cur_num_frames <= prev_num_frames:
-                if is_complete:
-                    break
-                continue
-            if cur_num_frames > prev_num_frames + 1:
-                pb_utils.Logger.log_info(
-                    f"[Seq {seq_id}] Multiple frames generated at once: prev={prev_num_frames} cur={cur_num_frames}"
-                )
 
-            # Decode full audio and stream only the newly generated frames.
-            full_audio = self.tts_generator._decode_audio(codes)
-            if full_audio is not None:
-                audio_np = full_audio.cpu().float().numpy().astype(np.float32)
-                delta_frames = cur_num_frames - prev_num_frames
-                if delta_frames > 0:
-                    tail_samples = delta_frames * chunk_len
-                    if tail_samples > 0:
-                        if tail_samples > audio_np.size:
-                            tail_samples = audio_np.size
-                        delta_np = audio_np[-tail_samples:]
-                        if delta_np.size > 0:
-                            max_abs = float(np.max(np.abs(delta_np)))
-                            if max_abs < 1e-4:
-                                pb_utils.Logger.log_info(
-                                    f"[Seq {seq_id}] Audio chunk near-silent: samples={delta_np.size} max_abs={max_abs:.6f}"
-                                )
-                            elif max_abs > 1.2:
-                                pb_utils.Logger.log_info(
-                                    f"[Seq {seq_id}] Audio chunk high amplitude: samples={delta_np.size} max_abs={max_abs:.3f}"
-                                )
-                        if audio_buf.size == 0:
-                            audio_buf = delta_np
-                        else:
-                            audio_buf = np.concatenate([audio_buf, delta_np])
+            # Decode full audio from all codes
+            audio_24k = self.tts_generator._decode_audio(codes)
+            audio_24k = audio_24k.cpu().float()
 
-            force_flush = bool(is_complete)
-            while audio_buf.size >= chunk_len or (force_flush and audio_buf.size > 0):
-                if audio_buf.size >= chunk_len:
-                    chunk_np = audio_buf[:chunk_len]
-                    audio_buf = audio_buf[chunk_len:]
-                else:
-                    chunk_np = audio_buf
-                    audio_buf = np.zeros((0,), dtype=np.float32)
-                with self._session_state_lock:
-                    chunk_counter = self._session_chunk_counters.get(seq_id, 0) + 1
-                    self._session_chunk_counters[seq_id] = chunk_counter
-                log_chunk = (
-                    chunk_counter <= 3
-                    or chunk_counter % self._log_every_n_chunks == 0
-                    or chunk_np.size != chunk_len
-                )
-                if log_chunk and chunk_np.size > 0:
-                    min_val = float(np.min(chunk_np))
-                    max_val = float(np.max(chunk_np))
-                    rms_val = float(np.sqrt(np.mean(chunk_np ** 2))) if chunk_np.size > 0 else 0.0
-                    nan_count = int(np.isnan(chunk_np).sum())
-                    pb_utils.Logger.log_info(
-                        f"[Seq {seq_id}] AUDIO_FRAME {chunk_counter}: samples={chunk_np.size} "
-                        f"expected={chunk_len} min={min_val:.4f} max={max_val:.4f} "
-                        f"rms={rms_val:.4f} nan={nan_count} prev_frames={prev_num_frames} "
-                        f"cur_frames={cur_num_frames}"
-                    )
-                audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
-                sender.send(pb_utils.InferenceResponse(
-                    output_tensors=[audio_tensor]
-                ))
-                force_flush = False
+            audio_np = audio_24k.numpy()
 
-            prev_num_frames = cur_num_frames
-            with self._session_state_lock:
-                self._session_prev_frames[seq_id] = prev_num_frames
-                self._session_audio_buffers[seq_id] = audio_buf
+            # Chunk length = 1920 @ 24k scaled by target_sr
+            chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
+
+            # stream last chunk_len samples
+            chunk_np = audio_np[-chunk_len:].astype(np.float32)
+            audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
+            sender.send(pb_utils.InferenceResponse(
+                output_tensors=[audio_tensor]
+            ))
 
             # Means model returned eos token
             if is_complete:

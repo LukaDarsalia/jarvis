@@ -138,6 +138,11 @@ class AVFrame:
             "word": self.word,
             "audio": "",
             "frame": "",
+            "audio_codec": "pcm-f32le",
+            "audio_sample_rate": 24000,
+            "audio_channels": 1,
+            "video_codec": "jpeg",
+            "video_fps": 25,
         }
 
         if self.audio_samples is not None and len(self.audio_samples) > 0:

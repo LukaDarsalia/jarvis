@@ -40,3 +40,5 @@ mv ./local_models /local_models
 mv ./testing_avatar_creation /local_models/musetalk_model/testing_avatar_creation
 
 ln -s /local_models ./local_models
+
+python3 model_repository/tts/1/tts_generator.py
