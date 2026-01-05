@@ -242,6 +242,9 @@ class WebSocketHandler:
         elif msg_type == "recording_stop":
             await self._handle_recording_stop(state)
 
+        elif msg_type == "text_input":
+            await self._handle_text_input(state, data)
+
     async def _handle_stop_generation(self, state: ConnectionState) -> None:
         """Handle stop generation request."""
         state.is_generating = False
@@ -280,6 +283,28 @@ class WebSocketHandler:
 
         if not state.is_generating:
             await self._close_tts_session(state)
+
+    async def _handle_text_input(self, state: ConnectionState, data: Dict[str, Any]) -> None:
+        """Handle direct text input (bypass STT)."""
+        text = (data.get("text") or "").strip()
+        if not text:
+            return
+
+        if state.is_generating:
+            return
+
+        state.is_generating = True
+        try:
+            await send_message(state, "stt_complete", {"text": text})
+            state.conversation.add_user_message(text)
+            await self._process_llm_and_tts(state, text)
+        except Exception as exc:
+            logger.error(f"Text input error: {exc}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await send_message(state, "error", {"message": str(exc)})
+        finally:
+            state.is_generating = False
 
     async def _audio_processor_loop(self, state: ConnectionState) -> None:
         """Process incoming audio chunks."""
@@ -460,27 +485,32 @@ class WebSocketHandler:
                 except asyncio.TimeoutError:
                     continue
 
-        # Process through pipeline
-        llm_response = await self.pipeline.process_llm_and_tts(
-            llm_generator=llm_generator(),
-            tts_session_id=state.tts_session_id,
-            video_enabled=video_enabled,
-            base_frame_index=state.musetalk_frame_index,
-            is_generating=lambda: state.is_generating,
-            on_llm_token=lambda token, full: asyncio.create_task(
-                send_message(state, "llm_token", {"token": token, "full_text": full})
-            ),
-            on_av_frame=lambda frame: asyncio.create_task(
-                send_message(state, "synced_av_frame", frame.to_websocket_payload())
-            ),
-            on_error=lambda msg: asyncio.create_task(
-                send_message(state, "error", {"message": msg})
-            ),
-            on_llm_complete=lambda text: asyncio.create_task(
-                send_message(state, "llm_complete", {"text": text})
-            ),
-            on_tts_complete=lambda: asyncio.create_task(self._on_tts_complete(state)),
-        )
+        frame_queue: asyncio.Queue = asyncio.Queue()
+        frame_sender_task = asyncio.create_task(self._frame_sender(state, frame_queue))
+
+        try:
+            # Process through pipeline
+            llm_response = await self.pipeline.process_llm_and_tts(
+                llm_generator=llm_generator(),
+                tts_session_id=state.tts_session_id,
+                video_enabled=video_enabled,
+                base_frame_index=state.musetalk_frame_index,
+                is_generating=lambda: state.is_generating,
+                on_llm_token=lambda token, full: asyncio.create_task(
+                    send_message(state, "llm_token", {"token": token, "full_text": full})
+                ),
+                on_av_frame=lambda frame: frame_queue.put_nowait(frame),
+                on_error=lambda msg: asyncio.create_task(
+                    send_message(state, "error", {"message": msg})
+                ),
+                on_llm_complete=lambda text: asyncio.create_task(
+                    send_message(state, "llm_complete", {"text": text})
+                ),
+                on_tts_complete=lambda: None,
+            )
+        finally:
+            await frame_queue.put(None)
+            frame_sender_task.add_done_callback(lambda t: t.exception())
 
         # Update conversation
         state.conversation.add_assistant_message(llm_response)
@@ -493,6 +523,18 @@ class WebSocketHandler:
         """Handle TTS/video completion."""
         await send_message(state, "tts_complete", {})
         await send_message(state, "video_complete", {})
+
+    async def _frame_sender(self, state: ConnectionState, frame_queue: asyncio.Queue) -> None:
+        """Send AV frames in order to ensure completion arrives after all frames."""
+        try:
+            while True:
+                frame = await frame_queue.get()
+                if frame is None:
+                    await self._on_tts_complete(state)
+                    break
+                await send_message(state, "synced_av_frame", frame.to_websocket_payload())
+        except Exception as exc:
+            logger.error(f"Frame sender error: {exc}")
 
     async def _init_tts_session(self, state: ConnectionState) -> None:
         """Initialize TTS session for the connection."""

@@ -30,6 +30,7 @@ class SimpleVoiceAssistant {
         this.expectedIndex = 0;
         this.pendingFrames = new Map();
         this.streamComplete = false;
+        this.lastVideoFrame = null;
 
         // WebCodecs
         this.useAudioDecoder = false;
@@ -58,7 +59,7 @@ class SimpleVoiceAssistant {
         this.cacheElements();
         this.bindEvents();
         await this.initAudioContext();
-        this.initDecoders();
+        await this.initDecoders();
         this.connect();
     }
 
@@ -89,6 +90,7 @@ class SimpleVoiceAssistant {
             avatarStatusIndicator: query(avatarStatus, '.status-indicator', 'avatarStatusIndicator'),
             avatarStatusText: query(avatarStatus, '.status-text', 'avatarStatusText'),
             avatarImage: get('avatarImage'),
+            avatarLoading: get('avatarLoading'),
             vadIndicator: get('vadIndicator'),
             vadStatus: get('vadStatus'),
             chatMessages,
@@ -114,56 +116,71 @@ class SimpleVoiceAssistant {
         }
     }
 
-    initDecoders() {
+    async initDecoders() {
+        const audioConfig = {
+            codec: 'pcm-f32le',
+            sampleRate: this.audioSampleRate,
+            numberOfChannels: 1,
+        };
+        const videoConfig = { codec: 'jpeg' };
+
         if (window.AudioDecoder) {
-            try {
-                this.audioDecoder = new AudioDecoder({
-                    output: (audioData) => this.onAudioDecoded(audioData),
-                    error: (err) => {
-                        console.error('AudioDecoder error:', err);
-                        this.useAudioDecoder = false;
-                        this.audioDecoder = null;
-                        this.audioDecodeQueue = [];
-                    },
-                });
-                this.audioDecoder.configure({
-                    codec: 'pcm-f32le',
-                    sampleRate: this.audioSampleRate,
-                    numberOfChannels: 1,
-                });
-                this.useAudioDecoder = true;
-            } catch (e) {
-                console.warn('AudioDecoder unavailable:', e);
-                this.audioDecoder = null;
+            const support = await AudioDecoder.isConfigSupported(audioConfig).catch(() => null);
+            if (support && support.supported) {
+                try {
+                    this.audioDecoder = new AudioDecoder({
+                        output: (audioData) => this.onAudioDecoded(audioData),
+                        error: (err) => {
+                            console.error('AudioDecoder error:', err);
+                            this.useAudioDecoder = false;
+                            this.audioDecoder = null;
+                            this.audioDecodeQueue = [];
+                        },
+                    });
+                    this.audioDecoder.configure(audioConfig);
+                    this.useAudioDecoder = true;
+                } catch (e) {
+                    console.warn('AudioDecoder unavailable:', e);
+                    this.audioDecoder = null;
+                    this.useAudioDecoder = false;
+                }
+            } else {
                 this.useAudioDecoder = false;
+                this.audioDecoder = null;
+                this.log('AudioDecoder not supported for pcm-f32le, using PCM fallback.');
             }
         }
 
         if (window.VideoDecoder) {
-            try {
-                this.videoDecoder = new VideoDecoder({
-                    output: (videoFrame) => this.onVideoDecoded(videoFrame),
-                    error: (err) => {
-                        console.error('VideoDecoder error:', err);
-                        this.useVideoDecoder = false;
-                        this.videoDecoder = null;
-                        if (this.videoCanvas) {
-                            this.videoCanvas.remove();
-                            this.videoCanvas = null;
-                            this.videoCtx = null;
-                        }
-                        this.elements.avatarImage.classList.remove('hidden');
-                    },
-                });
-                this.videoDecoder.configure({
-                    codec: 'jpeg',
-                });
-                this.useVideoDecoder = true;
-                this.setupVideoCanvas();
-            } catch (e) {
-                console.warn('VideoDecoder unavailable:', e);
-                this.videoDecoder = null;
+            const support = await VideoDecoder.isConfigSupported(videoConfig).catch(() => null);
+            if (support && support.supported) {
+                try {
+                    this.videoDecoder = new VideoDecoder({
+                        output: (videoFrame) => this.onVideoDecoded(videoFrame),
+                        error: (err) => {
+                            console.error('VideoDecoder error:', err);
+                            this.useVideoDecoder = false;
+                            this.videoDecoder = null;
+                            if (this.videoCanvas) {
+                                this.videoCanvas.remove();
+                                this.videoCanvas = null;
+                                this.videoCtx = null;
+                            }
+                            this.elements.avatarImage.classList.remove('hidden');
+                        },
+                    });
+                    this.videoDecoder.configure(videoConfig);
+                    this.useVideoDecoder = true;
+                    this.setupVideoCanvas();
+                } catch (e) {
+                    console.warn('VideoDecoder unavailable:', e);
+                    this.videoDecoder = null;
+                    this.useVideoDecoder = false;
+                }
+            } else {
                 this.useVideoDecoder = false;
+                this.videoDecoder = null;
+                this.log('VideoDecoder not supported for jpeg, using image fallback.');
             }
         }
     }
@@ -224,6 +241,7 @@ class SimpleVoiceAssistant {
                 break;
 
             case 'musetalk_ready':
+                this.elements.avatarLoading.classList.add('hidden');
                 if (data.success) {
                     this.updateAvatarStatus('ready', 'მზადაა');
                     if (data.idle_frame) {
@@ -418,6 +436,8 @@ class SimpleVoiceAssistant {
 
         if (frame.video) {
             this.queueVideo(frame.video, frame.index);
+        } else if (this.lastVideoFrame) {
+            this.displayJpegFrame(this.lastVideoFrame);
         }
     }
 
@@ -495,6 +515,7 @@ class SimpleVoiceAssistant {
     }
 
     displayJpegFrame(base64) {
+        this.lastVideoFrame = base64;
         if (this.useVideoDecoder && this.videoCanvas) {
             const img = new Image();
             img.onload = () => {

@@ -40,6 +40,7 @@ class MessageType(Enum):
     RECORDING_START = "recording_start"
     RECORDING_STOP = "recording_stop"
     STOP_GENERATION = "stop_generation"
+    TEXT_INPUT = "text_input"
 
     # Server -> Client
     CONNECTED = "connected"
@@ -131,6 +132,7 @@ class AVFrame:
     def to_websocket_payload(self) -> Dict[str, Any]:
         """Convert to WebSocket payload format."""
         import base64
+        import zlib
 
         payload = {
             "frame_index": self.frame_index,
@@ -138,6 +140,8 @@ class AVFrame:
             "word": self.word,
             "audio": "",
             "frame": "",
+            "audio_samples": 0,
+            "audio_crc32": 0,
             "audio_codec": "pcm-f32le",
             "audio_sample_rate": 24000,
             "audio_channels": 1,
@@ -146,7 +150,10 @@ class AVFrame:
         }
 
         if self.audio_samples is not None and len(self.audio_samples) > 0:
-            payload["audio"] = base64.b64encode(self.audio_samples.tobytes()).decode("utf-8")
+            audio_bytes = self.audio_samples.tobytes()
+            payload["audio"] = base64.b64encode(audio_bytes).decode("utf-8")
+            payload["audio_samples"] = int(self.audio_samples.size)
+            payload["audio_crc32"] = int(zlib.crc32(audio_bytes) & 0xFFFFFFFF)
 
         if self.video_jpeg is not None:
             payload["frame"] = base64.b64encode(self.video_jpeg).decode("utf-8")

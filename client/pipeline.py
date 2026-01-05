@@ -27,6 +27,7 @@ from config import TTSConfig, MuseTalkConfig, StreamingConfig
 from models import AudioFrame, AVFrame, TTSMetrics, BufferConfig, StreamingStats
 from tts_service import TTSService
 from triton_services import MuseTalkService
+from streaming_chunker import StreamingTTSChunker
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,7 @@ class AVPipeline:
             # Video frame cache: frame_index -> jpeg_bytes
             video_cache: Dict[int, bytes] = {}
             video_lock = threading.Lock()
+            video_done = threading.Event()
 
             # State
             frame_index = base_frame_index
@@ -219,12 +221,6 @@ class AVPipeline:
                 local_frame_index = base_frame_index
                 audio_log_count = 0
                 expected_chunk = self.config.tts_config.chunk_samples
-                target_peak = 0.8
-                max_gain = 20.0
-                min_peak = 0.005
-                gain_state = 1.0
-                attack = 0.2
-                release = 0.05
 
                 try:
                     while is_generating():
@@ -257,22 +253,6 @@ class AVPipeline:
                             if audio_np.size == 0:
                                 continue
 
-                            peak = float(np.max(np.abs(audio_np))) if audio_np.size > 0 else 0.0
-                            if peak < min_peak:
-                                target_gain = 1.0
-                            else:
-                                target_gain = min(max_gain, target_peak / peak)
-
-                            if target_gain > gain_state:
-                                gain_state += (target_gain - gain_state) * attack
-                            else:
-                                gain_state += (target_gain - gain_state) * release
-
-                            gain = gain_state
-                            if gain != 1.0:
-                                audio_np = audio_np * gain
-
-                            audio_np = np.clip(audio_np, -1.0, 1.0)
                             log_audio = (
                                 audio_log_count <= 3
                                 or audio_log_count % 50 == 0
@@ -287,7 +267,7 @@ class AVPipeline:
                                     f"TTS audio chunk {audio_log_count}: samples={audio_np.size} "
                                     f"expected={expected_chunk} dtype={audio_np.dtype} "
                                     f"min={min_val:.4f} max={max_val:.4f} rms={rms_val:.4f} "
-                                    f"nan={nan_count} peak={peak:.4f} gain={gain:.3f} target={target_gain:.3f}"
+                                    f"nan={nan_count}"
                                 )
 
                             audio_buffer = np.concatenate([audio_buffer, audio_np])
@@ -360,6 +340,7 @@ class AVPipeline:
                         except Empty:
                             if not is_generating():
                                 break
+                    video_done.set()
                     return
 
                 # Batch audio for efficient MuseTalk processing
@@ -448,6 +429,8 @@ class AVPipeline:
                     import traceback
                     logger.error(traceback.format_exc())
                     report_error(f"MuseTalk worker error: {exc}")
+                finally:
+                    video_done.set()
 
             # ----------------------------------------------------------------
             # AV Sender - pairs audio+video and sends immediately
@@ -472,14 +455,11 @@ class AVPipeline:
                         if frame is None:
                             break
 
-                        # Get video frame (wait briefly if not ready yet)
+                        # Get video frame if available (do not stall audio on slow video)
                         video_bytes = None
-                        for _ in range(10):  # Wait up to 1 second for video
+                        if video_enabled:
                             with video_lock:
                                 video_bytes = video_cache.pop(frame.index, None)
-                            if video_bytes is not None:
-                                break
-                            time.sleep(0.1)
 
                         # Use last frame as fallback
                         if video_bytes is None:
@@ -643,12 +623,11 @@ class VoiceToVoicePipeline:
         text_input_queue: Queue = Queue()
 
         llm_response = ""
-        tts_started = False
-        words_sent = 0
+        chunker = StreamingTTSChunker()
 
         # LLM token processing task
         async def process_llm_tokens():
-            nonlocal llm_response, tts_started, words_sent
+            nonlocal llm_response
 
             async for token in llm_generator:
                 if not is_generating():
@@ -657,28 +636,14 @@ class VoiceToVoicePipeline:
                 llm_response += token
                 on_llm_token(token, llm_response)
 
-                words = llm_response.split()
-
-                # Start TTS after 3 words (2-word lookahead)
-                if not tts_started and len(words) >= 3:
-                    first_chunk = " ".join(words[:3])
-                    text_input_queue.put([first_chunk])
-                    tts_started = True
-                    words_sent = 3
-
-                # Send new words one at a time
-                if tts_started and len(words) > words_sent:
-                    new_words = words[words_sent:]
-                    for w in new_words:
-                        text_input_queue.put([" " + w])
-                    words_sent = len(words)
+                chunks = chunker.push_token(token)
+                for chunk in chunks:
+                    text_input_queue.put([chunk])
 
             on_llm_complete(llm_response)
 
-            # Send flush chunks and end signal
-            if tts_started:
-                text_input_queue.put([""])
-                text_input_queue.put([""])
+            for chunk in chunker.finalize():
+                text_input_queue.put([chunk])
 
             text_input_queue.put(None)
 
