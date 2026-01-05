@@ -29,3 +29,14 @@ pip install gdown
 pip install coloredlogs flatbuffers numpy packaging protobuf sympy
 pip install -U --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
 pip install -U onnx onnxscript
+
+python3 ./download_data.py
+python3 ./onnx_csm/export_backbone_step_onnx.py
+python3 ./onnx_csm/export_depth_decoder_onnx.py
+python3 ./onnx_csm/generate_with_backbone_and_depth_onnx.py
+
+mv ./local_models /local_models
+
+mv ./testing_avatar_creation /local_models/musetalk_model/testing_avatar_creation
+
+ln -s /local_models ./local_models

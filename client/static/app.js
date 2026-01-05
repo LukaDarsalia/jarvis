@@ -75,6 +75,8 @@ class VoiceAssistant {
             defaultMinFrames: 48,
             maxFrames: 150,         // Maximum buffer size
             missingFrameToleranceMs: 400,
+            fallbackRtf: 1.7,
+            fallbackDurationMs: 6000,
         };
 
         // Adaptive buffering stats (rolling averages across streams)
@@ -109,6 +111,7 @@ class VoiceAssistant {
             computedBufferMs: 0,
         };
         this.serverBufferMs = null;
+        this.serverBufferCalibrated = false;
 
         // Playback stats for logging
         this.playbackStats = {
@@ -297,11 +300,21 @@ class VoiceAssistant {
         let source = 'auto';
         if (avgRtf > 0 && avgDurationMs > 0) {
             bufferMs = Math.max(0, (avgRtf - 1) * avgDurationMs);
-        } else if (Number.isFinite(this.serverBufferMs) && this.serverBufferMs > 0) {
+        } else if (
+            Number.isFinite(this.serverBufferMs) &&
+            this.serverBufferMs > 0 &&
+            this.serverBufferCalibrated
+        ) {
             bufferMs = this.serverBufferMs;
             source = 'server';
         } else {
-            bufferMs = this.bufferConfig.defaultMinFrames * this.frameInterval;
+            const fallbackRtf = this.bufferConfig.fallbackRtf || 1.0;
+            const fallbackDur = this.bufferConfig.fallbackDurationMs || 0;
+            const fallbackMs = Math.max(0, (fallbackRtf - 1) * fallbackDur);
+            bufferMs = Math.max(
+                this.bufferConfig.defaultMinFrames * this.frameInterval,
+                fallbackMs
+            );
             source = 'default';
         }
 
@@ -521,6 +534,7 @@ class VoiceAssistant {
                     if (Number.isFinite(data.buffer_config.buffer_ms)) {
                         this.serverBufferMs = data.buffer_config.buffer_ms;
                     }
+                    this.serverBufferCalibrated = Boolean(data.buffer_config.is_calibrated);
                     this.log('Server buffer config:', data.buffer_config);
                 }
                 if (data.success) {
@@ -581,6 +595,7 @@ class VoiceAssistant {
                     if (Number.isFinite(data.buffer_config.buffer_ms)) {
                         this.serverBufferMs = data.buffer_config.buffer_ms;
                     }
+                    this.serverBufferCalibrated = Boolean(data.buffer_config.is_calibrated);
                     this.log('TTS buffer config:', data.buffer_config);
                 }
                 this.log('TTS starting, video_enabled:', data.video_enabled);

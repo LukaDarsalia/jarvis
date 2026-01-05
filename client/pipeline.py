@@ -219,6 +219,12 @@ class AVPipeline:
                 local_frame_index = base_frame_index
                 audio_log_count = 0
                 expected_chunk = self.config.tts_config.chunk_samples
+                target_peak = 0.8
+                max_gain = 20.0
+                min_peak = 0.005
+                gain_state = 1.0
+                attack = 0.2
+                release = 0.05
 
                 try:
                     while is_generating():
@@ -246,11 +252,27 @@ class AVPipeline:
                                 audio_np = audio_np.astype(np.float32) / max_val
                             else:
                                 audio_np = audio_np.astype(np.float32)
-                            audio_np = np.clip(audio_np, -1.0, 1.0).reshape(-1)
+                            audio_np = audio_np.reshape(-1)
 
                             if audio_np.size == 0:
                                 continue
 
+                            peak = float(np.max(np.abs(audio_np))) if audio_np.size > 0 else 0.0
+                            if peak < min_peak:
+                                target_gain = 1.0
+                            else:
+                                target_gain = min(max_gain, target_peak / peak)
+
+                            if target_gain > gain_state:
+                                gain_state += (target_gain - gain_state) * attack
+                            else:
+                                gain_state += (target_gain - gain_state) * release
+
+                            gain = gain_state
+                            if gain != 1.0:
+                                audio_np = audio_np * gain
+
+                            audio_np = np.clip(audio_np, -1.0, 1.0)
                             log_audio = (
                                 audio_log_count <= 3
                                 or audio_log_count % 50 == 0
@@ -264,7 +286,8 @@ class AVPipeline:
                                 logger.info(
                                     f"TTS audio chunk {audio_log_count}: samples={audio_np.size} "
                                     f"expected={expected_chunk} dtype={audio_np.dtype} "
-                                    f"min={min_val:.4f} max={max_val:.4f} rms={rms_val:.4f} nan={nan_count}"
+                                    f"min={min_val:.4f} max={max_val:.4f} rms={rms_val:.4f} "
+                                    f"nan={nan_count} peak={peak:.4f} gain={gain:.3f} target={target_gain:.3f}"
                                 )
 
                             audio_buffer = np.concatenate([audio_buffer, audio_np])
