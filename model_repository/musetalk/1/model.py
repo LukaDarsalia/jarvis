@@ -21,6 +21,7 @@ import torch
 import librosa
 import soundfile as sf
 import triton_python_backend_utils as pb_utils
+from PIL import Image
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -183,7 +184,12 @@ class TritonPythonModel:
                 if isinstance(input_shape, list) and input_shape:
                     if isinstance(input_shape[0], int):
                         self.unet_onnx_batch = input_shape[0]
+                if self.unet_onnx_batch is None and self.config.batch_size > 0:
+                    self.unet_onnx_batch = self.config.batch_size
                 self.unet_onnx_timestep = np.array([0], dtype=np.int64)
+                pb_utils.Logger.log_info(
+                    f"UNet ONNX ready | dtype={self.unet_onnx_dtype} | batch={self.unet_onnx_batch}"
+                )
             except Exception as exc:
                 pb_utils.Logger.log_error(f"Failed to initialize UNet ONNX: {exc}")
                 self.unet_onnx_session = None
@@ -243,10 +249,12 @@ class TritonPythonModel:
         input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
         
         mask_list_cycle = []
+        mask_pil_list_cycle = []
         for mask_img_path in input_mask_list:
             mask = cv2.imread(mask_img_path)
             if mask is not None:
                 mask_list_cycle.append(mask)
+                mask_pil_list_cycle.append(Image.fromarray(mask).convert("L"))
         
         pb_utils.Logger.log_info(f"Avatar loaded: {len(frame_list_cycle)} frames, {len(mask_list_cycle)} masks")
         
@@ -261,6 +269,7 @@ class TritonPythonModel:
             'coord_list_cycle': coord_list_cycle,
             'frame_list_cycle': frame_list_cycle,
             'mask_list_cycle': mask_list_cycle,
+            'mask_pil_list_cycle': mask_pil_list_cycle,
             'mask_coords_list_cycle': mask_coords_list_cycle,
         }
     
@@ -491,7 +500,7 @@ class TritonPythonModel:
                 frame_data = {
                     'bbox': self.avatar_data['coord_list_cycle'][cycle_idx],
                     'ori_frame': self.avatar_data['frame_list_cycle'][cycle_idx],
-                    'mask': self.avatar_data['mask_list_cycle'][cycle_idx],
+                    'mask': self.avatar_data['mask_pil_list_cycle'][cycle_idx],
                     'mask_coords': self.avatar_data['mask_coords_list_cycle'][cycle_idx],
                 }
                 
