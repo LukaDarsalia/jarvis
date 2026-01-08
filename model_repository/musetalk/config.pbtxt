@@ -103,7 +103,7 @@ parameters: {
 
 parameters: {
   key: "fps"
-  value: { string_value: "25" }
+  value: { string_value: "18" }
 }
 
 parameters: {

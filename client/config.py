@@ -47,13 +47,13 @@ class TTSConfig:
 class MuseTalkConfig:
     """MuseTalk avatar generation configuration."""
     avatar_id: str = "default"
-    fps: int = 25
+    fps: int = 18
     # How many TTS chunks to wait before starting MuseTalk
     start_after_chunks: int = 3
     # How many TTS chunks to keep as lookahead buffer
     lookahead_chunks: int = 2
-    # Samples per video frame (24kHz / 25fps = 960 samples per frame)
-    samples_per_frame: int = 960
+    # Samples per video frame (24kHz / 18fps = 1333 samples per frame)
+    samples_per_frame: int = 1333
 
 
 @dataclass
