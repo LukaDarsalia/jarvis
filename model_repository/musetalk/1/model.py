@@ -11,6 +11,7 @@ import glob
 import pickle
 import traceback
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
@@ -419,7 +420,12 @@ class TritonPythonModel:
                 return None
     
     @torch.no_grad()
-    def _generate_frames(self, whisper_chunks: torch.Tensor, start_frame_index: int) -> List[tuple]:
+    def _generate_frames(
+        self,
+        whisper_chunks: torch.Tensor,
+        start_frame_index: int,
+        stats: Optional[Dict[str, float]] = None,
+    ) -> List[tuple]:
         """
         Generate video frames from whisper features.
         
@@ -435,6 +441,10 @@ class TritonPythonModel:
             return []
         
         results = []
+        if stats is not None:
+            stats.setdefault("unet_ms", 0.0)
+            stats.setdefault("vae_ms", 0.0)
+            stats.setdefault("blend_ms", 0.0)
         
         # Process in batches
         for batch_start in range(0, num_frames, self.config.batch_size):
@@ -455,6 +465,7 @@ class TritonPythonModel:
             audio_feature_batch = self.pe(whisper_batch.to(self.device))
             latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
 
+            unet_start = time.perf_counter()
             if self.unet_onnx_session is not None:
                 pred_latents = self._run_unet_onnx(latent_batch, audio_feature_batch)
             else:
@@ -463,10 +474,15 @@ class TritonPythonModel:
                     self.timesteps,
                     encoder_hidden_states=audio_feature_batch,
                 ).sample
-            
+            if stats is not None:
+                stats["unet_ms"] += (time.perf_counter() - unet_start) * 1000.0
+
             pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
+            vae_start = time.perf_counter()
             recon = self.vae.decode_latents(pred_latents)
-            
+            if stats is not None:
+                stats["vae_ms"] += (time.perf_counter() - vae_start) * 1000.0
+
             # Blend each frame
             for i, res_frame in enumerate(recon):
                 frame_num = batch_start + i
@@ -482,6 +498,7 @@ class TritonPythonModel:
                 x1, y1, x2, y2 = frame_data['bbox']
                 res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
                 
+                blend_start = time.perf_counter()
                 combine_frame = get_image_blending(
                     frame_data['ori_frame'],
                     res_frame,
@@ -489,6 +506,8 @@ class TritonPythonModel:
                     frame_data['mask'],
                     frame_data['mask_coords'],
                 )
+                if stats is not None:
+                    stats["blend_ms"] += (time.perf_counter() - blend_start) * 1000.0
                 
                 if not isinstance(combine_frame, np.ndarray):
                     combine_frame = np.array(combine_frame)
@@ -511,6 +530,7 @@ class TritonPythonModel:
     def _handle_request(self, request, sender):
         """Handle a single request (stateless)"""
         try:
+            request_start = time.perf_counter()
             # Get inputs
             audio = self._get_audio_input(request)
             frame_index = self._get_int_input(request, "FRAME_INDEX", 0)
@@ -524,7 +544,9 @@ class TritonPythonModel:
             pb_utils.Logger.log_info(f"Processing audio: {audio_duration_s:.3f}s, start_frame_index: {frame_index}")
             
             # Process audio through Whisper
+            whisper_start = time.perf_counter()
             whisper_chunks = self._process_audio_to_whisper(audio)
+            whisper_ms = (time.perf_counter() - whisper_start) * 1000.0
             
             if whisper_chunks is None or len(whisper_chunks) == 0:
                 pb_utils.Logger.log_error("Failed to process audio through Whisper")
@@ -532,9 +554,10 @@ class TritonPythonModel:
                 return
             
             pb_utils.Logger.log_info(f"Generated {len(whisper_chunks)} whisper chunks")
-            
+
             # Generate all frames
-            frames = self._generate_frames(whisper_chunks, frame_index)
+            stats: Dict[str, float] = {}
+            frames = self._generate_frames(whisper_chunks, frame_index, stats=stats)
             
             if len(frames) == 0:
                 pb_utils.Logger.log_warning("No frames generated")
@@ -547,6 +570,18 @@ class TritonPythonModel:
             for i, (frame_data, frame_idx, timestamp_ms) in enumerate(frames):
                 is_last = (i == len(frames) - 1)
                 self._send_frame(sender, frame_data, frame_idx, timestamp_ms, is_final=is_last)
+
+            total_ms = (time.perf_counter() - request_start) * 1000.0
+            unet_ms = stats.get("unet_ms", 0.0)
+            vae_ms = stats.get("vae_ms", 0.0)
+            blend_ms = stats.get("blend_ms", 0.0)
+            per_frame_ms = total_ms / len(frames) if frames else 0.0
+            unet_impl = "onnx" if self.unet_onnx_session is not None else "torch"
+            pb_utils.Logger.log_info(
+                "MuseTalk timing | total_ms=%.1f per_frame_ms=%.1f whisper_ms=%.1f "
+                "unet_ms=%.1f vae_ms=%.1f blend_ms=%.1f unet_impl=%s frames=%d"
+                % (total_ms, per_frame_ms, whisper_ms, unet_ms, vae_ms, blend_ms, unet_impl, len(frames))
+            )
         
         except Exception as e:
             pb_utils.Logger.log_error(f"Error processing request: {e}\n{traceback.format_exc()}")
