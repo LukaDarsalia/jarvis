@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import queue
 import sys
+import threading
+import time
 import wave
 from statistics import median
 
@@ -14,6 +17,8 @@ from streaming_chunker import StreamingTTSChunker, split_text_for_streaming
 from tts_service import TTSService
 from triton_services import TritonClient
 os.environ.setdefault("TRITON_URL", "185.151.171.35:54757")
+
+_SENTINEL = object()
 
 def write_wav(path: str, audio: np.ndarray, sample_rate: int) -> None:
     pcm = np.clip(audio, -1.0, 1.0)
@@ -70,6 +75,108 @@ def compare_audio(a: np.ndarray, b: np.ndarray):
     }
 
 
+def _stream_chunks(
+    tts_service: TTSService,
+    session_id: int,
+    chunks: list[str],
+    delay_s: float,
+) -> list[np.ndarray]:
+    audio_chunks: list[np.ndarray] = []
+    for chunk in chunks:
+        for audio_chunk, _, _ in tts_service.generate_stream([chunk], session_id=session_id):
+            audio_chunks.append(audio_chunk)
+        if delay_s > 0:
+            time.sleep(delay_s)
+    return audio_chunks
+
+
+def _run_interleaved(
+    llm_iter,
+    tts_service: TTSService,
+    session_id: int,
+    delay_s: float,
+):
+    chunker = StreamingTTSChunker()
+    audio_chunks: list[np.ndarray] = []
+    tokens: list[str] = []
+    chunks: list[str] = []
+
+    for token in llm_iter:
+        tokens.append(token)
+        for chunk in chunker.push_token(token):
+            chunks.append(chunk)
+            audio_chunks.extend(
+                _stream_chunks(tts_service, session_id, [chunk], delay_s)
+            )
+
+    for chunk in chunker.finalize():
+        chunks.append(chunk)
+        audio_chunks.extend(
+            _stream_chunks(tts_service, session_id, [chunk], delay_s)
+        )
+
+    return tokens, chunks, audio_chunks
+
+
+def _run_deferred(
+    llm_iter,
+    tts_service: TTSService,
+    session_id: int,
+    delay_s: float,
+):
+    tokens = list(llm_iter)
+    chunker = StreamingTTSChunker()
+    chunks: list[str] = []
+    for token in tokens:
+        chunks.extend(chunker.push_token(token))
+    chunks.extend(chunker.finalize())
+
+    audio_chunks = _stream_chunks(tts_service, session_id, chunks, delay_s)
+    return tokens, chunks, audio_chunks
+
+
+def _run_queued(
+    llm_iter,
+    tts_service: TTSService,
+    session_id: int,
+    delay_s: float,
+):
+    chunker = StreamingTTSChunker()
+    tokens: list[str] = []
+    chunks: list[str] = []
+    audio_chunks: list[np.ndarray] = []
+    chunk_queue: "queue.Queue" = queue.Queue()
+
+    def producer():
+        for token in llm_iter:
+            tokens.append(token)
+            for chunk in chunker.push_token(token):
+                chunks.append(chunk)
+                chunk_queue.put(chunk)
+        for chunk in chunker.finalize():
+            chunks.append(chunk)
+            chunk_queue.put(chunk)
+        chunk_queue.put(_SENTINEL)
+
+    def consumer():
+        while True:
+            item = chunk_queue.get()
+            if item is _SENTINEL:
+                break
+            audio_chunks.extend(
+                _stream_chunks(tts_service, session_id, [item], delay_s)
+            )
+
+    producer_thread = threading.Thread(target=producer, daemon=True)
+    consumer_thread = threading.Thread(target=consumer, daemon=True)
+    producer_thread.start()
+    consumer_thread.start()
+    producer_thread.join()
+    consumer_thread.join()
+
+    return tokens, chunks, audio_chunks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stream LLM tokens into TTS and save audio")
     parser.add_argument("--text", default="გამარჯობა", help="User prompt for LLM")
@@ -78,6 +185,18 @@ def main() -> None:
     parser.add_argument("--compare-full", action="store_true", help="Also synthesize using full-text chunks")
     parser.add_argument("--tokens-out", default="llm_tokens.txt", help="Path to save LLM tokens")
     parser.add_argument("--chunks-out", default="tts_chunks.txt", help="Path to save TTS chunks")
+    parser.add_argument(
+        "--mode",
+        choices=["interleaved", "deferred", "queued"],
+        default="interleaved",
+        help="How to feed LLM tokens into TTS",
+    )
+    parser.add_argument(
+        "--delay-ms",
+        type=float,
+        default=0.0,
+        help="Optional delay between streamed chunks",
+    )
     args = parser.parse_args()
 
     config = load_config()
@@ -97,23 +216,22 @@ def main() -> None:
     if not session.initialize():
         raise SystemExit("Failed to initialize TTS session")
 
-    chunker = StreamingTTSChunker()
-    audio_chunks = []
-    tokens = []
-    chunks = []
+    delay_s = max(args.delay_ms, 0.0) / 1000.0
+    llm_iter = triton.llm.generate_stream(prompt)
 
     try:
-        for token in triton.llm.generate_stream(prompt):
-            tokens.append(token)
-            for chunk in chunker.push_token(token):
-                chunks.append(chunk)
-                for audio, _, _ in tts_service.generate_stream([chunk], session_id=session.session_id):
-                    audio_chunks.append(audio)
-
-        for chunk in chunker.finalize():
-            chunks.append(chunk)
-            for audio, _, _ in tts_service.generate_stream([chunk], session_id=session.session_id):
-                audio_chunks.append(audio)
+        if args.mode == "interleaved":
+            tokens, chunks, audio_chunks = _run_interleaved(
+                llm_iter, tts_service, session.session_id, delay_s
+            )
+        elif args.mode == "deferred":
+            tokens, chunks, audio_chunks = _run_deferred(
+                llm_iter, tts_service, session.session_id, delay_s
+            )
+        else:
+            tokens, chunks, audio_chunks = _run_queued(
+                llm_iter, tts_service, session.session_id, delay_s
+            )
     finally:
         session.close()
 
@@ -123,7 +241,10 @@ def main() -> None:
     audio = np.concatenate(audio_chunks)
     rms = float(np.sqrt(np.mean(audio ** 2)))
     duration = audio.size / float(config.tts.sample_rate)
-    print(f"tokens={len(tokens)} chunks={len(chunks)} frames={len(audio_chunks)}")
+    print(
+        f"mode={args.mode} delay_ms={args.delay_ms:.1f} "
+        f"tokens={len(tokens)} chunks={len(chunks)} frames={len(audio_chunks)}"
+    )
     print(f"samples={audio.size} duration_s={duration:.3f} rms={rms:.6f}")
     frame_diff_stats = analyze_frame_diffs(audio_chunks)
     if frame_diff_stats:
@@ -168,8 +289,11 @@ def main() -> None:
         audio_full_chunks = []
         try:
             for chunk in expected_chunks:
-                for audio, _, _ in tts_service.generate_stream([chunk], session_id=session_full.session_id):
-                    audio_full_chunks.append(audio)
+                for audio_chunk, _, _ in tts_service.generate_stream(
+                    [chunk],
+                    session_id=session_full.session_id,
+                ):
+                    audio_full_chunks.append(audio_chunk)
         finally:
             session_full.close()
 

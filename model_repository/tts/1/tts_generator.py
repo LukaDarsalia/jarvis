@@ -175,13 +175,13 @@ class ORTDepthDecoder:
         self.bb_buf.copy_(h_last)
         self.cache_pos.fill_(int(pos))
         self._set_mask_for_pos(pos)
-
+        torch.cuda.synchronize()
         if hasattr(self.io, "synchronize_inputs"):
             self.io.synchronize_inputs()
         self.sess.run_with_iobinding(self.io)
         if hasattr(self.io, "synchronize_outputs"):
             self.io.synchronize_outputs()
-
+        torch.cuda.synchronize()
         for i in range(2 * self.L):
             self.past[i].copy_(self.present[i][:, :, 1:, :])
 
@@ -347,13 +347,13 @@ class ORTBackbonePastN:
         self.embed_buf.copy_(inputs_embeds)
         self.cache_pos.fill_(int(pos))
         self._set_mask_for_pos(pos)
-
+        torch.cuda.synchronize()
         if hasattr(self.io, "synchronize_inputs"):
             self.io.synchronize_inputs()
         self.sess.run_with_iobinding(self.io)
         if hasattr(self.io, "synchronize_outputs"):
             self.io.synchronize_outputs()
-
+        torch.cuda.synchronize()
         idx = int(pos) % self.past_len
         for i in range(2 * self.L):
             self.past[i][:, :, idx:idx + 1, :].copy_(self.new_kv[i])

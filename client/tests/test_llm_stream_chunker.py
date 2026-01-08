@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from streaming_chunker import StreamingTTSChunker
+from streaming_chunker import StreamingTTSChunker, split_text_for_streaming
 
 
 def collect_chunks(tokens):
@@ -64,6 +64,15 @@ class TestLLMStreamChunker(unittest.TestCase):
             collect_chunks(tokens),
             ["დღეს თბილისში ძალიან", " ცხელია", " და", " მგონი", " წვიმს", "", ""],
         )
+
+    def test_llm_style_georgian_tokens_match_full_split(self):
+        tokens = [
+            "გამარჯობა! ", "როგორ ", "შემიძლია ", "დაგეხმაროთ? ", "თუ ",
+            "გაქვთ ", "შეკითხვები ", "თიბისი ", "ბანკთან ", "დაკავშირებით, ",
+            "მე ", "მზად ", "ვარ ", "გიპასუხოთ. ", "რა ", "გაინტერესებთ?",
+        ]
+        expected = split_text_for_streaming("".join(tokens).strip())
+        self.assertEqual(collect_chunks(tokens), expected)
 
 
 if __name__ == "__main__":

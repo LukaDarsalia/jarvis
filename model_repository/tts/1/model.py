@@ -53,7 +53,6 @@ class TritonPythonModel:
                 reference_audio_path="/local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav",
                 reference_json_path="/local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
             )
-            self._sent_audio_len: Dict[int, int] = {}
 
             pb_utils.Logger.log_info("TTS Triton model initialized")
 
@@ -160,7 +159,6 @@ class TritonPythonModel:
             self._send_final(sender)
             if not is_initialized:
                 raise RuntimeError(f"[Seq {seq_id}] Failed to start session: max concurrent reached")
-            self._sent_audio_len[seq_id] = 0
             pb_utils.Logger.log_info(f"[Seq {seq_id}] Cache initialized successfully")
             return
 
@@ -168,7 +166,6 @@ class TritonPythonModel:
         if is_end:
             pb_utils.Logger.log_info(f"[Seq {seq_id}] Session successfully ended!")
             self.tts_generator.end_session(seq_id)
-            self._sent_audio_len.pop(seq_id, None)
             self._send_final(sender)
             return
 
@@ -180,8 +177,6 @@ class TritonPythonModel:
 
         # Processes one word audio
         # If model loops and never returns eos token, max_steps will stop it!
-        sent_audio_len = self._sent_audio_len.get(seq_id, 0)
-        pending_audio = np.zeros((0,), dtype=np.float32)
         for cur_step in range(self.config.max_steps):
             is_complete = self.tts_generator.step_session(
                 seq_id,
@@ -206,27 +201,12 @@ class TritonPythonModel:
             # Chunk length = 1920 @ 24k scaled by target_sr
             chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
 
-            if audio_np.size <= sent_audio_len:
-                if is_complete:
-                    break
-                continue
-
-            delta = audio_np[sent_audio_len:]
-            sent_audio_len = audio_np.size
-            if delta.size > 0:
-                pending_audio = (
-                    delta.astype(np.float32)
-                    if pending_audio.size == 0
-                    else np.concatenate([pending_audio, delta.astype(np.float32)])
-                )
-
-            while pending_audio.size >= chunk_len:
-                chunk_np = pending_audio[:chunk_len].astype(np.float32)
-                pending_audio = pending_audio[chunk_len:]
-                audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
-                sender.send(pb_utils.InferenceResponse(
-                    output_tensors=[audio_tensor]
-                ))
+            # stream last chunk_len samples
+            chunk_np = audio_np[-chunk_len:].astype(np.float32)
+            audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
+            sender.send(pb_utils.InferenceResponse(
+                output_tensors=[audio_tensor]
+            ))
 
             # Means model returned eos token
             if is_complete:
@@ -235,14 +215,6 @@ class TritonPythonModel:
             # Means max_steps stopped the process. Because of that, we must increase word pointer
             if cur_step == self.config.max_steps - 1:
                 self.tts_generator.increment_state_counter(seq_id)
-
-        if pending_audio.size > 0:
-            audio_tensor = pb_utils.Tensor("AUDIO_FRAME", pending_audio.astype(np.float32))
-            sender.send(pb_utils.InferenceResponse(
-                output_tensors=[audio_tensor]
-            ))
-
-        self._sent_audio_len[seq_id] = sent_audio_len
 
         # Ends streaming
         self._send_final(sender)

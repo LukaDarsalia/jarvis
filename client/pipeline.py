@@ -192,11 +192,14 @@ class AVPipeline:
             # Internal queues
             audio_frame_queue: Queue = Queue()  # Audio frames for sending
             musetalk_queue: Queue = Queue()      # Audio for MuseTalk processing
+            video_frame_queue: Queue = Queue()   # Video frames for late delivery
 
             # Video frame cache: frame_index -> jpeg_bytes
             video_cache: Dict[int, bytes] = {}
             video_lock = threading.Lock()
             video_done = threading.Event()
+            sent_lock = threading.Lock()
+            sent_video_indices: set[int] = set()
 
             # State
             frame_index = base_frame_index
@@ -406,6 +409,7 @@ class AVPipeline:
                             frames_generated += 1
                             with video_lock:
                                 video_cache[frame_idx] = frame_bytes
+                            video_frame_queue.put((frame_idx, frame_bytes))
 
                         # Update next frame index
                         next_frame_index = process_start_index + frames_generated
@@ -431,6 +435,7 @@ class AVPipeline:
                     report_error(f"MuseTalk worker error: {exc}")
                 finally:
                     video_done.set()
+                    video_frame_queue.put(None)
 
             # ----------------------------------------------------------------
             # AV Sender - pairs audio+video and sends immediately
@@ -466,6 +471,9 @@ class AVPipeline:
                             video_bytes = last_video_frame
                         else:
                             last_video_frame = video_bytes
+                            if video_enabled:
+                                with sent_lock:
+                                    sent_video_indices.add(frame.index)
 
                         # Create and send AV frame immediately
                         av_frame = AVFrame(
@@ -501,7 +509,40 @@ class AVPipeline:
 
                 finally:
                     result.total_audio_ms = (total_audio_samples / self._sample_rate) * 1000
-                    report_done()
+
+            def video_sender() -> None:
+                if not video_enabled:
+                    return
+
+                try:
+                    while True:
+                        item = video_frame_queue.get()
+                        if item is None:
+                            break
+                        frame_idx, frame_bytes = item
+                        with sent_lock:
+                            video_sent = frame_idx in sent_video_indices
+                        if video_sent:
+                            continue
+                        with video_lock:
+                            video_cache.pop(frame_idx, None)
+                        with sent_lock:
+                            sent_video_indices.add(frame_idx)
+                        av_frame = AVFrame(
+                            frame_index=frame_idx,
+                            audio_samples=np.zeros((0,), dtype=np.float32),
+                            video_jpeg=frame_bytes,
+                            word="",
+                            timestamp_ms=(frame_idx - base_frame_index) * 40.0,
+                            metrics=None,
+                        )
+                        report_frame(av_frame)
+
+                except Exception as exc:
+                    logger.error(f"Video sender error: {exc}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    report_error(f"Video sender error: {exc}")
 
             # ----------------------------------------------------------------
             # Run workers
@@ -510,12 +551,15 @@ class AVPipeline:
                 threading.Thread(target=tts_worker, name="tts-worker", daemon=True),
                 threading.Thread(target=musetalk_worker, name="musetalk-worker", daemon=True),
                 threading.Thread(target=av_sender, name="av-sender", daemon=True),
+                threading.Thread(target=video_sender, name="video-sender", daemon=True),
             ]
 
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
+
+            report_done()
 
         # Start the runner in a thread pool
         runner_future = loop.run_in_executor(None, runner)
