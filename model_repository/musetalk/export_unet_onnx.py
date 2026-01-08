@@ -111,6 +111,7 @@ def main() -> None:
         args.output,
         export_params=True,
         opset_version=18,
+        dynamo=False,
         do_constant_folding=True,
         input_names=["sample", "timestep", "encoder_hidden_states"],
         output_names=["output"],

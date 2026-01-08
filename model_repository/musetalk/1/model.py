@@ -154,6 +154,7 @@ class TritonPythonModel:
         self.unet_onnx_session = None
         self.unet_onnx_dtype = None
         self.unet_onnx_timestep = None
+        self.unet_onnx_batch = None
 
         if self.config.use_onnx_unet:
             try:
@@ -177,6 +178,10 @@ class TritonPythonModel:
                     self.unet_onnx_dtype = np.float16
                 else:
                     self.unet_onnx_dtype = np.float32
+                input_shape = self.unet_onnx_session.get_inputs()[0].shape
+                if isinstance(input_shape, list) and input_shape:
+                    if isinstance(input_shape[0], int):
+                        self.unet_onnx_batch = input_shape[0]
                 self.unet_onnx_timestep = np.array([0], dtype=np.int64)
             except Exception as exc:
                 pb_utils.Logger.log_error(f"Failed to initialize UNet ONNX: {exc}")
@@ -283,20 +288,54 @@ class TritonPythonModel:
     ) -> torch.Tensor:
         if self.unet_onnx_session is None:
             raise RuntimeError("UNet ONNX session is not initialized")
-        sample = latent_batch.detach().cpu().numpy()
-        encoder = audio_feature_batch.detach().cpu().numpy()
-        if self.unet_onnx_dtype is not None:
-            sample = sample.astype(self.unet_onnx_dtype)
-            encoder = encoder.astype(self.unet_onnx_dtype)
-        outputs = self.unet_onnx_session.run(
-            None,
-            {
-                "sample": sample,
-                "timestep": self.unet_onnx_timestep,
-                "encoder_hidden_states": encoder,
-            },
-        )
-        return torch.from_numpy(outputs[0]).to(self.device)
+        batch_size = int(latent_batch.shape[0])
+        expected = self.unet_onnx_batch
+
+        def run_once(sample_t: torch.Tensor, encoder_t: torch.Tensor) -> torch.Tensor:
+            sample = sample_t.detach().cpu().numpy()
+            encoder = encoder_t.detach().cpu().numpy()
+            if self.unet_onnx_dtype is not None:
+                sample = sample.astype(self.unet_onnx_dtype)
+                encoder = encoder.astype(self.unet_onnx_dtype)
+            outputs = self.unet_onnx_session.run(
+                None,
+                {
+                    "sample": sample,
+                    "timestep": self.unet_onnx_timestep,
+                    "encoder_hidden_states": encoder,
+                },
+            )
+            return torch.from_numpy(outputs[0]).to(self.device)
+
+        if expected is None or expected == batch_size:
+            return run_once(latent_batch, audio_feature_batch)
+
+        if expected <= 0:
+            raise RuntimeError(f"Invalid UNet ONNX batch size: {expected}")
+
+        outputs = []
+        for start in range(0, batch_size, expected):
+            end = min(start + expected, batch_size)
+            sample_chunk = latent_batch[start:end]
+            encoder_chunk = audio_feature_batch[start:end]
+            if end - start < expected:
+                pad = expected - (end - start)
+                sample_pad = torch.zeros(
+                    (pad,) + tuple(sample_chunk.shape[1:]),
+                    device=sample_chunk.device,
+                    dtype=sample_chunk.dtype,
+                )
+                encoder_pad = torch.zeros(
+                    (pad,) + tuple(encoder_chunk.shape[1:]),
+                    device=encoder_chunk.device,
+                    dtype=encoder_chunk.dtype,
+                )
+                sample_chunk = torch.cat([sample_chunk, sample_pad], dim=0)
+                encoder_chunk = torch.cat([encoder_chunk, encoder_pad], dim=0)
+            out_chunk = run_once(sample_chunk, encoder_chunk)
+            outputs.append(out_chunk[: end - start])
+
+        return torch.cat(outputs, dim=0)
     
     def _send_frame(self, sender, frame_data: np.ndarray, frame_index: int, timestamp_ms: float, is_final: bool = False):
         """Send a video frame response"""
