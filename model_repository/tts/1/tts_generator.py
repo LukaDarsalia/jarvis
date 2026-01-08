@@ -893,7 +893,6 @@ class TTSGenerator:
                     continue
 
                 audio_codes = torch.cat(frames[-2:], dim=0)
-                print(audio_codes.shape)
                 audio_24k = self._decode_audio(audio_codes)
                 if audio_24k is None:
                     continue
