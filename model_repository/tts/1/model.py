@@ -175,46 +175,22 @@ class TritonPythonModel:
             self._send_final(sender)
             raise RuntimeError(f"[Seq {seq_id}] session is not active!")
 
-        # Processes one word audio
-        # If model loops and never returns eos token, max_steps will stop it!
-        for cur_step in range(self.config.max_steps):
-            is_complete = self.tts_generator.step_session(
-                seq_id,
-                max_steps=1,
-                temperature=temperature,
-                topp=topp,
-                depth_temperature=depth_temperature,
-                depth_topp=depth_topp
-            )
-
-            # Get all codes so far
-            codes = self.tts_generator.get_session_audio(seq_id, return_codes=True)
-            if codes is None:
+        chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
+        for chunk_np in self.tts_generator.stream_session_audio(
+            session_id=seq_id,
+            chunk_len=chunk_len,
+            max_steps=self.config.max_steps,
+            temperature=temperature,
+            topp=topp,
+            depth_temperature=depth_temperature,
+            depth_topp=depth_topp,
+        ):
+            if chunk_np.size == 0:
                 continue
-
-            # Decode full audio from all codes
-            audio_24k = self.tts_generator._decode_audio(codes)
-            audio_24k = audio_24k.cpu().float()
-
-            audio_np = audio_24k.numpy()
-
-            # Chunk length = 1920 @ 24k scaled by target_sr
-            chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
-
-            # stream last chunk_len samples
-            chunk_np = audio_np[-chunk_len:].astype(np.float32)
             audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
             sender.send(pb_utils.InferenceResponse(
                 output_tensors=[audio_tensor]
             ))
-
-            # Means model returned eos token
-            if is_complete:
-                break
-
-            # Means max_steps stopped the process. Because of that, we must increase word pointer
-            if cur_step == self.config.max_steps - 1:
-                self.tts_generator.increment_state_counter(seq_id)
 
         # Ends streaming
         self._send_final(sender)

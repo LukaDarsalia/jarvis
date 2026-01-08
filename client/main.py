@@ -118,5 +118,5 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
-    os.environ.setdefault("TRITON_URL", "185.151.171.35:54757")
+    os.environ.setdefault("TRITON_URL", "185.151.171.35:44957")
     uvicorn.run(app, host="0.0.0.0", port=8080)

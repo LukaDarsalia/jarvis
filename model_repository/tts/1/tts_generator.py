@@ -2,7 +2,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Generator
 from pathlib import Path
 import numpy as np
 import onnxruntime as ort
@@ -789,6 +789,125 @@ class TTSGenerator:
         )
         return is_complete
 
+    def stream_session_audio(
+        self,
+        session_id: int,
+        chunk_len: int,
+        max_steps: int,
+        temperature: Optional[float] = None,
+        topp: Optional[float] = None,
+        depth_temperature: Optional[float] = None,
+        depth_topp: Optional[float] = None,
+    ) -> Generator[np.ndarray, None, None]:
+        """
+        Yield audio chunks for the queued text in a session.
+
+        This runs the generation loop internally and emits the latest chunk
+        after each newly generated frame.
+
+        Assumes exclusive access to the session while streaming.
+        """
+        if chunk_len <= 0:
+            return
+
+        with self.session_lock:
+            state = self.sessions.get(session_id)
+        if state is None:
+            return
+
+        if temperature is not None:
+            self.temperature = temperature
+        if topp is not None:
+            self.top_p = topp
+        if depth_temperature is not None:
+            self.decoder_temperature = depth_temperature
+        if depth_topp is not None:
+            self.decoder_top_p = depth_topp
+
+        steps_for_chunk = 0
+
+        with torch.no_grad():
+            while True:
+                frames = None
+                state.last_activity_time = time.time()
+
+                if not state.has_active_text:
+                    if state.counter < len(state.input_queue):
+                        inject_inputs = state.input_queue[state.counter]
+                        inject_embeds = self.text_embed(inject_inputs["input_ids"])
+                        for i in range(inject_embeds.shape[1]):
+                            token_embed = inject_embeds[:, i:i + 1, :]
+                            ort_logits, h_last = state.ort_bb.step(
+                                token_embed,
+                                pos=state.seq_len,
+                            )
+                            state.seq_len += 1
+                            state.logits_next = ort_logits[:, 0, :]
+                            state.h_last = h_last
+                        state.has_active_text = True
+                        state.cur_step = 0
+                        state.counter += 1
+                        steps_for_chunk = 0
+                    else:
+                        return
+                else:
+                    c0 = self.sample_from_logits(
+                        state.logits_next,
+                        method="nucleus",
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                    )
+                    c0_1d = c0.view(-1).to(torch.long)
+                    reached_eos = (c0_1d == state.eos.view(-1)).any()
+
+                    if bool(reached_eos):
+                        state.has_active_text = False
+                        state.cur_step = 0
+                        steps_for_chunk = 0
+                    else:
+                        frame = state.ort_dd.generate_frame(
+                            c0=c0_1d,
+                            h_last=state.h_last,
+                            method="nucleus",
+                            temperature=self.decoder_temperature,
+                            top_p=self.decoder_top_p,
+                        )
+                        state.frames.append(frame)
+
+                        frame_3d = frame.unsqueeze(1)  # [B,1,C]
+                        audio_embeds = self.audio_embed(frame_3d)
+                        ort_logits, h_last = state.ort_bb.step(audio_embeds, pos=state.seq_len)
+                        state.seq_len += 1
+                        state.logits_next = ort_logits[:, 0, :]
+                        state.h_last = h_last
+
+                        state.cur_step += 1
+                        steps_for_chunk += 1
+
+                        frames = state.frames
+
+                if (not state.has_active_text) and (state.counter >= len(state.input_queue)):
+                    return
+
+                if frames is None:
+                    continue
+
+                audio_codes = torch.cat(frames, dim=0)
+                audio_24k = self._decode_audio(audio_codes)
+                if audio_24k is None:
+                    continue
+                audio_np = audio_24k.detach().cpu().float().numpy()
+                if audio_np.size == 0:
+                    continue
+
+                chunk_np = audio_np[-chunk_len:].astype(np.float32)
+                yield chunk_np
+
+                if max_steps > 0 and steps_for_chunk >= max_steps and state.has_active_text:
+                    state.has_active_text = False
+                    state.cur_step = 0
+                    steps_for_chunk = 0
+
     def increment_state_counter(self, session_id: int) -> bool:
         """
         Force the current text chunk to finish and allow the next one to inject.
@@ -935,7 +1054,6 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         start_time = time.perf_counter()
         first_chunk_time = None
-        prev_audio_len = 0
 
         print(f"\n[Turn {turn_idx}] {text}")
 
@@ -944,37 +1062,17 @@ if __name__ == "__main__":
             if not appended:
                 raise RuntimeError(f"Failed to append text for session {seq_id}.")
 
-            for cur_step in range(config.max_steps):
-                is_complete = tts_generator.step_session(seq_id, max_steps=1)
-
-                codes = tts_generator.get_session_audio(seq_id, return_codes=True)
-                if codes is None:
-                    continue
-
-                audio_24k = tts_generator._decode_audio(codes)
-                audio_24k = audio_24k.cpu().float()
-                audio_np = audio_24k.numpy()
-                if audio_np.size == 0:
-                    continue
-
+            for _chunk in tts_generator.stream_session_audio(
+                session_id=seq_id,
+                chunk_len=chunk_len,
+                max_steps=config.max_steps,
+                temperature=config.temperature,
+                topp=config.top_p,
+                depth_temperature=config.decoder_temperature,
+                depth_topp=config.decoder_top_p,
+            ):
                 if first_chunk_time is None:
                     first_chunk_time = time.perf_counter() - start_time
-
-                if audio_np.size > prev_audio_len:
-                    chunk_np = audio_np[-chunk_len:].astype(np.float32)
-                    audio_ms = (audio_np.size / output_sample_rate) * 1000.0
-                    chunk_ms = (chunk_np.size / output_sample_rate) * 1000.0
-                    # print(
-                    #     f"[Turn {turn_idx}][Chunk {chunk_idx}][Step {cur_step + 1}] "
-                    #     f"audio={audio_ms:.1f}ms last_chunk={chunk_ms:.1f}ms"
-                    # )
-                    prev_audio_len = audio_np.size
-
-                if is_complete:
-                    break
-
-            if cur_step == config.max_steps - 1 and not is_complete:
-                tts_generator.increment_state_counter(seq_id)
 
         torch.cuda.synchronize()
         gen_time = time.perf_counter() - start_time
