@@ -490,7 +490,7 @@ class TritonPythonModel:
                 
                 frame_data = {
                     'bbox': self.avatar_data['coord_list_cycle'][cycle_idx],
-                    'ori_frame': copy.deepcopy(self.avatar_data['frame_list_cycle'][cycle_idx]),
+                    'ori_frame': self.avatar_data['frame_list_cycle'][cycle_idx],
                     'mask': self.avatar_data['mask_list_cycle'][cycle_idx],
                     'mask_coords': self.avatar_data['mask_coords_list_cycle'][cycle_idx],
                 }

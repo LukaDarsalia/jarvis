@@ -340,9 +340,9 @@ class AVPipeline:
                     return
 
                 # Batch audio for efficient MuseTalk processing
-                # 480ms = 12 frames minimum for good quality
-                min_audio_samples = int(0.48 * self._sample_rate)
-                max_audio_samples = int(2.0 * self._sample_rate)  # 2 seconds max
+                # 240ms = 6 frames minimum for lower latency
+                min_audio_samples = int(0.24 * self._sample_rate)
+                max_audio_samples = int(1.0 * self._sample_rate)  # 1 second max
 
                 audio_buffer = np.zeros((0,), dtype=np.float32)
                 frame_buffer: List[AudioFrame] = []
