@@ -50,7 +50,7 @@ class MuseTalkConfig:
     unet_onnx_path: str = "/local_models/musetalk_model/musetalkV15/unet.onnx"
     use_onnx_unet: bool = True
     fps: int = 25
-    batch_size: int = 4
+    batch_size: int = 8
     audio_padding_length_left: int = 2
     audio_padding_length_right: int = 2
     input_sample_rate: int = 24000
@@ -433,6 +433,7 @@ class TritonPythonModel:
         self,
         whisper_chunks: torch.Tensor,
         start_frame_index: int,
+        skip_factor: int = 1,
         stats: Optional[Dict[str, float]] = None,
     ) -> List[tuple]:
         """
@@ -441,6 +442,7 @@ class TritonPythonModel:
         Args:
             whisper_chunks: Whisper audio features [num_frames, ...]
             start_frame_index: Starting frame index in avatar cycle (for video continuity)
+            skip_factor: Generate every Nth frame (1=all, 2=half, etc.)
         
         Returns:
             List of (frame_data, frame_index, timestamp_ms) tuples
@@ -449,24 +451,33 @@ class TritonPythonModel:
         if num_frames == 0:
             return []
         
+        # Apply frame skipping - select which frames to generate
+        skip_factor = max(1, skip_factor)
+        frame_indices_to_generate = list(range(0, num_frames, skip_factor))
+        
+        # Always include the last frame for smooth transitions
+        if frame_indices_to_generate[-1] != num_frames - 1:
+            frame_indices_to_generate.append(num_frames - 1)
+        
         results = []
         if stats is not None:
             stats.setdefault("unet_ms", 0.0)
             stats.setdefault("vae_ms", 0.0)
             stats.setdefault("blend_ms", 0.0)
         
-        # Process in batches
-        for batch_start in range(0, num_frames, self.config.batch_size):
-            batch_end = min(batch_start + self.config.batch_size, num_frames)
+        # Process selected frames in batches
+        for batch_start_idx in range(0, len(frame_indices_to_generate), self.config.batch_size):
+            batch_end_idx = min(batch_start_idx + self.config.batch_size, len(frame_indices_to_generate))
+            batch_frame_indices = frame_indices_to_generate[batch_start_idx:batch_end_idx]
             
-            # Get whisper features for batch
-            whisper_batch = whisper_chunks[batch_start:batch_end]
+            # Get whisper features for selected frames
+            whisper_batch = whisper_chunks[batch_frame_indices]
             
-            # Get latents for batch (use start_frame_index for avatar cycle position)
+            # Get latents for batch (use actual frame indices for avatar cycle position)
             latent_batch = []
-            for i in range(batch_start, batch_end):
+            for frame_num in batch_frame_indices:
                 # Cycle through avatar frames starting from start_frame_index
-                cycle_idx = (start_frame_index + i) % self.num_avatar_frames
+                cycle_idx = (start_frame_index + frame_num) % self.num_avatar_frames
                 latent_batch.append(self.avatar_data['input_latent_list_cycle'][cycle_idx])
             latent_batch = torch.cat(latent_batch, dim=0)
             
@@ -494,7 +505,7 @@ class TritonPythonModel:
 
             # Blend each frame
             for i, res_frame in enumerate(recon):
-                frame_num = batch_start + i
+                frame_num = batch_frame_indices[i]  # Use actual frame index
                 cycle_idx = (start_frame_index + frame_num) % self.num_avatar_frames
                 
                 frame_data = {
@@ -522,7 +533,7 @@ class TritonPythonModel:
                     combine_frame = np.array(combine_frame)
                 combine_frame = np.ascontiguousarray(combine_frame, dtype=np.uint8)
                 
-                # Output frame index continues from start_frame_index
+                # Output frame index uses actual frame position for correct timing
                 output_frame_idx = start_frame_index + frame_num
                 timestamp_ms = frame_num * (1000.0 / self.config.fps)
                 
@@ -543,6 +554,8 @@ class TritonPythonModel:
             # Get inputs
             audio = self._get_audio_input(request)
             frame_index = self._get_int_input(request, "FRAME_INDEX", 0)
+            skip_factor = self._get_int_input(request, "SKIP_FACTOR", 1)
+            skip_factor = max(1, min(skip_factor, 5))  # Clamp to 1-5
             
             if audio is None or len(audio) == 0:
                 pb_utils.Logger.log_error("AUDIO input is required and must not be empty")
@@ -564,9 +577,9 @@ class TritonPythonModel:
             
             chunk_count = len(whisper_chunks)
 
-            # Generate all frames
+            # Generate frames (with optional skipping for adaptive FPS)
             stats: Dict[str, float] = {}
-            frames = self._generate_frames(whisper_chunks, frame_index, stats=stats)
+            frames = self._generate_frames(whisper_chunks, frame_index, skip_factor=skip_factor, stats=stats)
             
             if len(frames) == 0:
                 pb_utils.Logger.log_warning("No frames generated")
@@ -574,6 +587,7 @@ class TritonPythonModel:
                 return
             
             frame_count = len(frames)
+            total_possible_frames = chunk_count  # Frames we would generate without skipping
             
             # Send all frames
             for i, (frame_data, frame_idx, timestamp_ms) in enumerate(frames):
@@ -589,10 +603,11 @@ class TritonPythonModel:
             rtf = (total_ms / audio_duration_ms) if audio_duration_ms > 0 else 0.0
             def pct(value: float) -> float:
                 return (value / total_ms * 100.0) if total_ms > 0 else 0.0
+            skip_info = f" | skip={skip_factor}" if skip_factor > 1 else ""
             pb_utils.Logger.log_info(
                 "MuseTalk | rtf=%.3f | total_ms=%.1f | per_frame_ms=%.1f | audio_ms=%.1f | "
                 "whisper_ms=%.1f (%.1f%%) | unet_ms=%.1f (%.1f%%) | vae_ms=%.1f (%.1f%%) | "
-                "blend_ms=%.1f (%.1f%%) | chunks=%d | frames=%d | unet=%s"
+                "blend_ms=%.1f (%.1f%%) | chunks=%d | frames=%d | unet=%s%s"
                 % (
                     rtf,
                     total_ms,
@@ -605,6 +620,7 @@ class TritonPythonModel:
                     chunk_count,
                     frame_count,
                     unet_impl,
+                    skip_info,
                 )
             )
         

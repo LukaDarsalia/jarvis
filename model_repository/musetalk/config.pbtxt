@@ -14,6 +14,15 @@ input [
     data_type: TYPE_INT32
     dims: [1]
     optional: true
+  },
+  {
+    name: "SKIP_FACTOR"
+    data_type: TYPE_INT32
+    dims: [1]
+    optional: true
+    # 1 = generate all frames (25fps)
+    # 2 = skip every other frame (12.5fps effective)
+    # 3 = generate every 3rd frame (8.3fps effective)
   }
 ]
 
@@ -108,7 +117,7 @@ parameters: {
 
 parameters: {
   key: "batch_size"
-  value: { string_value: "4" }
+  value: { string_value: "8" }
 }
 
 parameters: {

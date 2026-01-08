@@ -348,6 +348,14 @@ class AVPipeline:
                 frame_buffer: List[AudioFrame] = []
                 next_frame_index = base_frame_index
                 done = False
+                
+                # Adaptive skip factor tracking
+                musetalk_config = self.config.musetalk_config
+                current_skip_factor = musetalk_config.skip_factor
+                adaptive_skip_enabled = musetalk_config.adaptive_skip
+                lag_threshold_ms = musetalk_config.adaptive_skip_lag_threshold_ms
+                last_generation_end_time: Optional[float] = None
+                cumulative_lag_ms = 0.0
 
                 try:
                     while is_generating() or not done:
@@ -384,30 +392,56 @@ class AVPipeline:
                         # Process the accumulated audio
                         process_audio = audio_buffer.copy()
                         process_start_index = next_frame_index
+                        audio_duration_ms = (len(process_audio) / self._sample_rate) * 1000.0
+                        expected_frames = int(len(process_audio) / self._samples_per_frame)
 
                         # Clear buffers
                         audio_buffer = np.zeros((0,), dtype=np.float32)
                         frame_buffer = []
 
+                        # Adaptive skip factor: increase if falling behind
+                        if adaptive_skip_enabled and last_generation_end_time is not None:
+                            # Calculate how much we're lagging behind realtime
+                            time_since_last = (time.time() - last_generation_end_time) * 1000.0
+                            expected_time = audio_duration_ms  # Should take this long in realtime
+                            lag_ms = time_since_last - expected_time
+                            cumulative_lag_ms += lag_ms
+                            
+                            # Adjust skip factor based on cumulative lag
+                            if cumulative_lag_ms > lag_threshold_ms * 3:
+                                current_skip_factor = min(4, current_skip_factor + 1)
+                            elif cumulative_lag_ms > lag_threshold_ms * 2:
+                                current_skip_factor = min(3, max(current_skip_factor, 2))
+                            elif cumulative_lag_ms > lag_threshold_ms:
+                                current_skip_factor = max(2, current_skip_factor)
+                            elif cumulative_lag_ms < 0:
+                                # Catching up, reduce skip factor
+                                current_skip_factor = max(1, current_skip_factor - 1)
+                                cumulative_lag_ms = max(0, cumulative_lag_ms)
+
                         # Generate video frames
                         start_time = time.time()
                         frames_generated = 0
 
+                        skip_info = f", skip={current_skip_factor}" if current_skip_factor > 1 else ""
                         logger.info(
                             f"MuseTalk: Processing {len(process_audio)/self._sample_rate:.3f}s audio "
-                            f"starting at index {process_start_index}"
+                            f"starting at index {process_start_index}{skip_info}"
                         )
 
                         for frame_bytes, frame_idx, _ in self.musetalk_service.generate_frames(
                             process_audio,
                             frame_index=process_start_index,
+                            skip_factor=current_skip_factor,
                         ):
                             frames_generated += 1
                             with video_lock:
                                 video_cache[frame_idx] = frame_bytes
+                        
+                        last_generation_end_time = time.time()
 
-                        # Update next frame index
-                        next_frame_index = process_start_index + frames_generated
+                        # Update next frame index (advance by expected frames, not generated)
+                        next_frame_index = process_start_index + expected_frames
 
                         # Record metrics
                         if frames_generated > 0:
@@ -416,8 +450,9 @@ class AVPipeline:
                                 self.metrics_manager.record_musetalk_generation(
                                     frames_generated, duration
                                 )
+                            lag_info = f", lag={cumulative_lag_ms:.0f}ms" if adaptive_skip_enabled else ""
                             logger.info(
-                                f"MuseTalk: Generated {frames_generated} frames in {duration:.3f}s"
+                                f"MuseTalk: Generated {frames_generated}/{expected_frames} frames in {duration:.3f}s{lag_info}"
                             )
 
                         if done:

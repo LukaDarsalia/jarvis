@@ -222,6 +222,9 @@ async def get_config():
         "musetalk": {
             "start_after_chunks": config.musetalk.start_after_chunks,
             "lookahead_chunks": config.musetalk.lookahead_chunks,
+            "skip_factor": config.musetalk.skip_factor,
+            "adaptive_skip": config.musetalk.adaptive_skip,
+            "adaptive_skip_lag_threshold_ms": config.musetalk.adaptive_skip_lag_threshold_ms,
         },
     }
 
@@ -288,6 +291,18 @@ async def update_config(new_config: dict):
                 config.musetalk.lookahead_chunks = max(0, int(mt_cfg["lookahead_chunks"]))
             except (TypeError, ValueError):
                 logger.warning(f"Ignoring invalid lookahead_chunks: {mt_cfg['lookahead_chunks']}")
+        if "skip_factor" in mt_cfg:
+            try:
+                config.musetalk.skip_factor = max(1, min(5, int(mt_cfg["skip_factor"])))
+            except (TypeError, ValueError):
+                logger.warning(f"Ignoring invalid skip_factor: {mt_cfg['skip_factor']}")
+        if "adaptive_skip" in mt_cfg:
+            config.musetalk.adaptive_skip = bool(mt_cfg["adaptive_skip"])
+        if "adaptive_skip_lag_threshold_ms" in mt_cfg:
+            try:
+                config.musetalk.adaptive_skip_lag_threshold_ms = max(100.0, float(mt_cfg["adaptive_skip_lag_threshold_ms"]))
+            except (TypeError, ValueError):
+                logger.warning(f"Ignoring invalid adaptive_skip_lag_threshold_ms: {mt_cfg['adaptive_skip_lag_threshold_ms']}")
 
     return await get_config()
 
