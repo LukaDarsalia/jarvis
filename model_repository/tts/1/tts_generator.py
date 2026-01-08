@@ -1043,69 +1043,69 @@ if __name__ == "__main__":
     total_audio_samples = 0
     total_gen_time = 0.0
 
-for turn_idx, text in enumerate(assistant_texts, start=1):
-    seq_id = 100 + turn_idx
-    all_chunks = _split_text_for_streaming(text)
+    for turn_idx, text in enumerate(assistant_texts, start=1):
+        seq_id = 100 + turn_idx
+        all_chunks = _split_text_for_streaming(text)
 
-    ok = tts_generator.initialize_session(seq_id, speaker_id=0)
-    if not ok:
-        raise RuntimeError(f"Failed to initialize TTS session {seq_id}.")
+        ok = tts_generator.initialize_session(seq_id, speaker_id=0)
+        if not ok:
+            raise RuntimeError(f"Failed to initialize TTS session {seq_id}.")
 
-    torch.cuda.synchronize()
-    start_time = time.perf_counter()
-    first_chunk_time = None
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        first_chunk_time = None
 
-    print(f"\n[Turn {turn_idx}] {text}")
+        print(f"\n[Turn {turn_idx}] {text}")
 
-    # NEW: collect streamed chunks here (each is length chunk_len)
-    streamed_chunks: List[np.ndarray] = []
+        # NEW: collect streamed chunks here (each is length chunk_len)
+        streamed_chunks: List[np.ndarray] = []
 
-    for chunk_idx, chunk in enumerate(all_chunks, start=1):
-        appended = tts_generator.append_texts(seq_id, [chunk], speaker_id=0)
-        if not appended:
-            raise RuntimeError(f"Failed to append text for session {seq_id}.")
+        for chunk_idx, chunk in enumerate(all_chunks, start=1):
+            appended = tts_generator.append_texts(seq_id, [chunk], speaker_id=0)
+            if not appended:
+                raise RuntimeError(f"Failed to append text for session {seq_id}.")
 
-        for out_chunk in tts_generator.stream_session_audio(
-            session_id=seq_id,
-            chunk_len=chunk_len,
-            max_steps=config.max_steps,
-            temperature=config.temperature,
-            topp=config.top_p,
-            depth_temperature=config.decoder_temperature,
-            depth_topp=config.decoder_top_p,
-        ):
-            if first_chunk_time is None:
-                first_chunk_time = time.perf_counter() - start_time
+            for out_chunk in tts_generator.stream_session_audio(
+                session_id=seq_id,
+                chunk_len=chunk_len,
+                max_steps=config.max_steps,
+                temperature=config.temperature,
+                topp=config.top_p,
+                depth_temperature=config.decoder_temperature,
+                depth_topp=config.decoder_top_p,
+            ):
+                if first_chunk_time is None:
+                    first_chunk_time = time.perf_counter() - start_time
 
-            # NEW: store the chunk
-            streamed_chunks.append(out_chunk)
+                # NEW: store the chunk
+                streamed_chunks.append(out_chunk)
 
-    torch.cuda.synchronize()
-    gen_time = time.perf_counter() - start_time
+        torch.cuda.synchronize()
+        gen_time = time.perf_counter() - start_time
 
-    # NEW: assemble final audio from streamed chunks
-    if not streamed_chunks:
-        raise RuntimeError(f"No audio chunks generated for session {seq_id}.")
+        # NEW: assemble final audio from streamed chunks
+        if not streamed_chunks:
+            raise RuntimeError(f"No audio chunks generated for session {seq_id}.")
 
-    final_audio_np = np.concatenate(streamed_chunks, axis=0).astype(np.float32)
-    final_audio = torch.from_numpy(final_audio_np)  # 1D CPU tensor
+        final_audio_np = np.concatenate(streamed_chunks, axis=0).astype(np.float32)
+        final_audio = torch.from_numpy(final_audio_np)  # 1D CPU tensor
 
-    # Cleanup session state (NOTE: your end_session decodes full audio again, wasteful)
-    _ = tts_generator.end_session(seq_id)  # ignore returned audio, just cleanup
+        # Cleanup session state (NOTE: your end_session decodes full audio again, wasteful)
+        _ = tts_generator.end_session(seq_id)  # ignore returned audio, just cleanup
 
-    audio_samples = final_audio.shape[-1]
-    audio_dur = audio_samples / output_sample_rate
-    rtf = gen_time / max(audio_dur, 1e-9)
+        audio_samples = final_audio.shape[-1]
+        audio_dur = audio_samples / output_sample_rate
+        rtf = gen_time / max(audio_dur, 1e-9)
 
-    total_audio_samples += audio_samples
-    total_gen_time += gen_time
+        total_audio_samples += audio_samples
+        total_gen_time += gen_time
 
-    first_chunk_ms = 0.0 if first_chunk_time is None else first_chunk_time * 1000.0
-    print(f"[Turn {turn_idx}] First output latency: {first_chunk_ms:.1f} ms")
-    print(f"[Turn {turn_idx}] Generation time: {gen_time:.3f} s")
-    print(f"[Turn {turn_idx}] Audio duration: {audio_dur:.3f} s")
-    print(f"[Turn {turn_idx}] RTF: {rtf:.3f}")
+        first_chunk_ms = 0.0 if first_chunk_time is None else first_chunk_time * 1000.0
+        print(f"[Turn {turn_idx}] First output latency: {first_chunk_ms:.1f} ms")
+        print(f"[Turn {turn_idx}] Generation time: {gen_time:.3f} s")
+        print(f"[Turn {turn_idx}] Audio duration: {audio_dur:.3f} s")
+        print(f"[Turn {turn_idx}] RTF: {rtf:.3f}")
 
-    out_path = f"standalone_turn_{turn_idx}.wav"
-    sf.write(out_path, final_audio_np, output_sample_rate)
-    print(f"[Turn {turn_idx}] Saved {out_path}")
+        out_path = f"standalone_turn_{turn_idx}.wav"
+        sf.write(out_path, final_audio_np, output_sample_rate)
+        print(f"[Turn {turn_idx}] Saved {out_path}")
