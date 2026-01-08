@@ -376,7 +376,6 @@ class MuseTalkService(TritonClientBase):
         self,
         audio: np.ndarray,
         frame_index: int = 0,
-        skip_factor: int = 1,
         on_frame: Optional[Callable[[bytes, int, float], None]] = None,
         timeout: float = 60.0,
     ) -> Generator[Tuple[bytes, int, float], None, None]:
@@ -386,7 +385,6 @@ class MuseTalkService(TritonClientBase):
         Args:
             audio: Audio samples at 24kHz as float32
             frame_index: Starting frame index for avatar cycle
-            skip_factor: Generate every Nth frame (1=all, 2=half, etc.)
             on_frame: Optional callback for each frame
             timeout: Timeout for waiting for frames
 
@@ -398,8 +396,7 @@ class MuseTalkService(TritonClientBase):
             return
 
         audio_duration_s = len(audio) / 24000.0
-        skip_info = f", skip_factor={skip_factor}" if skip_factor > 1 else ""
-        logger.info(f"MuseTalk: Processing {audio_duration_s:.3f}s audio, start_frame_index={frame_index}{skip_info}")
+        logger.info(f"MuseTalk: Processing {audio_duration_s:.3f}s audio, start_frame_index={frame_index}")
 
         result_queue: queue.Queue = queue.Queue()
         start_time = time.time()
@@ -422,11 +419,9 @@ class MuseTalkService(TritonClientBase):
             inputs = [
                 grpc_client.InferInput("AUDIO", list(audio.shape), "FP32"),
                 grpc_client.InferInput("FRAME_INDEX", [1], "INT32"),
-                grpc_client.InferInput("SKIP_FACTOR", [1], "INT32"),
             ]
             inputs[0].set_data_from_numpy(audio)
             inputs[1].set_data_from_numpy(np.array([frame_index], dtype=np.int32))
-            inputs[2].set_data_from_numpy(np.array([skip_factor], dtype=np.int32))
 
             outputs = [
                 grpc_client.InferRequestedOutput("VIDEO_FRAME"),

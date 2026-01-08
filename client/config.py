@@ -54,13 +54,6 @@ class MuseTalkConfig:
     lookahead_chunks: int = 2
     # Samples per video frame (24kHz / 25fps = 960 samples per frame)
     samples_per_frame: int = 960
-    # Adaptive frame skipping: 1=all frames, 2=half, 3=third, etc.
-    # Set to 1 to disable, or higher to reduce load when falling behind
-    skip_factor: int = 1
-    # Enable adaptive skip factor based on lag
-    adaptive_skip: bool = True
-    # Lag threshold (ms) to increase skip factor
-    adaptive_skip_lag_threshold_ms: float = 500.0
 
 
 @dataclass
