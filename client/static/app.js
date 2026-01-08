@@ -33,8 +33,8 @@ class VoiceAssistant {
         // Video/Avatar
         this.videoEnabled = false;
         this.idleFrame = null;
-        this.videoFps = 18;
-        this.frameInterval = 1000 / 18;  // ~55.56ms per frame
+        this.videoFps = 25;
+        this.frameInterval = 1000 / 25;  // 40ms per frame at 25 FPS
 
         // Streaming state
         this.isGenerating = false;
