@@ -1109,3 +1109,9 @@ if __name__ == "__main__":
         out_path = f"standalone_turn_{turn_idx}.wav"
         sf.write(out_path, final_audio_np, output_sample_rate)
         print(f"[Turn {turn_idx}] Saved {out_path}")
+
+    total_audio_dur = total_audio_samples / output_sample_rate
+    total_rtf = total_gen_time / max(total_audio_dur, 1e-9)
+    print("\n[Total] Generation time: {:.3f} s".format(total_gen_time))
+    print("[Total] Audio duration: {:.3f} s".format(total_audio_dur))
+    print("[Total] RTF: {:.3f}".format(total_rtf))
