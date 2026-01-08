@@ -45,6 +45,8 @@ class MuseTalkConfig:
     vae_model_path: str = "/local_models/musetalk_model/sd-vae"
     face_parse_resnet_path: str = "/local_models/musetalk_model/face-parse-bisent/resnet18-5c106cde.pth"
     face_parse_model_path: str = "/local_models/musetalk_model/face-parse-bisent/79999_iter.pth"
+    unet_onnx_path: str = "/local_models/musetalk_model/musetalkV15/unet.onnx"
+    use_onnx_unet: bool = True
     fps: int = 25
     batch_size: int = 4
     audio_padding_length_left: int = 2
@@ -75,6 +77,8 @@ class TritonPythonModel:
             self.config.vae_model_path = self._get_param(params, 'vae_model_path', self.config.vae_model_path)
             self.config.face_parse_resnet_path = self._get_param(params, 'face_parse_resnet_path', self.config.face_parse_resnet_path)
             self.config.face_parse_model_path = self._get_param(params, 'face_parse_model_path', self.config.face_parse_model_path)
+            self.config.unet_onnx_path = self._get_param(params, 'unet_onnx_path', self.config.unet_onnx_path)
+            self.config.use_onnx_unet = self._get_bool_param(params, 'use_onnx_unet', self.config.use_onnx_unet)
             self.config.fps = int(self._get_param(params, 'fps', str(self.config.fps)))
             self.config.batch_size = int(self._get_param(params, 'batch_size', str(self.config.batch_size)))
             self.config.audio_padding_length_left = int(self._get_param(params, 'audio_padding_left', str(self.config.audio_padding_length_left)))
@@ -85,6 +89,7 @@ class TritonPythonModel:
             pb_utils.Logger.log_info(f"Avatar root: {self.config.avatar_root}")
             pb_utils.Logger.log_info(f"FPS: {self.config.fps}")
             pb_utils.Logger.log_info(f"Batch size: {self.config.batch_size}")
+            pb_utils.Logger.log_info(f"Use ONNX UNet: {self.config.use_onnx_unet}")
             
             # Load models
             self._load_models()
@@ -110,6 +115,10 @@ class TritonPythonModel:
             value = default
         pb_utils.Logger.log_info(f"Parameter {key}: {value}")
         return value
+
+    def _get_bool_param(self, params, key, default: bool) -> bool:
+        value = self._get_param(params, key, str(default))
+        return str(value).lower() in {"1", "true", "yes", "y", "on"}
     
     def _load_models(self):
         """Load all required models"""
@@ -142,6 +151,38 @@ class TritonPythonModel:
         self.weight_dtype = self.unet.model.dtype
         self.device = device
         self.timesteps = torch.tensor([0], device=device)
+        self.unet_onnx_session = None
+        self.unet_onnx_dtype = None
+        self.unet_onnx_timestep = None
+
+        if self.config.use_onnx_unet:
+            try:
+                import onnxruntime as ort
+
+                available = ort.get_available_providers()
+                providers = []
+                if "CUDAExecutionProvider" in available and self.config.device == "cuda":
+                    providers.append("CUDAExecutionProvider")
+                providers.append("CPUExecutionProvider")
+
+                pb_utils.Logger.log_info(
+                    f"Loading UNet ONNX from {self.config.unet_onnx_path} with providers {providers}"
+                )
+                self.unet_onnx_session = ort.InferenceSession(
+                    self.config.unet_onnx_path,
+                    providers=providers,
+                )
+                input_type = self.unet_onnx_session.get_inputs()[0].type
+                if "float16" in input_type:
+                    self.unet_onnx_dtype = np.float16
+                else:
+                    self.unet_onnx_dtype = np.float32
+                self.unet_onnx_timestep = np.array([0], dtype=np.int64)
+            except Exception as exc:
+                pb_utils.Logger.log_error(f"Failed to initialize UNet ONNX: {exc}")
+                self.unet_onnx_session = None
+                if self.config.use_onnx_unet:
+                    raise
         
         pb_utils.Logger.log_info("Loading Audio Processor...")
         self.audio_processor = AudioProcessor(feature_extractor_path=self.config.whisper_dir)
@@ -234,6 +275,28 @@ class TritonPythonModel:
         if arr.size == 0:
             return None
         return arr.astype(np.float32)
+
+    def _run_unet_onnx(
+        self,
+        latent_batch: torch.Tensor,
+        audio_feature_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.unet_onnx_session is None:
+            raise RuntimeError("UNet ONNX session is not initialized")
+        sample = latent_batch.detach().cpu().numpy()
+        encoder = audio_feature_batch.detach().cpu().numpy()
+        if self.unet_onnx_dtype is not None:
+            sample = sample.astype(self.unet_onnx_dtype)
+            encoder = encoder.astype(self.unet_onnx_dtype)
+        outputs = self.unet_onnx_session.run(
+            None,
+            {
+                "sample": sample,
+                "timestep": self.unet_onnx_timestep,
+                "encoder_hidden_states": encoder,
+            },
+        )
+        return torch.from_numpy(outputs[0]).to(self.device)
     
     def _send_frame(self, sender, frame_data: np.ndarray, frame_index: int, timestamp_ms: float, is_final: bool = False):
         """Send a video frame response"""
@@ -352,12 +415,15 @@ class TritonPythonModel:
             # Forward pass through models
             audio_feature_batch = self.pe(whisper_batch.to(self.device))
             latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
-            
-            pred_latents = self.unet.model(
-                latent_batch,
-                self.timesteps,
-                encoder_hidden_states=audio_feature_batch,
-            ).sample
+
+            if self.unet_onnx_session is not None:
+                pred_latents = self._run_unet_onnx(latent_batch, audio_feature_batch)
+            else:
+                pred_latents = self.unet.model(
+                    latent_batch,
+                    self.timesteps,
+                    encoder_hidden_states=audio_feature_batch,
+                ).sample
             
             pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
             recon = self.vae.decode_latents(pred_latents)

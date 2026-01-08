@@ -57,6 +57,16 @@ parameters: {
 }
 
 parameters: {
+  key: "unet_onnx_path"
+  value: { string_value: "/local_models/musetalk_model/musetalkV15/unet.onnx" }
+}
+
+parameters: {
+  key: "use_onnx_unet"
+  value: { string_value: "true" }
+}
+
+parameters: {
   key: "vae_type"
   value: { string_value: "sd-vae" }
 }
