@@ -541,7 +541,7 @@ class TritonPythonModel:
                 return
             
             audio_duration_s = len(audio) / self.config.input_sample_rate
-            pb_utils.Logger.log_info(f"Processing audio: {audio_duration_s:.3f}s, start_frame_index: {frame_index}")
+            audio_duration_ms = (len(audio) / self.config.input_sample_rate) * 1000.0
             
             # Process audio through Whisper
             whisper_start = time.perf_counter()
@@ -553,7 +553,7 @@ class TritonPythonModel:
                 self._send_final(sender)
                 return
             
-            pb_utils.Logger.log_info(f"Generated {len(whisper_chunks)} whisper chunks")
+            chunk_count = len(whisper_chunks)
 
             # Generate all frames
             stats: Dict[str, float] = {}
@@ -564,7 +564,7 @@ class TritonPythonModel:
                 self._send_final(sender)
                 return
             
-            pb_utils.Logger.log_info(f"Sending {len(frames)} frames")
+            frame_count = len(frames)
             
             # Send all frames
             for i, (frame_data, frame_idx, timestamp_ms) in enumerate(frames):
@@ -575,12 +575,28 @@ class TritonPythonModel:
             unet_ms = stats.get("unet_ms", 0.0)
             vae_ms = stats.get("vae_ms", 0.0)
             blend_ms = stats.get("blend_ms", 0.0)
-            per_frame_ms = total_ms / len(frames) if frames else 0.0
+            per_frame_ms = total_ms / frame_count if frame_count else 0.0
             unet_impl = "onnx" if self.unet_onnx_session is not None else "torch"
+            rtf = (total_ms / audio_duration_ms) if audio_duration_ms > 0 else 0.0
+            def pct(value: float) -> float:
+                return (value / total_ms * 100.0) if total_ms > 0 else 0.0
             pb_utils.Logger.log_info(
-                "MuseTalk timing | total_ms=%.1f per_frame_ms=%.1f whisper_ms=%.1f "
-                "unet_ms=%.1f vae_ms=%.1f blend_ms=%.1f unet_impl=%s frames=%d"
-                % (total_ms, per_frame_ms, whisper_ms, unet_ms, vae_ms, blend_ms, unet_impl, len(frames))
+                "MuseTalk | rtf=%.3f | total_ms=%.1f | per_frame_ms=%.1f | audio_ms=%.1f | "
+                "whisper_ms=%.1f (%.1f%%) | unet_ms=%.1f (%.1f%%) | vae_ms=%.1f (%.1f%%) | "
+                "blend_ms=%.1f (%.1f%%) | chunks=%d | frames=%d | unet=%s"
+                % (
+                    rtf,
+                    total_ms,
+                    per_frame_ms,
+                    audio_duration_ms,
+                    whisper_ms, pct(whisper_ms),
+                    unet_ms, pct(unet_ms),
+                    vae_ms, pct(vae_ms),
+                    blend_ms, pct(blend_ms),
+                    chunk_count,
+                    frame_count,
+                    unet_impl,
+                )
             )
         
         except Exception as e:

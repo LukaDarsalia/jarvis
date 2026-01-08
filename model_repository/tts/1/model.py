@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 import torch
 import triton_python_backend_utils as pb_utils
+import time
 
 from tts_generator import TTSGenerator
 
@@ -169,12 +170,13 @@ class TritonPythonModel:
             self._send_final(sender)
             return
 
-        pb_utils.Logger.log_info(f"Appends intermediate texts: {texts}")
         ok = self.tts_generator.append_texts(seq_id, texts, speaker_id=0)
         if not ok:
             self._send_final(sender)
             raise RuntimeError(f"[Seq {seq_id}] session is not active!")
 
+        start = time.perf_counter()
+        total_samples = 0
         chunk_len = int(self.stream_chunk_duration * float(self.output_sample_rate))
         for chunk_np in self.tts_generator.stream_session_audio(
             session_id=seq_id,
@@ -187,10 +189,19 @@ class TritonPythonModel:
         ):
             if chunk_np.size == 0:
                 continue
+            total_samples += int(chunk_np.size)
             audio_tensor = pb_utils.Tensor("AUDIO_FRAME", chunk_np)
             sender.send(pb_utils.InferenceResponse(
                 output_tensors=[audio_tensor]
             ))
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        audio_ms = (total_samples / float(self.output_sample_rate)) * 1000.0 if total_samples > 0 else 0.0
+        rtf = (elapsed_ms / audio_ms) if audio_ms > 0 else 0.0
+        pb_utils.Logger.log_info(
+            "TTS | rtf=%.3f | total_ms=%.1f | audio_ms=%.1f"
+            % (rtf, elapsed_ms, audio_ms)
+        )
 
         # Ends streaming
         self._send_final(sender)

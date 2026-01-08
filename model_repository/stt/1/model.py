@@ -3,6 +3,7 @@ import torch
 import triton_python_backend_utils as pb_utils
 import nemo.collections.asr as nemo_asr
 import soundfile as sf
+import time
 
 class TritonPythonModel:
 
@@ -28,10 +29,12 @@ class TritonPythonModel:
 
             # NeMo expects a list of file paths OR arrays
             # but transcribe() supports raw waveform via parameter
+            start = time.perf_counter()
             result = self.asr_model.transcribe(
                 audio=[audio],
                 batch_size=1
             )[0]
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
 
             # Handle different return types - NeMo can return Hypothesis object or string
             transcript = result.text
@@ -41,5 +44,6 @@ class TritonPythonModel:
             )
 
             responses.append(pb_utils.InferenceResponse([out_tensor]))
+            pb_utils.Logger.log_info(f"STT | total_ms={elapsed_ms:.1f} | chars={len(transcript)}")
 
         return responses
