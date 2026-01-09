@@ -357,7 +357,15 @@ class AVPipeline:
                 batch_count = 0
 
                 try:
-                    while is_generating() or not done:
+                    while True:
+                        # Check exit conditions first
+                        if done and len(audio_buffer) == 0:
+                            break
+                        if not is_generating() and done:
+                            # Generation stopped and we've processed everything
+                            if len(audio_buffer) == 0:
+                                break
+                        
                         # Collect frames from queue
                         try:
                             frame = musetalk_queue.get(timeout=0.1)
@@ -369,6 +377,9 @@ class AVPipeline:
                         except Empty:
                             if not is_generating() and musetalk_queue.empty():
                                 done = True
+                            # If done with no audio, exit
+                            if done and len(audio_buffer) == 0:
+                                break
 
                         # Decide whether to process
                         should_process = False
@@ -379,6 +390,8 @@ class AVPipeline:
                             # Need at least 200ms (whisper window) for meaningful processing
                             min_tail_samples = whisper_window_samples
                             if len(audio_buffer) < min_tail_samples:
+                                # Not enough audio for meaningful processing, discard and exit
+                                logger.info(f"MuseTalk: Discarding {len(audio_buffer)} samples (< {min_tail_samples} min)")
                                 break
                             should_process = True
                         elif len(audio_buffer) >= max_audio_samples:

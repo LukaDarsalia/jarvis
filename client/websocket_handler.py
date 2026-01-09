@@ -143,6 +143,11 @@ class WebSocketHandler:
         self.config = config
 
         self.active_connections: Dict[str, ConnectionState] = {}
+        
+        # Global last video frame - persists across connections for idle display
+        self._global_last_video_frame: Optional[bytes] = None
+        # Global frame index - continues avatar animation across connections
+        self._global_frame_index: int = 0
 
     async def handle_connection(self, websocket: WebSocket) -> None:
         """Handle a new WebSocket connection."""
@@ -152,6 +157,7 @@ class WebSocketHandler:
         state = ConnectionState(
             websocket=websocket,
             connection_id=connection_id,
+            musetalk_frame_index=self._global_frame_index,  # Continue from global index
         )
         self.active_connections[connection_id] = state
 
@@ -166,7 +172,8 @@ class WebSocketHandler:
 
             # Check MuseTalk availability and get idle frame
             musetalk_available = await self._check_musetalk_available()
-            idle_frame = state.last_video_frame  # Use last frame from previous generation if available
+            # Use global last frame (persists across connections) or connection-specific
+            idle_frame = self._global_last_video_frame or state.last_video_frame
 
             # Only fetch initial idle frame if we don't have one from a previous generation
             if musetalk_available and idle_frame is None:
@@ -487,9 +494,15 @@ class WebSocketHandler:
 
     def _handle_av_frame(self, state: ConnectionState, frame) -> asyncio.Task:
         """Handle AV frame - track last video frame and send to client."""
-        # Track last video frame for idle display
+        # Track last video frame for idle display (both per-connection and global)
         if frame.video_jpeg is not None:
             state.last_video_frame = frame.video_jpeg
+            self._global_last_video_frame = frame.video_jpeg  # Persist across connections
+        
+        # Update frame index to continue animation from this point
+        state.musetalk_frame_index = frame.frame_index + 1
+        self._global_frame_index = frame.frame_index + 1  # Persist across connections
+        
         return asyncio.create_task(
             send_message(state, "synced_av_frame", frame.to_websocket_payload())
         )
