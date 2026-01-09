@@ -40,6 +40,8 @@ class VoiceAssistant {
         this.isGenerating = false;
         this.streamComplete = false;
         this.isPaused = false;
+        this.generationTimeoutId = null;  // Watchdog timer for stuck generation
+        this.lastActivityTime = 0;        // Last time we received data
 
         // Frame buffer and playback - LARGER BUFFER to handle MuseTalk being slower than realtime
         this.frameBuffer = new Map();    // frame_index -> frame payload
@@ -75,23 +77,11 @@ class VoiceAssistant {
             logFirst: 3,
         };
 
-        // Buffer configuration - MuseTalk runs at ~1.45x realtime
-        // For 7s video: lag = 7 * (700/480 - 1) * 480ms = ~1.5s = 38 frames
-        // We need enough initial buffer to cover this entire lag
+        // Buffer configuration - simple manual setting
         this.bufferConfig = {
-            minFrames: 48,          // Initial buffer: ~2 seconds (covers worst case lag)
-            defaultMinFrames: 48,
+            minFrames: 24,          // Initial buffer: ~1 second at 25fps (reduced from 48)
             maxFrames: 150,         // Maximum buffer size
             missingFrameToleranceMs: 400,
-        };
-
-        // Adaptive buffering stats (rolling averages across streams)
-        this.bufferStats = {
-            rtfSamples: [],
-            durationSamplesMs: [],
-            windowSize: 10,
-            avgRtf: 0,
-            avgDurationMs: 0,
         };
 
         // Per-stream metrics (reset on each generation)
@@ -112,13 +102,6 @@ class VoiceAssistant {
         this.streamCounter = 0;
         this.runMetrics = this.createRunMetrics();
 
-        this.bufferSettings = {
-            auto: true,
-            manualBufferMs: 0,
-            computedBufferMs: 0,
-        };
-        this.serverBufferMs = null;
-
         // Playback stats for logging
         this.playbackStats = {
             startTime: 0,
@@ -136,6 +119,7 @@ class VoiceAssistant {
             vad: { speech_threshold_ms: 200, silence_threshold_ms: 1500 },
             llm: { temperature: 0.7, top_p: 0.9, max_new_tokens: 512, system_prompt: 'თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი' },
             tts: { backbone_temperature: 0.01, backbone_top_p: 0.999, depth_temperature: 0.01, depth_top_p: 0.999 },
+            musetalk: { batch_size: 8, lookahead_chunks: 2 },
         };
 
         // DOM Elements
@@ -246,8 +230,11 @@ class VoiceAssistant {
             ttsDepthTempValue: document.getElementById('ttsDepthTempValue'),
             ttsDepthTopP: document.getElementById('ttsDepthTopP'),
             ttsDepthTopPValue: document.getElementById('ttsDepthTopPValue'),
-            bufferSize: document.getElementById('bufferSize'),
-            bufferAutoToggle: document.getElementById('bufferAutoToggle'),
+            musetalkBatchSize: document.getElementById('musetalkBatchSize'),
+            musetalkBatchSizeValue: document.getElementById('musetalkBatchSizeValue'),
+            musetalkLookaheadChunks: document.getElementById('musetalkLookaheadChunks'),
+            musetalkLookaheadChunksValue: document.getElementById('musetalkLookaheadChunksValue'),
+            bufferFrames: document.getElementById('bufferFrames'),
             bufferCurrent: document.getElementById('bufferCurrent'),
         };
     }
@@ -264,7 +251,8 @@ class VoiceAssistant {
 
         // Sliders
         ['speechThreshold', 'silenceThreshold', 'llmTemperature', 'llmTopP', 'llmMaxTokens',
-         'ttsBackboneTemp', 'ttsBackboneTopP', 'ttsDepthTemp', 'ttsDepthTopP'].forEach(id => {
+         'ttsBackboneTemp', 'ttsBackboneTopP', 'ttsDepthTemp', 'ttsDepthTopP',
+         'musetalkBatchSize', 'musetalkLookaheadChunks'].forEach(id => {
             const slider = this.elements[id];
             const valueEl = this.elements[id + 'Value'];
             if (slider && valueEl) {
@@ -273,122 +261,40 @@ class VoiceAssistant {
         });
 
         // Buffer controls
-        this.elements.bufferAutoToggle?.addEventListener('change', () => this.updateBufferMode());
-        this.elements.bufferSize?.addEventListener('input', () => this.updateManualBuffer());
+        this.elements.bufferFrames?.addEventListener('input', () => this.updateBufferFrames());
     }
 
     // ============ Buffering ============
 
     initializeBufferControls() {
-        if (this.elements.bufferAutoToggle) {
-            this.bufferSettings.auto = this.elements.bufferAutoToggle.checked;
+        if (this.elements.bufferFrames) {
+            const frames = parseInt(this.elements.bufferFrames.value, 10);
+            this.bufferConfig.minFrames = Number.isFinite(frames) && frames > 0 ? frames : 48;
         }
-        if (this.elements.bufferSize) {
-            const manual = parseFloat(this.elements.bufferSize.value);
-            this.bufferSettings.manualBufferMs = Number.isFinite(manual) ? manual : 0;
-        }
-        this.updateBufferControlsUI();
-        this.updateBufferCurrentDisplay();
+        this.updateBufferDisplay();
     }
 
-    updateBufferMode() {
-        this.updateBufferControlsUI();
-        this.updateBufferCurrentDisplay();
-    }
-
-    updateManualBuffer() {
-        const manual = parseFloat(this.elements.bufferSize?.value);
-        this.bufferSettings.manualBufferMs = Number.isFinite(manual) ? manual : 0;
-        this.updateBufferCurrentDisplay();
-    }
-
-    updateBufferControlsUI() {
-        if (this.elements.bufferAutoToggle) {
-            this.bufferSettings.auto = this.elements.bufferAutoToggle.checked;
-        }
-        if (this.elements.bufferSize) {
-            this.elements.bufferSize.disabled = this.bufferSettings.auto;
-            if (!this.bufferSettings.auto) {
-                const manual = parseFloat(this.elements.bufferSize.value);
-                this.bufferSettings.manualBufferMs = Number.isFinite(manual) ? manual : 0;
-            }
+    updateBufferFrames() {
+        if (this.elements.bufferFrames) {
+            const frames = parseInt(this.elements.bufferFrames.value, 10);
+            this.bufferConfig.minFrames = Number.isFinite(frames) && frames > 0 ? frames : 48;
+            this.updateBufferDisplay();
         }
     }
 
-    computeAverage(values) {
-        if (!values.length) return 0;
-        const total = values.reduce((sum, v) => sum + v, 0);
-        return total / values.length;
-    }
-
-    addRollingSample(list, value, windowSize) {
-        if (!Number.isFinite(value) || value <= 0) return;
-        list.push(value);
-        if (list.length > windowSize) list.shift();
-    }
-
-    calculateBufferMs() {
-        const maxBufferMs = this.bufferConfig.maxFrames * this.frameInterval;
-        const avgRtf = this.bufferStats.avgRtf;
-        const avgDurationMs = this.bufferStats.avgDurationMs;
-
-        if (!this.bufferSettings.auto) {
-            const manual = Math.max(0, this.bufferSettings.manualBufferMs || 0);
-            return {
-                bufferMs: Math.min(manual, maxBufferMs),
-                source: 'manual',
-                avgRtf,
-                avgDurationMs,
-            };
+    updateBufferDisplay() {
+        if (this.elements.bufferCurrent) {
+            const frames = this.bufferConfig.minFrames;
+            const ms = frames * this.frameInterval;
+            this.elements.bufferCurrent.textContent = `ბუფერი: ${frames} ფრეიმი = ${ms}ms`;
         }
-
-        let bufferMs = 0;
-        let source = 'auto';
-        if (avgRtf > 0 && avgDurationMs > 0) {
-            bufferMs = Math.max(0, (avgRtf - 1) * avgDurationMs);
-        } else if (Number.isFinite(this.serverBufferMs) && this.serverBufferMs > 0) {
-            bufferMs = this.serverBufferMs;
-            source = 'server';
-        } else {
-            bufferMs = this.bufferConfig.defaultMinFrames * this.frameInterval;
-            source = 'default';
-        }
-
-        return {
-            bufferMs: Math.min(bufferMs, maxBufferMs),
-            source,
-            avgRtf,
-            avgDurationMs,
-        };
     }
 
     applyInitialBufferConfig() {
-        const { bufferMs, source, avgRtf, avgDurationMs } = this.calculateBufferMs();
-        const minFrames = Math.max(0, Math.ceil(bufferMs / this.frameInterval));
-        this.bufferConfig.minFrames = minFrames;
-        this.bufferSettings.computedBufferMs = bufferMs;
-        this.updateBufferCurrentDisplay();
-
-        const rtfText = avgRtf > 0 ? avgRtf.toFixed(3) : '-';
-        const durText = avgDurationMs > 0 ? avgDurationMs.toFixed(0) : '-';
+        // Just log the current buffer config
         this.log(
-            `Initial buffer (${source}) | ${bufferMs.toFixed(0)}ms | minFrames=${minFrames} | avgRTF=${rtfText} | avgDur=${durText}ms`
+            `Initial buffer | ${this.bufferConfig.minFrames} frames | ${this.bufferConfig.minFrames * this.frameInterval}ms`
         );
-    }
-
-    updateBufferCurrentDisplay() {
-        const { bufferMs, source } = this.calculateBufferMs();
-        this.bufferSettings.computedBufferMs = bufferMs;
-
-        if (this.elements.bufferSize && this.bufferSettings.auto) {
-            this.elements.bufferSize.value = Math.round(bufferMs).toString();
-        }
-
-        if (this.elements.bufferCurrent) {
-            const frameCount = Math.max(0, Math.ceil(bufferMs / this.frameInterval));
-            const label = source || 'auto';
-            this.elements.bufferCurrent.textContent = `ამჟამინდელი ბუფერი: ${bufferMs.toFixed(0)} ms (${frameCount} frames, ${label})`;
-        }
     }
 
     startNewStreamMetrics() {
@@ -485,12 +391,6 @@ class VoiceAssistant {
         }
 
         const observedRtf = durationMs > 0 && generationMs > 0 ? generationMs / durationMs : 0;
-        if (Number.isFinite(observedRtf) && observedRtf > 0 && Number.isFinite(durationMs) && durationMs > 0) {
-            this.addRollingSample(this.bufferStats.rtfSamples, observedRtf, this.bufferStats.windowSize);
-            this.addRollingSample(this.bufferStats.durationSamplesMs, durationMs, this.bufferStats.windowSize);
-            this.bufferStats.avgRtf = this.computeAverage(this.bufferStats.rtfSamples);
-            this.bufferStats.avgDurationMs = this.computeAverage(this.bufferStats.durationSamplesMs);
-        }
 
         this.streamMetrics.summary = {
             reason,
@@ -503,8 +403,6 @@ class VoiceAssistant {
         if (!this.isPlaying && this.frameBuffer.size === 0) {
             this.emitFinalSummary();
         }
-
-        this.updateBufferCurrentDisplay();
     }
 
     logStreamSummary({ reason, observedRtf, ttsRtf, durationMs, generationMs }) {
@@ -641,12 +539,6 @@ class VoiceAssistant {
 
             case 'musetalk_ready':
                 this.videoEnabled = data.success;
-                if (data.buffer_config) {
-                    if (Number.isFinite(data.buffer_config.buffer_ms)) {
-                        this.serverBufferMs = data.buffer_config.buffer_ms;
-                    }
-                    this.log('Server buffer config:', data.buffer_config);
-                }
                 if (data.success) {
                     this.updateAvatarStatus('ready', 'მზადაა');
                     this.elements.avatarContainer?.classList.remove('disabled');
@@ -685,6 +577,8 @@ class VoiceAssistant {
             case 'llm_start':
                 this.isGenerating = true;
                 this.streamComplete = false;
+                this.lastActivityTime = performance.now();
+                this.startGenerationWatchdog();  // Start watchdog timer
                 this.showStopButton();
                 this.currentAssistantMessage = this.addMessage('assistant', '', true);
                 this.wordsSpoken = [];
@@ -708,6 +602,7 @@ class VoiceAssistant {
                 break;
 
             case 'llm_token':
+                this.lastActivityTime = performance.now();  // Update activity
                 if (this.runMetrics.llmFirstTokenAt === null) {
                     this.runMetrics.llmFirstTokenAt = performance.now();
                     const firstTokenMs = this.runMetrics.llmStartAt !== null
@@ -740,20 +635,17 @@ class VoiceAssistant {
 
             case 'tts_start':
                 this.runMetrics.ttsStartAt = performance.now();
-                if (data.buffer_config) {
-                    if (Number.isFinite(data.buffer_config.buffer_ms)) {
-                        this.serverBufferMs = data.buffer_config.buffer_ms;
-                    }
-                }
                 this.updateAvatarStatus('speaking', 'საუბრობს');
                 break;
 
             case 'synced_av_frame':
+                this.lastActivityTime = performance.now();  // Update activity
                 this.handleAVFrame(data);
                 break;
 
             case 'tts_complete':
             case 'video_complete':
+                this.stopGenerationWatchdog();  // Stop watchdog timer
                 this.streamMetrics.completeAt = performance.now();
                 this.finalizeStreamMetrics(data.type);
                 this.streamComplete = true;
@@ -771,6 +663,7 @@ class VoiceAssistant {
 
             case 'error':
                 this.log('Error:', data.message);
+                this.stopGenerationWatchdog();  // Stop watchdog timer
                 this.isGenerating = false;
                 this.hideStopButton();
                 this.stopPlayback();
@@ -1263,6 +1156,64 @@ class VoiceAssistant {
         this.updateReplayButtonState();
     }
 
+    // ============ Generation Watchdog ============
+
+    startGenerationWatchdog() {
+        this.stopGenerationWatchdog();  // Clear any existing timer
+        
+        const WATCHDOG_CHECK_INTERVAL = 5000;  // Check every 5 seconds
+        const INACTIVITY_TIMEOUT = 30000;       // Reset if no activity for 30 seconds
+        
+        this.generationTimeoutId = setInterval(() => {
+            if (!this.isGenerating) {
+                this.stopGenerationWatchdog();
+                return;
+            }
+            
+            const now = performance.now();
+            const inactiveMs = now - this.lastActivityTime;
+            
+            if (inactiveMs > INACTIVITY_TIMEOUT) {
+                this.log(`Generation watchdog: No activity for ${(inactiveMs / 1000).toFixed(1)}s, forcing reset`);
+                this.handleGenerationTimeout();
+            }
+        }, WATCHDOG_CHECK_INTERVAL);
+    }
+
+    stopGenerationWatchdog() {
+        if (this.generationTimeoutId) {
+            clearInterval(this.generationTimeoutId);
+            this.generationTimeoutId = null;
+        }
+    }
+
+    handleGenerationTimeout() {
+        this.stopGenerationWatchdog();
+        
+        // Reset generation state
+        this.streamComplete = true;
+        this.isGenerating = false;
+        this.hideStopButton();
+        
+        // If we have frames, try to play them
+        if (this.frameBuffer.size > 0) {
+            this.log(`Timeout recovery: Playing ${this.frameBuffer.size} buffered frames`);
+            this.isPaused = false;
+            this.startPlayback();
+        } else {
+            this.stopPlayback();
+            this.updateAvatarStatus('ready', 'მზადაა');
+            
+            // Show idle frame
+            if (this.idleFrame) {
+                this.displayFrame(this.idleFrame);
+            }
+        }
+        
+        // Notify user
+        this.log('Generation timed out - state reset');
+    }
+
     playAudio(audioFloat) {
         if (!this.audioContext || !audioFloat || audioFloat.length === 0) return;
 
@@ -1593,6 +1544,8 @@ class VoiceAssistant {
         setVal('ttsBackboneTopP', this.config.tts.backbone_top_p);
         setVal('ttsDepthTemp', this.config.tts.depth_temperature);
         setVal('ttsDepthTopP', this.config.tts.depth_top_p);
+        setVal('musetalkBatchSize', this.config.musetalk?.batch_size ?? 8);
+        setVal('musetalkLookaheadChunks', this.config.musetalk?.lookahead_chunks ?? 2);
     }
 
     async saveSettings() {
@@ -1606,6 +1559,8 @@ class VoiceAssistant {
         this.config.tts.backbone_top_p = parseFloat(this.elements.ttsBackboneTopP?.value || 0.9);
         this.config.tts.depth_temperature = parseFloat(this.elements.ttsDepthTemp?.value || 0.8);
         this.config.tts.depth_top_p = parseFloat(this.elements.ttsDepthTopP?.value || 0.9);
+        this.config.musetalk.batch_size = parseInt(this.elements.musetalkBatchSize?.value || 8);
+        this.config.musetalk.lookahead_chunks = parseInt(this.elements.musetalkLookaheadChunks?.value || 2);
 
         localStorage.setItem('voiceAssistantConfig', JSON.stringify(this.config));
 
@@ -1628,6 +1583,7 @@ class VoiceAssistant {
             vad: { speech_threshold_ms: 200, silence_threshold_ms: 1500 },
             llm: { temperature: 0.7, top_p: 0.9, max_new_tokens: 512, system_prompt: 'თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი' },
             tts: { backbone_temperature: 0.01, backbone_top_p: 0.999, depth_temperature: 0.01, depth_top_p: 0.999 },
+            musetalk: { batch_size: 8, lookahead_chunks: 2 },
         };
         this.loadSettingsToUI();
     }
@@ -1649,6 +1605,7 @@ class VoiceAssistant {
                 if (serverConfig.vad) this.config.vad = { ...this.config.vad, ...serverConfig.vad };
                 if (serverConfig.llm) this.config.llm = { ...this.config.llm, ...serverConfig.llm };
                 if (serverConfig.tts) this.config.tts = { ...this.config.tts, ...serverConfig.tts };
+                if (serverConfig.musetalk) this.config.musetalk = { ...this.config.musetalk, ...serverConfig.musetalk };
                 this.loadSettingsToUI();
             })
             .catch(e => this.log('Could not load server config:', e));

@@ -24,7 +24,8 @@ from typing import Optional, Callable, Dict, List
 import numpy as np
 
 from config import TTSConfig, MuseTalkConfig, StreamingConfig
-from models import AudioFrame, AVFrame, TTSMetrics, BufferConfig, StreamingStats
+from models import AudioFrame, AVFrame, TTSMetrics, StreamingStats
+from streaming_chunker import StreamingTTSChunker
 from tts_service import TTSService
 from triton_services import MuseTalkService
 
@@ -32,11 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Streaming Metrics Manager (simplified - client handles adaptive buffering)
+# Streaming Metrics Manager (simple stats tracking)
 # ============================================================================
 
 class StreamingMetricsManager:
-    """Tracks generation timing statistics for client-side adaptive buffering."""
+    """Tracks generation timing statistics."""
 
     def __init__(self, config: StreamingConfig):
         self.config = config
@@ -59,7 +60,7 @@ class StreamingMetricsManager:
                 self._musetalk_fps.add_sample(fps)
 
     def get_stats(self) -> dict:
-        """Get current stats for client-side adaptive buffering."""
+        """Get current generation stats."""
         with self._lock:
             return {
                 "tts_rtf_mean": self._tts_rtf.mean,
@@ -67,39 +68,6 @@ class StreamingMetricsManager:
                 "musetalk_fps_mean": self._musetalk_fps.mean,
                 "musetalk_fps_std": self._musetalk_fps.std,
             }
-
-    def calculate_buffer_config(self) -> BufferConfig:
-        """Calculate buffer configuration for client."""
-        with self._lock:
-            tts_mean = self._tts_rtf.mean
-            tts_std = self._tts_rtf.std
-            musetalk_mean = self._musetalk_fps.mean if self._musetalk_fps.mean > 0 else 25.0
-            musetalk_std = self._musetalk_fps.std
-
-            # Suggest buffer based on RTF - client will use this
-            k = self.config.buffer_k_std
-            worst_case_rtf = max(0.0, tts_mean + k * tts_std) if tts_mean > 0 else 1.0
-
-            # Suggest minimum buffer frames based on generation speed
-            suggested_buffer_ms = max(160.0, worst_case_rtf * 100.0)
-            suggested_frames = max(4, int(suggested_buffer_ms / 40.0))
-
-            return BufferConfig(
-                buffer_ms=suggested_buffer_ms,
-                frame_buffer=suggested_frames,
-                buffer_source="server_suggested",
-                manual_buffer_ms=None,
-                is_calibrated=tts_mean > 0,
-                tts_rtf_mean=tts_mean,
-                tts_rtf_std=tts_std,
-                tts_overage_ms=0,
-                musetalk_fps_mean=musetalk_mean,
-                musetalk_fps_std=musetalk_std,
-                musetalk_overage_ms=0,
-                network_latency_mean_ms=0,
-                network_latency_std_ms=0,
-                network_buffer_ms=0,
-            )
 
 
 # ============================================================================
@@ -339,16 +307,42 @@ class AVPipeline:
                                 break
                     return
 
-                # Batch audio for efficient MuseTalk processing
-                # 320ms = 8 frames for lower latency while maintaining quality
-                min_audio_samples = int(0.32 * self._sample_rate)
-                max_audio_samples = int(1.5 * self._sample_rate)  # 1.5 seconds max
+                # Batch configuration
+                # batch_size: number of video frames per Triton call
+                # lookahead_chunks: TTS chunks (80ms each) for Whisper future context
+                batch_size = self.config.musetalk_config.batch_size
+                lookahead_chunks = self.config.musetalk_config.lookahead_chunks
                 
-                # Lookahead: keep some audio from previous batch for context overlap
-                # This gives Whisper real audio context instead of zero padding
-                # lookahead_chunks=2 means ~160ms of overlap (2 frames at 25fps = 80ms, but we use samples)
-                lookahead_samples = int(self.config.musetalk_config.lookahead_chunks * self._samples_per_frame)
-                lookahead_buffer = np.zeros((0,), dtype=np.float32)  # Audio to prepend to next batch
+                # Constants
+                WHISPER_WINDOW_MS = 200  # Whisper needs 200ms (10 chunks × 20ms) for features
+                FRAME_MS = 40  # Each video frame = 40ms @ 25fps
+                TTS_CHUNK_MS = 80  # Each TTS output chunk = 80ms
+                
+                # Calculate audio requirements in samples
+                whisper_window_samples = int(WHISPER_WINDOW_MS / 1000 * self._sample_rate)
+                lookahead_samples = int(lookahead_chunks * TTS_CHUNK_MS / 1000 * self._sample_rate)
+                batch_audio_samples = batch_size * self._samples_per_frame  # batch_size × 40ms
+                
+                # First batch needs: 200ms + (batch_size-1)*40ms + lookahead*80ms
+                # This is because first frame needs 200ms whisper window, subsequent frames add 40ms each
+                first_batch_min_samples = whisper_window_samples + (batch_size - 1) * self._samples_per_frame + lookahead_samples
+                
+                # Subsequent batches need: batch_size * 40ms (lookahead from previous batch provides context)
+                subsequent_batch_min_samples = batch_audio_samples
+                
+                # Max batch size to prevent memory issues
+                max_audio_samples = int(2.0 * self._sample_rate)  # 2 seconds max
+                
+                is_first_batch = True
+                
+                logger.info(
+                    f"MuseTalk config: batch_size={batch_size}, lookahead_chunks={lookahead_chunks} "
+                    f"(first_batch_min={first_batch_min_samples / self._sample_rate * 1000:.0f}ms, "
+                    f"subsequent_batch_min={subsequent_batch_min_samples / self._sample_rate * 1000:.0f}ms)"
+                )
+                
+                # Lookahead buffer: audio from end of previous batch for Whisper context
+                lookahead_buffer = np.zeros((0,), dtype=np.float32)
 
                 audio_buffer = np.zeros((0,), dtype=np.float32)
                 frame_buffer: List[AudioFrame] = []
@@ -378,14 +372,18 @@ class AVPipeline:
 
                         # Decide whether to process
                         should_process = False
+                        current_min_samples = first_batch_min_samples if is_first_batch else subsequent_batch_min_samples
+                        
                         if done and len(audio_buffer) > 0:
-                            # Skip tiny tail chunks; fallback video will reuse last frame.
-                            if len(audio_buffer) < min_audio_samples:
+                            # For tail chunks, process whatever remains if it's enough for at least 1 frame
+                            # Need at least 200ms (whisper window) for meaningful processing
+                            min_tail_samples = whisper_window_samples
+                            if len(audio_buffer) < min_tail_samples:
                                 break
                             should_process = True
                         elif len(audio_buffer) >= max_audio_samples:
                             should_process = True
-                        elif len(audio_buffer) >= min_audio_samples:
+                        elif len(audio_buffer) >= current_min_samples:
                             should_process = True
 
                         if not should_process:
@@ -436,7 +434,7 @@ class AVPipeline:
                         logger.info(
                             f"MuseTalk: Processing {len(process_audio)/self._sample_rate:.3f}s audio "
                             f"(lookahead={lookahead_frames} frames) starting at index {process_start_index} "
-                            f"(waited {wait_ms:.0f}ms for audio)"
+                            f"(waited {wait_ms:.0f}ms for audio, first_batch={is_first_batch})"
                         )
 
                         for frame_bytes, frame_idx, _ in self.musetalk_service.generate_frames(
@@ -454,6 +452,7 @@ class AVPipeline:
                         next_frame_index = next_frame_index + new_frames_count
                         last_batch_end_time = time.time()
                         batch_count += 1
+                        is_first_batch = False  # First batch has been processed
 
                         # Record metrics (use new_frames_count for accurate stats)
                         if new_frames_count > 0:
@@ -496,9 +495,10 @@ class AVPipeline:
                         overall_sustained_fps = (total_frames_generated / total_time_ms * 1000.0) if total_time_ms > 0 else 0.0
                         avg_wait_ms = total_wait_time_ms / batch_count
                         avg_process_ms = total_process_time_ms / batch_count
-                        lookahead_ms = (lookahead_samples / self._sample_rate * 1000.0) if lookahead_samples > 0 else 0.0
+                        lookahead_ms = lookahead_chunks * TTS_CHUNK_MS
                         logger.info(
-                            f"MuseTalk SUMMARY: batches={batch_count} | total_frames={total_frames_generated} | "
+                            f"MuseTalk SUMMARY: batch_size={batch_size} | batches={batch_count} | "
+                            f"total_frames={total_frames_generated} | "
                             f"overall_sustained_fps={overall_sustained_fps:.1f} | "
                             f"avg_wait_ms={avg_wait_ms:.0f} | avg_process_ms={avg_process_ms:.0f} | "
                             f"lookahead_ms={lookahead_ms:.0f}"
@@ -529,12 +529,27 @@ class AVPipeline:
 
                         # Get video frame (wait briefly if not ready yet)
                         video_bytes = None
-                        for _ in range(10):  # Wait up to 1 second for video
-                            with video_lock:
-                                video_bytes = video_cache.pop(frame.index, None)
-                            if video_bytes is not None:
-                                break
-                            time.sleep(0.1)
+                        # First check if it's already available (no wait)
+                        with video_lock:
+                            video_bytes = video_cache.pop(frame.index, None)
+                        
+                        # If not available, wait briefly (but not too long for tail frames)
+                        if video_bytes is None and last_video_frame is not None:
+                            # We have a fallback, so only wait a short time (200ms max)
+                            for _ in range(4):
+                                time.sleep(0.05)
+                                with video_lock:
+                                    video_bytes = video_cache.pop(frame.index, None)
+                                if video_bytes is not None:
+                                    break
+                        elif video_bytes is None:
+                            # No fallback yet, wait longer for first frames (500ms max)
+                            for _ in range(10):
+                                time.sleep(0.05)
+                                with video_lock:
+                                    video_bytes = video_cache.pop(frame.index, None)
+                                if video_bytes is not None:
+                                    break
 
                         # Use last frame as fallback
                         if video_bytes is None:
@@ -589,8 +604,12 @@ class AVPipeline:
 
             for t in threads:
                 t.start()
+            
+            # Join threads with timeout to prevent hanging
             for t in threads:
-                t.join()
+                t.join(timeout=60.0)  # 60 second max wait per thread
+                if t.is_alive():
+                    logger.warning(f"Thread {t.name} did not complete within timeout")
 
         # Start the runner in a thread pool
         runner_future = loop.run_in_executor(None, runner)
@@ -621,7 +640,19 @@ class AVPipeline:
                     continue
 
         finally:
-            await runner_future
+            # Wait for runner with timeout to prevent hanging
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(runner_future),
+                    timeout=60.0,  # 60 second max wait
+                )
+            except asyncio.TimeoutError:
+                logger.error("Pipeline runner timed out after 60 seconds")
+                result.success = False
+                result.error_message = "Pipeline timeout"
+            except Exception as e:
+                logger.error(f"Pipeline runner error: {e}")
+            
             on_complete()
 
         return result
@@ -656,12 +687,8 @@ class VoiceToVoicePipeline:
             config,
         )
 
-    def get_buffer_config(self) -> BufferConfig:
-        """Get suggested buffer configuration for client."""
-        return self.metrics_manager.calculate_buffer_config()
-
     def get_metrics_stats(self) -> dict:
-        """Get metrics stats for client-side adaptive buffering."""
+        """Get current generation stats."""
         return self.metrics_manager.get_stats()
 
     async def process_llm_and_tts(
@@ -698,12 +725,11 @@ class VoiceToVoicePipeline:
         text_input_queue: Queue = Queue()
 
         llm_response = ""
-        tts_started = False
-        words_sent = 0
+        chunker = StreamingTTSChunker()
 
         # LLM token processing task
         async def process_llm_tokens():
-            nonlocal llm_response, tts_started, words_sent
+            nonlocal llm_response
 
             async for token in llm_generator:
                 if not is_generating():
@@ -712,28 +738,17 @@ class VoiceToVoicePipeline:
                 llm_response += token
                 on_llm_token(token, llm_response)
 
-                words = llm_response.split()
-
-                # Start TTS after 3 words (2-word lookahead)
-                if not tts_started and len(words) >= 3:
-                    first_chunk = " ".join(words[:3])
-                    text_input_queue.put([first_chunk])
-                    tts_started = True
-                    words_sent = 3
-
-                # Send new words one at a time
-                if tts_started and len(words) > words_sent:
-                    new_words = words[words_sent:]
-                    for w in new_words:
-                        text_input_queue.put([" " + w])
-                    words_sent = len(words)
+                # Use StreamingTTSChunker to handle word chunking with proper punctuation handling
+                chunks = chunker.push_token(token)
+                for chunk in chunks:
+                    text_input_queue.put([chunk])
 
             on_llm_complete(llm_response)
 
-            # Send flush chunks and end signal
-            if tts_started:
-                text_input_queue.put([""])
-                text_input_queue.put([""])
+            # Finalize - get any remaining chunks and flush signals
+            final_chunks = chunker.finalize()
+            for chunk in final_chunks:
+                text_input_queue.put([chunk])
 
             text_input_queue.put(None)
 

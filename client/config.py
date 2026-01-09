@@ -48,11 +48,13 @@ class MuseTalkConfig:
     """MuseTalk avatar generation configuration."""
     avatar_id: str = "default"
     fps: int = 25
-    # How many TTS chunks to wait before starting MuseTalk (not currently used)
-    start_after_chunks: int = 3
-    # How many frames of audio to overlap between batches for better Whisper context
-    # This prepends audio from previous batch to give real audio context instead of zero padding
-    # 2 frames = ~80ms overlap at 25fps (2 * 960 samples @ 24kHz = 80ms)
+    # Number of video frames to generate per Triton batch call
+    # Higher = more efficient but higher latency, Lower = lower latency but less efficient
+    # With 600ms Triton round-trip: batch_size=16 gives ~26fps sustained (16 frames / 600ms)
+    batch_size: int = 8
+    # Number of TTS chunks (80ms each) to keep as lookahead for Whisper context
+    # This provides future audio context for better lip-sync accuracy
+    # 2 chunks = 160ms lookahead
     lookahead_chunks: int = 2
     # Samples per video frame (24kHz / 25fps = 960 samples per frame)
     samples_per_frame: int = 960

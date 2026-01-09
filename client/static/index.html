@@ -264,16 +264,16 @@
                             MuseTalk (ავატარი)
                         </h3>
                         <div class="setting-item">
-                            <label for="musetalkStartChunks">დაწყების ბუფერი (chunks)</label>
-                            <input type="range" id="musetalkStartChunks" min="0" max="20" value="3" step="1">
-                            <span class="setting-value" id="musetalkStartChunksValue">3</span>
+                            <label for="musetalkBatchSize">Batch Size (ფრეიმები)</label>
+                            <input type="range" id="musetalkBatchSize" min="1" max="24" value="8" step="1">
+                            <span class="setting-value" id="musetalkBatchSizeValue">8</span>
                         </div>
                         <div class="setting-item">
-                            <label for="musetalkLookaheadChunks">Lookahead (chunks)</label>
-                            <input type="range" id="musetalkLookaheadChunks" min="0" max="20" value="2" step="1">
+                            <label for="musetalkLookaheadChunks">Lookahead (TTS chunks)</label>
+                            <input type="range" id="musetalkLookaheadChunks" min="0" max="10" value="2" step="1">
                             <span class="setting-value" id="musetalkLookaheadChunksValue">2</span>
                         </div>
-                        <div class="setting-hint">1 chunk = 80ms</div>
+                        <div class="setting-hint">Batch: ფრეიმები Triton-ზე (1=40ms). Lookahead: TTS chunk-ები (1=80ms)</div>
                     </div>
 
                     <!-- Buffer / Sync Settings -->
@@ -289,20 +289,13 @@
                         </h3>
                         <div class="setting-item full-width buffer-setting">
                             <div class="setting-row">
-                                <label for="bufferSize">ბუფერის ზომა (ms)</label>
-                                <div class="buffer-toggle">
-                                    <label class="toggle-switch">
-                                        <input type="checkbox" id="bufferAutoToggle" checked>
-                                        <span class="toggle-slider"></span>
-                                    </label>
-                                    <span class="toggle-label">ავტომატური (კალიბრაციით)</span>
-                                </div>
+                                <label for="bufferFrames">საჭირო ფრეიმების რაოდენობა</label>
                             </div>
                             <div class="buffer-controls">
-                                <input type="number" id="bufferSize" min="0" max="2000" step="10" value="0" disabled>
-                                <span class="setting-hint">გამორთე ავტომატური რეჟიმი რომ მიუთითო საკუთარი ბუფერი (ms)</span>
+                                <input type="number" id="bufferFrames" min="1" max="100" step="1" value="24">
+                                <span class="setting-hint">რამდენი ფრეიმი უნდა დაგროვდეს დაწყებამდე (1 ფრეიმი = 40ms @ 25fps)</span>
                             </div>
-                            <div class="setting-hint" id="bufferCurrent">ამჟამინდელი ბუფერი: - ms</div>
+                            <div class="setting-hint" id="bufferCurrent">ბუფერი: 24 ფრეიმი = 960ms</div>
                         </div>
                     </div>
                 </div>

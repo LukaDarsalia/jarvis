@@ -35,6 +35,14 @@ python3 ./onnx_csm/export_backbone_step_onnx.py
 python3 ./onnx_csm/export_depth_decoder_onnx.py
 python3 ./onnx_csm/generate_with_backbone_and_depth_onnx.py
 
+# Export MuseTalk UNet to ONNX (FP16 for faster inference)
+echo "=== Exporting MuseTalk UNet to ONNX (FP16) ==="
+python3 ./model_repository/musetalk/export_unet_onnx.py --fp16 --device cuda --output ./local_models/musetalk_model/musetalkV15/unet.onnx
+
+# Benchmark UNet to verify ONNX is working
+echo "=== Benchmarking UNet (PyTorch vs ONNX) ==="
+python3 ./model_repository/musetalk/benchmark_unet_speed.py --device cuda --fp16 --iters 20 --warmup 5
+
 mv ./local_models /local_models
 
 mv ./testing_avatar_creation /local_models/musetalk_model/testing_avatar_creation

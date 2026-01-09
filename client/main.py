@@ -197,8 +197,6 @@ async def get_config():
     if config is None or triton_client is None:
         raise HTTPException(status_code=503, detail="Client not initialized")
 
-    buffer_config = pipeline.get_buffer_config() if pipeline else {}
-
     return {
         "vad": {
             "speech_threshold_ms": config.vad.speech_threshold_ms,
@@ -218,9 +216,8 @@ async def get_config():
             "depth_top_p": config.tts.depth_top_p,
             "sample_rate": config.tts.sample_rate,
         },
-        "buffer": buffer_config.to_dict() if hasattr(buffer_config, 'to_dict') else buffer_config,
         "musetalk": {
-            "start_after_chunks": config.musetalk.start_after_chunks,
+            "batch_size": config.musetalk.batch_size,
             "lookahead_chunks": config.musetalk.lookahead_chunks,
         },
     }
@@ -265,24 +262,13 @@ async def update_config(new_config: dict):
         if "sample_rate" in tts:
             config.tts.sample_rate = int(tts["sample_rate"])
 
-    if "buffer" in new_config:
-        buffer_cfg = new_config["buffer"]
-        manual_buffer = buffer_cfg.get("manual_buffer_ms", None)
-        if manual_buffer in ["", None]:
-            pipeline.set_manual_buffer(None)
-        else:
-            try:
-                pipeline.set_manual_buffer(float(manual_buffer))
-            except (TypeError, ValueError):
-                logger.warning(f"Ignoring invalid manual buffer value: {manual_buffer}")
-
     if "musetalk" in new_config:
         mt_cfg = new_config["musetalk"]
-        if "start_after_chunks" in mt_cfg:
+        if "batch_size" in mt_cfg:
             try:
-                config.musetalk.start_after_chunks = max(0, int(mt_cfg["start_after_chunks"]))
+                config.musetalk.batch_size = max(1, min(32, int(mt_cfg["batch_size"])))
             except (TypeError, ValueError):
-                logger.warning(f"Ignoring invalid start_after_chunks: {mt_cfg['start_after_chunks']}")
+                logger.warning(f"Ignoring invalid batch_size: {mt_cfg['batch_size']}")
         if "lookahead_chunks" in mt_cfg:
             try:
                 config.musetalk.lookahead_chunks = max(0, int(mt_cfg["lookahead_chunks"]))
@@ -316,5 +302,5 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
-    os.environ.setdefault("TRITON_URL", "185.151.171.35:44957")
+    os.environ.setdefault("TRITON_URL", "185.151.171.35:46218")
     uvicorn.run(app, host="0.0.0.0", port=8080)

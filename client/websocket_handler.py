@@ -75,6 +75,7 @@ class ConnectionState:
 
     # MuseTalk frame tracking
     musetalk_frame_index: int = 0
+    last_video_frame: Optional[bytes] = None  # Last generated video frame for idle display
 
     # Serialize websocket sends to preserve message order
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -165,21 +166,20 @@ class WebSocketHandler:
 
             # Check MuseTalk availability and get idle frame
             musetalk_available = await self._check_musetalk_available()
-            idle_frame = None
+            idle_frame = state.last_video_frame  # Use last frame from previous generation if available
 
-            if musetalk_available:
+            # Only fetch initial idle frame if we don't have one from a previous generation
+            if musetalk_available and idle_frame is None:
                 loop = asyncio.get_event_loop()
                 idle_frame = await loop.run_in_executor(
                     None,
                     self.triton_client.musetalk.get_idle_frame,
                 )
 
-            buffer_config = self.pipeline.get_buffer_config()
             await send_message(state, "musetalk_ready", {
                 "success": musetalk_available,
                 "session_id": None,
                 "idle_frame": base64.b64encode(idle_frame).decode("utf-8") if idle_frame else None,
-                "buffer_config": buffer_config.to_dict(),
             })
 
             # Start audio processor
@@ -420,11 +420,9 @@ class WebSocketHandler:
         # Check video availability
         video_enabled = await self._check_musetalk_available()
 
-        buffer_config = self.pipeline.get_buffer_config()
         await send_message(state, "tts_start", {
             "text": "",
             "video_enabled": video_enabled,
-            "buffer_config": buffer_config.to_dict(),
         })
 
         # Create async LLM generator
@@ -470,9 +468,7 @@ class WebSocketHandler:
             on_llm_token=lambda token, full: asyncio.create_task(
                 send_message(state, "llm_token", {"token": token, "full_text": full})
             ),
-            on_av_frame=lambda frame: asyncio.create_task(
-                send_message(state, "synced_av_frame", frame.to_websocket_payload())
-            ),
+            on_av_frame=lambda frame: self._handle_av_frame(state, frame),
             on_error=lambda msg: asyncio.create_task(
                 send_message(state, "error", {"message": msg})
             ),
@@ -488,6 +484,15 @@ class WebSocketHandler:
         # Close TTS session
         if state.tts_session_id is not None:
             await self._close_tts_session(state)
+
+    def _handle_av_frame(self, state: ConnectionState, frame) -> asyncio.Task:
+        """Handle AV frame - track last video frame and send to client."""
+        # Track last video frame for idle display
+        if frame.video_jpeg is not None:
+            state.last_video_frame = frame.video_jpeg
+        return asyncio.create_task(
+            send_message(state, "synced_av_frame", frame.to_websocket_payload())
+        )
 
     async def _on_tts_complete(self, state: ConnectionState) -> None:
         """Handle TTS/video completion."""
