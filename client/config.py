@@ -48,9 +48,11 @@ class MuseTalkConfig:
     """MuseTalk avatar generation configuration."""
     avatar_id: str = "default"
     fps: int = 25
-    # How many TTS chunks to wait before starting MuseTalk
+    # How many TTS chunks to wait before starting MuseTalk (not currently used)
     start_after_chunks: int = 3
-    # How many TTS chunks to keep as lookahead buffer
+    # How many frames of audio to overlap between batches for better Whisper context
+    # This prepends audio from previous batch to give real audio context instead of zero padding
+    # 2 frames = ~80ms overlap at 25fps (2 * 960 samples @ 24kHz = 80ms)
     lookahead_chunks: int = 2
     # Samples per video frame (24kHz / 25fps = 960 samples per frame)
     samples_per_frame: int = 960

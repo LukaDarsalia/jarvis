@@ -343,11 +343,24 @@ class AVPipeline:
                 # 320ms = 8 frames for lower latency while maintaining quality
                 min_audio_samples = int(0.32 * self._sample_rate)
                 max_audio_samples = int(1.5 * self._sample_rate)  # 1.5 seconds max
+                
+                # Lookahead: keep some audio from previous batch for context overlap
+                # This gives Whisper real audio context instead of zero padding
+                # lookahead_chunks=2 means ~160ms of overlap (2 frames at 25fps = 80ms, but we use samples)
+                lookahead_samples = int(self.config.musetalk_config.lookahead_chunks * self._samples_per_frame)
+                lookahead_buffer = np.zeros((0,), dtype=np.float32)  # Audio to prepend to next batch
 
                 audio_buffer = np.zeros((0,), dtype=np.float32)
                 frame_buffer: List[AudioFrame] = []
                 next_frame_index = base_frame_index
                 done = False
+                
+                # Timing metrics for debugging
+                last_batch_end_time: Optional[float] = None
+                total_wait_time_ms = 0.0
+                total_process_time_ms = 0.0
+                total_frames_generated = 0
+                batch_count = 0
 
                 try:
                     while is_generating() or not done:
@@ -381,21 +394,49 @@ class AVPipeline:
                         if len(audio_buffer) == 0:
                             continue
 
-                        # Process the accumulated audio
-                        process_audio = audio_buffer.copy()
-                        process_start_index = next_frame_index
+                        # Track wait time (time since last batch finished)
+                        batch_start_time = time.time()
+                        if last_batch_end_time is not None:
+                            wait_ms = (batch_start_time - last_batch_end_time) * 1000.0
+                            total_wait_time_ms += wait_ms
+                        else:
+                            wait_ms = 0.0
+                        
+                        # Prepend lookahead buffer from previous batch for context overlap
+                        # This gives Whisper real audio context instead of zero padding at batch boundaries
+                        if lookahead_buffer.size > 0:
+                            full_audio = np.concatenate([lookahead_buffer, audio_buffer])
+                            # Calculate how many frames the lookahead covers (for frame index offset)
+                            lookahead_frames = lookahead_buffer.size // self._samples_per_frame
+                        else:
+                            full_audio = audio_buffer.copy()
+                            lookahead_frames = 0
+                        
+                        process_audio = full_audio
+                        # Frame index for Triton starts at the lookahead portion
+                        # But we only keep frames AFTER the lookahead (those are new)
+                        process_start_index = next_frame_index - lookahead_frames
+                        
+                        # Save end of current audio as lookahead for next batch
+                        if not done and lookahead_samples > 0 and audio_buffer.size >= lookahead_samples:
+                            lookahead_buffer = audio_buffer[-lookahead_samples:]
+                        else:
+                            lookahead_buffer = np.zeros((0,), dtype=np.float32)
 
                         # Clear buffers
                         audio_buffer = np.zeros((0,), dtype=np.float32)
                         frame_buffer = []
 
                         # Generate video frames
-                        start_time = time.time()
+                        triton_start_time = time.time()
                         frames_generated = 0
+                        new_frames_count = 0  # Frames after lookahead
+                        audio_duration_ms = len(process_audio) / self._sample_rate * 1000.0
 
                         logger.info(
                             f"MuseTalk: Processing {len(process_audio)/self._sample_rate:.3f}s audio "
-                            f"starting at index {process_start_index}"
+                            f"(lookahead={lookahead_frames} frames) starting at index {process_start_index} "
+                            f"(waited {wait_ms:.0f}ms for audio)"
                         )
 
                         for frame_bytes, frame_idx, _ in self.musetalk_service.generate_frames(
@@ -403,21 +444,40 @@ class AVPipeline:
                             frame_index=process_start_index,
                         ):
                             frames_generated += 1
-                            with video_lock:
-                                video_cache[frame_idx] = frame_bytes
+                            # Only cache frames that are NEW (after lookahead region)
+                            if frame_idx >= next_frame_index:
+                                with video_lock:
+                                    video_cache[frame_idx] = frame_bytes
+                                new_frames_count += 1
 
-                        # Update next frame index
-                        next_frame_index = process_start_index + frames_generated
+                        # Update next frame index (only count new frames, not re-generated lookahead)
+                        next_frame_index = next_frame_index + new_frames_count
+                        last_batch_end_time = time.time()
+                        batch_count += 1
 
-                        # Record metrics
-                        if frames_generated > 0:
-                            duration = time.time() - start_time
-                            if duration > 0:
+                        # Record metrics (use new_frames_count for accurate stats)
+                        if new_frames_count > 0:
+                            triton_duration_ms = (last_batch_end_time - triton_start_time) * 1000.0
+                            total_process_time_ms += triton_duration_ms
+                            total_frames_generated += new_frames_count
+                            
+                            if triton_duration_ms > 0:
                                 self.metrics_manager.record_musetalk_generation(
-                                    frames_generated, duration
+                                    new_frames_count, triton_duration_ms / 1000.0
                                 )
+                            
+                            # Calculate effective FPS for this batch (new frames only)
+                            batch_eff_fps = (new_frames_count / triton_duration_ms * 1000.0) if triton_duration_ms > 0 else 0.0
+                            # Calculate sustained FPS including wait time
+                            cycle_time_ms = wait_ms + triton_duration_ms
+                            sustained_fps = (new_frames_count / cycle_time_ms * 1000.0) if cycle_time_ms > 0 else 0.0
+                            
                             logger.info(
-                                f"MuseTalk: Generated {frames_generated} frames in {duration:.3f}s"
+                                f"MuseTalk: batch={batch_count} | new_frames={new_frames_count} | "
+                                f"total_generated={frames_generated} (lookahead={lookahead_frames}) | "
+                                f"triton_ms={triton_duration_ms:.0f} | wait_ms={wait_ms:.0f} | "
+                                f"batch_fps={batch_eff_fps:.1f} | sustained_fps={sustained_fps:.1f} | "
+                                f"audio_ms={audio_duration_ms:.0f}"
                             )
 
                         if done:
@@ -428,6 +488,21 @@ class AVPipeline:
                     import traceback
                     logger.error(traceback.format_exc())
                     report_error(f"MuseTalk worker error: {exc}")
+                
+                finally:
+                    # Log final summary
+                    if total_frames_generated > 0 and batch_count > 0:
+                        total_time_ms = total_wait_time_ms + total_process_time_ms
+                        overall_sustained_fps = (total_frames_generated / total_time_ms * 1000.0) if total_time_ms > 0 else 0.0
+                        avg_wait_ms = total_wait_time_ms / batch_count
+                        avg_process_ms = total_process_time_ms / batch_count
+                        lookahead_ms = (lookahead_samples / self._sample_rate * 1000.0) if lookahead_samples > 0 else 0.0
+                        logger.info(
+                            f"MuseTalk SUMMARY: batches={batch_count} | total_frames={total_frames_generated} | "
+                            f"overall_sustained_fps={overall_sustained_fps:.1f} | "
+                            f"avg_wait_ms={avg_wait_ms:.0f} | avg_process_ms={avg_process_ms:.0f} | "
+                            f"lookahead_ms={lookahead_ms:.0f}"
+                        )
 
             # ----------------------------------------------------------------
             # AV Sender - pairs audio+video and sends immediately

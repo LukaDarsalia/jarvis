@@ -62,6 +62,13 @@ class VoiceAssistant {
             gaps: 0,
             lateDrops: 0,
         };
+        this.frameArrivalStats = {
+            lastArrivalTime: null,
+            gapSamples: [],          // Track last N gaps
+            maxSamples: 50,
+            underrunCount: 0,        // Times playback stalled
+            burstCount: 0,           // Frames arriving < 5ms apart (burst)
+        };
         this.audioDecodeStats = {
             count: 0,
             logEvery: 50,
@@ -537,17 +544,27 @@ class VoiceAssistant {
             ? metrics.musetalkLastFrameIndex - metrics.musetalkFirstFrameIndex + 1
             : null;
         const musetalkDurationMs = musetalkFrames ? musetalkFrames * this.frameInterval : null;
-        const musetalkRtf = musetalkGenMs && musetalkDurationMs ? musetalkGenMs / musetalkDurationMs : null;
+        
+        // Calculate effective FPS instead of RTF
+        const musetalkEffFps = musetalkGenMs && musetalkFrames ? (musetalkFrames / musetalkGenMs * 1000) : null;
+        
+        // Calculate average frame arrival gap
+        const arrivalGaps = this.frameArrivalStats.gapSamples;
+        const avgArrivalGapMs = arrivalGaps.length > 0 
+            ? arrivalGaps.reduce((a, b) => a + b, 0) / arrivalGaps.length 
+            : null;
+        const effectiveArrivalFps = avgArrivalGapMs ? (1000 / avgArrivalGapMs) : null;
 
         const ttsRtfText = this.formatRate(ttsRtf, '');
-        const observedRtfText = this.formatRate(observedRtf, '');
 
         this.metricLog(
             `Final (${reason}) | VAD ${this.formatMs(vadLatencyMs)} | STT ${this.formatMs(sttLatencyMs)} | ` +
             `LLM first ${this.formatMs(llmFirstTokenMs)} | LLM speed ${this.formatRate(llmSpeed, ' tok/s')} | ` +
-            `TTS first audio ${this.formatMs(ttsFirstAudioMs)} | TTS RTF ${ttsRtfText} | ` +
-            `MuseTalk first ${this.formatMs(musetalkFirstMs)} | MuseTalk RTF ${this.formatRate(musetalkRtf, '')} | ` +
-            `Observed RTF ${observedRtfText} | Audio ${this.formatMs(durationMs)} | Gen ${this.formatMs(generationMs)}`
+            `TTS first ${this.formatMs(ttsFirstAudioMs)} | TTS RTF ${ttsRtfText} | ` +
+            `MuseTalk first ${this.formatMs(musetalkFirstMs)} | MuseTalk eff_fps ${this.formatRate(musetalkEffFps, '')} | ` +
+            `Arrival eff_fps ${this.formatRate(effectiveArrivalFps, '')} | ` +
+            `Underruns ${this.frameArrivalStats.underrunCount} | Bursts ${this.frameArrivalStats.burstCount} | ` +
+            `Audio ${this.formatMs(durationMs)} | Gen ${this.formatMs(generationMs)}`
         );
     }
 
@@ -892,6 +909,15 @@ class VoiceAssistant {
         this.framesReceived = 0;
         this.lastVideoFrame = null;
         this.nextAudioTime = 0;
+        
+        // Reset frame arrival stats
+        this.frameArrivalStats = {
+            lastArrivalTime: null,
+            gapSamples: [],
+            maxSamples: 50,
+            underrunCount: 0,
+            burstCount: 0,
+        };
     }
 
     prepareReplayCapture() {
@@ -1041,6 +1067,22 @@ class VoiceAssistant {
         this.frameBuffer.set(frameIndex, payload);
         this.pendingReplayFrames.set(frameIndex, payload);
         this.framesReceived++;
+        
+        // Track frame arrival timing
+        const now = performance.now();
+        if (this.frameArrivalStats.lastArrivalTime !== null) {
+            const gapMs = now - this.frameArrivalStats.lastArrivalTime;
+            this.frameArrivalStats.gapSamples.push(gapMs);
+            if (this.frameArrivalStats.gapSamples.length > this.frameArrivalStats.maxSamples) {
+                this.frameArrivalStats.gapSamples.shift();
+            }
+            // Track bursts (frames arriving very close together)
+            if (gapMs < 5) {
+                this.frameArrivalStats.burstCount++;
+            }
+        }
+        this.frameArrivalStats.lastArrivalTime = now;
+        
         this.updateStreamMetrics(data);
 
         // Update metrics display
@@ -1197,6 +1239,7 @@ class VoiceAssistant {
         if (!this.underrunLogged) {
             this.log(`Buffer underrun at frame ${this.framesPlayed} | Waiting for more frames...`);
             this.underrunLogged = true;
+            this.frameArrivalStats.underrunCount++;
         }
 
         // Check again soon

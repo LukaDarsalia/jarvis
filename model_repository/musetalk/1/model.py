@@ -586,23 +586,28 @@ class TritonPythonModel:
             blend_ms = stats.get("blend_ms", 0.0)
             per_frame_ms = total_ms / frame_count if frame_count else 0.0
             unet_impl = "onnx" if self.unet_onnx_session is not None else "torch"
-            rtf = (total_ms / audio_duration_ms) if audio_duration_ms > 0 else 0.0
+            # Calculate effective FPS: frames generated per second of wall time
+            effective_fps = (frame_count / total_ms * 1000.0) if total_ms > 0 else 0.0
+            # Required FPS for real-time playback
+            target_fps = self.config.fps
+            # Can we keep up? (effective_fps >= target_fps means yes)
+            can_realtime = "YES" if effective_fps >= target_fps else "NO"
             def pct(value: float) -> float:
                 return (value / total_ms * 100.0) if total_ms > 0 else 0.0
             pb_utils.Logger.log_info(
-                "MuseTalk | rtf=%.3f | total_ms=%.1f | per_frame_ms=%.1f | audio_ms=%.1f | "
+                "MuseTalk | eff_fps=%.1f (target=%d, realtime=%s) | total_ms=%.1f | per_frame_ms=%.1f | "
                 "whisper_ms=%.1f (%.1f%%) | unet_ms=%.1f (%.1f%%) | vae_ms=%.1f (%.1f%%) | "
-                "blend_ms=%.1f (%.1f%%) | chunks=%d | frames=%d | unet=%s"
+                "blend_ms=%.1f (%.1f%%) | frames=%d | unet=%s"
                 % (
-                    rtf,
+                    effective_fps,
+                    target_fps,
+                    can_realtime,
                     total_ms,
                     per_frame_ms,
-                    audio_duration_ms,
                     whisper_ms, pct(whisper_ms),
                     unet_ms, pct(unet_ms),
                     vae_ms, pct(vae_ms),
                     blend_ms, pct(blend_ms),
-                    chunk_count,
                     frame_count,
                     unet_impl,
                 )
