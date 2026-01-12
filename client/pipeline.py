@@ -704,6 +704,110 @@ class VoiceToVoicePipeline:
         """Get current generation stats."""
         return self.metrics_manager.get_stats()
 
+    async def process_llm_and_tts_buffered(
+        self,
+        llm_generator,
+        tts_session_id: int,
+        video_enabled: bool,
+        base_frame_index: int,
+        check_cancelled: Callable[[], bool] = lambda: False,
+    ):
+        """
+        Process LLM output through TTS and MuseTalk, yielding AV frames.
+        
+        This is used for speculative processing where we want to buffer frames.
+        
+        Args:
+            llm_generator: Async generator yielding LLM tokens/text
+            tts_session_id: TTS session ID (must be initialized)
+            video_enabled: Whether to generate video
+            base_frame_index: Starting frame index
+            check_cancelled: Callback to check if processing should be cancelled
+            
+        Yields:
+            AVFrame objects as they are generated
+        """
+        frame_queue: asyncio.Queue = asyncio.Queue()
+        llm_response = ""
+        pipeline_error = None
+        
+        def is_generating():
+            return not check_cancelled()
+        
+        def on_llm_token(token: str, full_text: str):
+            pass  # We don't need to handle tokens individually for speculative
+        
+        def on_av_frame(av_frame: AVFrame):
+            # Put frame in queue for yielding
+            try:
+                frame_queue.put_nowait(("frame", av_frame))
+            except asyncio.QueueFull:
+                logger.warning("Frame queue full, dropping frame")
+        
+        def on_error(msg: str):
+            nonlocal pipeline_error
+            pipeline_error = msg
+            frame_queue.put_nowait(("error", msg))
+        
+        def on_llm_complete(full_text: str):
+            nonlocal llm_response
+            llm_response = full_text
+        
+        def on_tts_complete():
+            frame_queue.put_nowait(("done", None))
+        
+        # Run the existing pipeline method
+        pipeline_task = asyncio.create_task(
+            self.process_llm_and_tts(
+                llm_generator=llm_generator,
+                tts_session_id=tts_session_id,
+                video_enabled=video_enabled,
+                base_frame_index=base_frame_index,
+                is_generating=is_generating,
+                on_llm_token=on_llm_token,
+                on_av_frame=on_av_frame,
+                on_error=on_error,
+                on_llm_complete=on_llm_complete,
+                on_tts_complete=on_tts_complete,
+            )
+        )
+        
+        try:
+            # Yield frames as they come
+            while True:
+                try:
+                    msg_type, data = await asyncio.wait_for(frame_queue.get(), timeout=0.5)
+                    
+                    if msg_type == "done":
+                        break
+                    elif msg_type == "error":
+                        logger.error(f"Pipeline error: {data}")
+                        break
+                    elif msg_type == "frame":
+                        yield data
+                        
+                except asyncio.TimeoutError:
+                    if check_cancelled():
+                        pipeline_task.cancel()
+                        break
+                    # Check if pipeline task is done
+                    if pipeline_task.done():
+                        # Drain remaining frames
+                        while not frame_queue.empty():
+                            msg_type, data = frame_queue.get_nowait()
+                            if msg_type == "frame":
+                                yield data
+                        break
+                    continue
+                    
+        finally:
+            if not pipeline_task.done():
+                pipeline_task.cancel()
+                try:
+                    await pipeline_task
+                except asyncio.CancelledError:
+                    pass
+
     async def process_llm_and_tts(
         self,
         llm_generator,

@@ -16,7 +16,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 from fastapi import WebSocket
@@ -78,19 +78,29 @@ class ConnectionState:
     musetalk_frame_index: int = 0
     last_video_frame: Optional[bytes] = None  # Last generated video frame for idle display
 
-    # Speculative processing state (early STT/LLM before full silence)
+    # Speculative processing state (full pipeline: STT → LLM → TTS → MuseTalk)
+    # Runs in background during early silence, buffers AV frames on frontend
     speculative_task: Optional[asyncio.Task] = None
     speculative_stt_result: Optional[str] = None
     speculative_llm_result: Optional[str] = None
     speculative_cancelled: bool = False
+    # Keep last completed speculative results to compare with final STT
+    # Even if cancelled, if final STT matches, we can reuse buffered frames
+    last_speculative_stt: Optional[str] = None
+    last_speculative_llm: Optional[str] = None
+    # Track if speculative pipeline completed TTS+MuseTalk
+    speculative_pipeline_complete: bool = False
 
     # Serialize websocket sends to preserve message order
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     
+    # Lock to prevent multiple TTS init calls
+    tts_init_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    tts_init_in_progress: bool = False
+    
     # Key latency metric: time from utterance end to first AV frame
     utterance_end_time: Optional[float] = None  # When VAD detected utterance complete
     first_av_frame_sent: bool = False  # Track if we've sent first frame this generation
-
 
 # ============================================================================
 # Message Helpers
@@ -330,7 +340,9 @@ class WebSocketHandler:
                 if not buffer:
                     continue
 
-                if not state.is_recording or state.is_generating:
+                # Always process VAD even during generation (for barge-in detection)
+                # But only act on new utterances after handling potential barge-in
+                if not state.is_recording:
                     buffer.clear()
                     continue
 
@@ -350,18 +362,64 @@ class WebSocketHandler:
 
                 # Log VAD status for debugging
                 if status in {VADStatus.SPEAKING, VADStatus.EARLY_SILENCE, VADStatus.UTTERANCE_COMPLETE, VADStatus.SPEECH_RESUMED}:
-                    logger.debug(f"[VAD_WS] Status: {status.value}, speculative_task={'running' if state.speculative_task else 'none'}")
+                    logger.debug(f"[VAD_WS] Status: {status.value}, speculative_task={'running' if state.speculative_task else 'none'}, is_generating={state.is_generating}")
+
+                # ================================================================
+                # BARGE-IN HANDLING: User starts speaking during generation
+                # ================================================================
+                if state.is_generating and status == VADStatus.SPEECH_START:
+                    logger.info(f"[BARGE-IN] 🛑 User started speaking during generation - stopping current output")
+                    state.is_generating = False
+                    
+                    # Cancel any speculative task from previous response
+                    if state.speculative_task is not None:
+                        state.speculative_cancelled = True
+                        state.speculative_task.cancel()
+                        state.speculative_task = None
+                    
+                    # Clear speculative results
+                    state.speculative_stt_result = None
+                    state.speculative_llm_result = None
+                    state.speculative_pipeline_complete = False
+                    
+                    # Tell frontend to stop playback and clear buffer
+                    await send_message(state, "stop_playback", {})
+                    await send_message(state, "clear_speculative_buffer", {})
+                    
+                    # Reset TTS session for new utterance
+                    if state.tts_session_id is not None:
+                        asyncio.create_task(self._reset_tts_session_after_cancel(state))
+                    
+                    # Reset VAD to start fresh
+                    self.triton_client.vad.reset_state()
+                    state.vad_time_ms = 0.0
+                    
+                    # Process this audio chunk as start of new speech
+                    status, audio_data = await loop.run_in_executor(
+                        None,
+                        self.triton_client.vad.process_with_state,
+                        combined_audio,
+                        state.vad_time_ms,
+                    )
+                    state.vad_time_ms += len(combined_audio) / 16000.0 * 1000.0
 
                 # Handle speech resumption - cancel speculative processing so we can re-run with more audio
                 # Only cancel on actual SPEECH_RESUMED, not on SPEAKING (which is just "in utterance")
                 if status == VADStatus.SPEECH_RESUMED and state.speculative_task is not None:
-                    logger.info(f"[SPECULATIVE] Speech resumed, cancelling speculative (will re-trigger on next silence)")
+                    logger.info(f"[SPECULATIVE] Speech resumed, cancelling speculative and clearing frontend buffer")
                     state.speculative_cancelled = True
                     state.speculative_task.cancel()
                     state.speculative_task = None
                     state.speculative_stt_result = None
                     state.speculative_llm_result = None
-                    # Don't send cancellation to frontend - it's internal re-triggering
+                    state.speculative_pipeline_complete = False
+                    # Tell frontend to clear its speculative buffer
+                    await send_message(state, "clear_speculative_buffer", {})
+                    
+                    # TTS session may be in bad state after cancellation
+                    # Close and re-init for next speculative run
+                    if state.tts_session_id is not None:
+                        asyncio.create_task(self._reset_tts_session_after_cancel(state))
 
                 if status in {VADStatus.SPEAKING, VADStatus.SPEECH_START, VADStatus.SPEECH_CONTINUE, VADStatus.SPEECH_RESUMED, VADStatus.UTTERANCE_COMPLETE, VADStatus.EARLY_SILENCE}:
                     await send_message(state, "vad_status", {"status": status.value})
@@ -373,13 +431,20 @@ class WebSocketHandler:
                         state.speculative_task.cancel()
                         state.speculative_task = None
                     
-                    logger.info(f"[SPECULATIVE] Early silence detected, starting speculative STT/LLM ({len(audio_data)} samples)")
+                    logger.info(f"[SPECULATIVE] Early silence detected, starting speculative STT+LLM ({len(audio_data)} samples)")
                     state.speculative_cancelled = False
                     state.speculative_stt_result = None
                     state.speculative_llm_result = None
                     state.speculative_task = asyncio.create_task(
                         self._process_speculative_stt_llm(state, audio_data)
                     )
+                    
+                    # Also ensure TTS session is being initialized if not ready yet
+                    # This handles the case where user speaks before previous TTS session pre-init completes
+                    if state.tts_session_id is None and not state.tts_session_ready.is_set():
+                        logger.info(f"[SPECULATIVE] TTS session not ready, ensuring init in progress")
+                        # The _init_tts_session handles the case where init is already in progress
+                        asyncio.create_task(self._init_tts_session(state))
 
                 # Handle full utterance completion
                 if status == VADStatus.UTTERANCE_COMPLETE and audio_data is not None:
@@ -408,15 +473,20 @@ class WebSocketHandler:
         audio: np.ndarray,
     ) -> None:
         """
-        Process audio speculatively through STT and LLM.
-        Results are cached and used if utterance completes without more speech.
+        Process audio speculatively through FULL pipeline: STT → LLM → TTS → MuseTalk.
+        AV frames are sent to frontend as 'speculative_av_frame' and buffered there.
+        On utterance_complete, frontend plays from buffer immediately (near-zero latency).
         """
         try:
-            # Speculative STT
+            loop = asyncio.get_event_loop()
+            state.speculative_pipeline_complete = False
+            
+            # ================================================================
+            # Phase 1: Speculative STT
+            # ================================================================
             logger.info(f"[SPECULATIVE] Starting STT on {len(audio)} samples")
             await send_message(state, "speculative_stt_start", {})
             
-            loop = asyncio.get_event_loop()
             transcript = await loop.run_in_executor(
                 None,
                 self.triton_client.stt.transcribe,
@@ -424,48 +494,147 @@ class WebSocketHandler:
             )
             
             if state.speculative_cancelled:
-                logger.info(f"[SPECULATIVE] STT completed but cancelled, discarding")
+                if transcript.strip():
+                    state.last_speculative_stt = transcript
+                logger.info(f"[SPECULATIVE] STT completed but cancelled, saving for potential reuse: '{transcript}'")
                 return
             
             state.speculative_stt_result = transcript
+            state.last_speculative_stt = transcript
             logger.info(f"[SPECULATIVE] STT result: {transcript}")
             await send_message(state, "speculative_stt_complete", {"text": transcript})
             
             if not transcript.strip():
                 return
             
-            # Speculative LLM - start generating but don't use TTS yet
-            logger.info(f"[SPECULATIVE] Starting LLM generation")
+            # ================================================================
+            # Phase 2: Speculative LLM (streaming tokens to TTS)
+            # ================================================================
+            logger.info(f"[SPECULATIVE] Starting LLM + TTS + MuseTalk pipeline")
             await send_message(state, "speculative_llm_start", {})
             
-            # Build prompt using existing history (don't add user message to history yet)
-            prompt = self.triton_client.llm.build_prompt(
-                transcript,
-                state.conversation.get_history(),  # Current history without this message
-            )
-            
-            # Run LLM in executor (it's synchronous)
-            loop = asyncio.get_event_loop()
-            llm_response = ""
-            
-            def run_llm():
-                nonlocal llm_response
-                for token in self.triton_client.llm.generate_stream(prompt):
-                    if state.speculative_cancelled:
-                        return
-                    llm_response += token
-                    # We can't easily send websocket messages from here
-                    # Just collect the full response
-            
-            await loop.run_in_executor(None, run_llm)
-            
-            if state.speculative_cancelled:
-                logger.info(f"[SPECULATIVE] LLM cancelled, discarding")
+            # Wait for TTS session to be ready
+            try:
+                await asyncio.wait_for(
+                    state.tts_session_ready.wait(),
+                    timeout=self.config.streaming.tts_init_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[SPECULATIVE] TTS session not ready, falling back to STT+LLM only")
+                # Fall back to LLM-only speculative
+                await self._speculative_llm_only(state, transcript)
                 return
             
-            state.speculative_llm_result = llm_response
-            logger.info(f"[SPECULATIVE] LLM complete: {len(llm_response)} chars")
-            await send_message(state, "speculative_llm_complete", {"text": llm_response})
+            if state.tts_session_id is None:
+                logger.warning(f"[SPECULATIVE] TTS session not initialized, falling back to STT+LLM only")
+                await self._speculative_llm_only(state, transcript)
+                return
+            
+            if state.speculative_cancelled:
+                return
+            
+            # Check video availability
+            video_enabled = await self._check_musetalk_available()
+            
+            # Build prompt
+            prompt = self.triton_client.llm.build_prompt(
+                transcript,
+                state.conversation.get_history(),
+            )
+            
+            # Create async LLM generator
+            async def llm_generator():
+                token_queue: asyncio.Queue = asyncio.Queue()
+                done = False
+
+                def llm_worker():
+                    nonlocal done
+                    try:
+                        for token in self.triton_client.llm.generate_stream(prompt):
+                            if state.speculative_cancelled:
+                                break
+                            loop.call_soon_threadsafe(token_queue.put_nowait, ("token", token))
+                    finally:
+                        done = True
+                        loop.call_soon_threadsafe(token_queue.put_nowait, ("done", None))
+
+                loop.run_in_executor(None, llm_worker)
+
+                while not done or not token_queue.empty():
+                    try:
+                        msg_type, data = await asyncio.wait_for(
+                            token_queue.get(), timeout=0.1
+                        )
+                        if msg_type == "done":
+                            break
+                        if state.speculative_cancelled:
+                            break
+                        yield data
+                    except asyncio.TimeoutError:
+                        if state.speculative_cancelled:
+                            break
+                        continue
+
+            llm_response = ""
+            
+            def on_llm_token(token, full_text):
+                nonlocal llm_response
+                llm_response = full_text
+                # Update state so partial result is available even before pipeline completes
+                state.speculative_llm_result = full_text
+            
+            def on_speculative_av_frame(frame):
+                """Send AV frame as speculative (buffered on frontend)."""
+                # Track last video frame for idle display
+                if frame.video_jpeg is not None:
+                    state.last_video_frame = frame.video_jpeg
+                    self._global_last_video_frame = frame.video_jpeg
+                
+                state.musetalk_frame_index = frame.frame_index + 1
+                self._global_frame_index = frame.frame_index + 1
+                
+                payload = frame.to_websocket_payload()
+                payload["speculative"] = True  # Mark as speculative
+                return asyncio.create_task(
+                    send_message(state, "speculative_av_frame", payload)
+                )
+            
+            # Run full pipeline with speculative AV frame handler
+            try:
+                final_response = await self.pipeline.process_llm_and_tts(
+                    llm_generator=llm_generator(),
+                    tts_session_id=state.tts_session_id,
+                    video_enabled=video_enabled,
+                    base_frame_index=state.musetalk_frame_index,
+                    is_generating=lambda: not state.speculative_cancelled,
+                    on_llm_token=on_llm_token,
+                    on_av_frame=on_speculative_av_frame,
+                    on_error=lambda msg: logger.error(f"[SPECULATIVE] Pipeline error: {msg}"),
+                    on_llm_complete=lambda text: None,
+                    on_tts_complete=lambda: None,
+                )
+                
+                if state.speculative_cancelled:
+                    if llm_response.strip():
+                        state.last_speculative_llm = llm_response
+                    logger.info(f"[SPECULATIVE] Pipeline cancelled after partial completion")
+                    return
+                
+                state.speculative_llm_result = final_response or llm_response
+                state.last_speculative_llm = state.speculative_llm_result
+                state.speculative_pipeline_complete = True
+                
+                logger.info(f"[SPECULATIVE] ✅ Full pipeline complete: {len(state.speculative_llm_result)} chars")
+                await send_message(state, "speculative_pipeline_complete", {
+                    "text": state.speculative_llm_result
+                })
+                
+            except Exception as exc:
+                logger.error(f"[SPECULATIVE] Pipeline error: {exc}")
+                # Fall back to LLM-only result if we have it
+                if llm_response.strip():
+                    state.speculative_llm_result = llm_response
+                    state.last_speculative_llm = llm_response
             
         except asyncio.CancelledError:
             logger.info(f"[SPECULATIVE] Task cancelled")
@@ -473,6 +642,41 @@ class WebSocketHandler:
             logger.error(f"[SPECULATIVE] Error: {exc}")
             import traceback
             logger.error(traceback.format_exc())
+    
+    async def _speculative_llm_only(
+        self,
+        state: ConnectionState,
+        transcript: str,
+    ) -> None:
+        """Run LLM-only speculative processing (fallback when TTS not ready)."""
+        loop = asyncio.get_event_loop()
+        
+        prompt = self.triton_client.llm.build_prompt(
+            transcript,
+            state.conversation.get_history(),
+        )
+        
+        llm_response = ""
+        
+        def run_llm():
+            nonlocal llm_response
+            for token in self.triton_client.llm.generate_stream(prompt):
+                if state.speculative_cancelled:
+                    return
+                llm_response += token
+        
+        await loop.run_in_executor(None, run_llm)
+        
+        if state.speculative_cancelled:
+            if llm_response.strip():
+                state.last_speculative_llm = llm_response
+            logger.info(f"[SPECULATIVE] LLM cancelled, saving: {len(llm_response)} chars")
+            return
+        
+        state.speculative_llm_result = llm_response
+        state.last_speculative_llm = llm_response
+        logger.info(f"[SPECULATIVE] LLM complete (no TTS): {len(llm_response)} chars")
+        await send_message(state, "speculative_llm_complete", {"text": llm_response})
 
     async def _process_voice_to_voice(
         self,
@@ -494,53 +698,132 @@ class WebSocketHandler:
                     f"task={state.speculative_task is not None}, "
                     f"cancelled={state.speculative_cancelled}, "
                     f"stt_result={state.speculative_stt_result is not None}, "
-                    f"llm_result={state.speculative_llm_result is not None}")
+                    f"llm_result={state.speculative_llm_result is not None}, "
+                    f"pipeline_complete={state.speculative_pipeline_complete}")
 
         try:
-            if use_speculative:
-                # Wait for speculative task to complete if still running
-                if not state.speculative_task.done():
-                    logger.info(f"[VOICE2VOICE] Waiting for speculative task to complete")
-                    try:
-                        await asyncio.wait_for(state.speculative_task, timeout=5.0)
-                    except asyncio.TimeoutError:
-                        logger.warning(f"[VOICE2VOICE] Speculative task timed out, falling back to normal")
-                        use_speculative = False
-                    except asyncio.CancelledError:
-                        use_speculative = False
-            
             if use_speculative and state.speculative_stt_result:
-                # Use speculative STT result
+                # Use speculative STT result - DON'T wait for full pipeline!
                 transcript = state.speculative_stt_result
                 t_stt = (time.time() - t_start) * 1000
                 logger.info(f"[LATENCY] STT (speculative): {t_stt:.0f}ms - '{transcript}'")
                 await send_message(state, "stt_start", {})
                 await send_message(state, "stt_complete", {"text": transcript, "speculative": True})
-            else:
-                # Normal STT processing
-                await send_message(state, "stt_start", {})
-                loop = asyncio.get_event_loop()
-                transcript = await loop.run_in_executor(
-                    None,
-                    self.triton_client.stt.transcribe,
-                    audio,
-                )
-                t_stt = (time.time() - t_start) * 1000
-                logger.info(f"[LATENCY] STT (normal): {t_stt:.0f}ms - '{transcript}'")
-                await send_message(state, "stt_complete", {"text": transcript})
+                
+                # Update conversation history
+                state.conversation.add_user_message(transcript)
+                
+                # Send UI updates for LLM (even if still running, show what we have)
+                await send_message(state, "llm_start", {})
+                
+                if state.speculative_llm_result:
+                    # LLM finished, send the result
+                    await send_message(state, "llm_token", {
+                        "token": state.speculative_llm_result,
+                        "full_text": state.speculative_llm_result
+                    })
+                    await send_message(state, "llm_complete", {"text": state.speculative_llm_result})
+                    state.conversation.add_assistant_message(state.speculative_llm_result)
+                
+                await send_message(state, "tts_start", {"text": "", "video_enabled": True})
+                
+                # Signal frontend to start playing from speculative buffer IMMEDIATELY
+                # Frontend will play whatever frames are buffered and continue receiving more
+                logger.info(f"[VOICE2VOICE] 🚀 Signaling frontend to start playing from buffer (pipeline still running)")
+                await send_message(state, "start_speculative_playback", {})
+                
+                # Now wait for the speculative task to complete (in background, frames still streaming)
+                if state.speculative_task and not state.speculative_task.done():
+                    logger.info(f"[VOICE2VOICE] Waiting for speculative pipeline to finish...")
+                    try:
+                        await state.speculative_task
+                    except asyncio.CancelledError:
+                        pass
+                
+                # If we didn't send the LLM result yet (was still generating when playback started),
+                # send it now that pipeline is complete
+                if state.speculative_llm_result:
+                    # Send full LLM text to frontend
+                    await send_message(state, "llm_token", {
+                        "token": "",
+                        "full_text": state.speculative_llm_result
+                    })
+                    await send_message(state, "llm_complete", {"text": state.speculative_llm_result})
+                    # Add to conversation if not already added
+                    last_assistant = state.conversation.get_last_assistant_message()
+                    if not last_assistant or last_assistant != state.speculative_llm_result:
+                        state.conversation.add_assistant_message(state.speculative_llm_result)
+                
+                # Signal completion
+                await self._on_tts_complete(state)
+                
+                # Re-init TTS session for next utterance
+                if state.tts_session_id is not None:
+                    await self._close_tts_session(state)
+                asyncio.create_task(self._init_tts_session(state))
+                return
+            
+            # === Non-speculative path: normal STT processing ===
+            await send_message(state, "stt_start", {})
+            loop = asyncio.get_event_loop()
+            transcript = await loop.run_in_executor(
+                None,
+                self.triton_client.stt.transcribe,
+                audio,
+            )
+            t_stt = (time.time() - t_start) * 1000
+            logger.info(f"[LATENCY] STT (normal): {t_stt:.0f}ms - '{transcript}'")
+            await send_message(state, "stt_complete", {"text": transcript})
+            
+            # Check if final STT matches last speculative STT - can reuse results!
+            reuse_llm_result: Optional[str] = None
+            if (state.last_speculative_stt and
+                transcript.strip() == state.last_speculative_stt.strip()):
+                # Check if full pipeline was completed - use the buffered frames!
+                if state.speculative_pipeline_complete and state.last_speculative_llm:
+                    logger.info(f"[VOICE2VOICE] ✅ Final STT matches speculative, using buffered frames!")
+                    
+                    # Update conversation
+                    state.conversation.add_user_message(transcript)
+                    state.conversation.add_assistant_message(state.last_speculative_llm)
+                    
+                    # Send UI updates
+                    await send_message(state, "llm_start", {})
+                    await send_message(state, "llm_token", {
+                        "token": state.last_speculative_llm,
+                        "full_text": state.last_speculative_llm
+                    })
+                    await send_message(state, "llm_complete", {"text": state.last_speculative_llm})
+                    await send_message(state, "tts_start", {"text": "", "video_enabled": True})
+                    
+                    # Signal frontend to play from buffer
+                    await send_message(state, "start_speculative_playback", {})
+                    await self._on_tts_complete(state)
+                    
+                    if state.tts_session_id is not None:
+                        await self._close_tts_session(state)
+                    asyncio.create_task(self._init_tts_session(state))
+                    return
+                
+                # Only LLM cached, need to run TTS
+                if state.last_speculative_llm:
+                    logger.info(f"[VOICE2VOICE] ✅ Final STT matches, reusing LLM result")
+                    reuse_llm_result = state.last_speculative_llm
+            elif state.last_speculative_stt:
+                logger.info(f"[VOICE2VOICE] ❌ STT mismatch: final='{transcript}' vs speculative='{state.last_speculative_stt}'")
+                # Clear speculative buffer on frontend since STT changed
+                await send_message(state, "clear_speculative_buffer", {})
 
             if not transcript.strip():
                 return
 
             state.conversation.add_user_message(transcript)
 
-            # Check if we have speculative LLM result
-            t_llm_start = time.time()
-            if use_speculative and state.speculative_llm_result:
+            # Use cached LLM result if available, otherwise run normal pipeline
+            if reuse_llm_result:
                 t_llm = (time.time() - t_start) * 1000
-                logger.info(f"[LATENCY] LLM (speculative): {t_llm:.0f}ms - {len(state.speculative_llm_result)} chars")
-                # Use cached LLM result, just need to run TTS
-                await self._process_tts_with_cached_llm(state, transcript, state.speculative_llm_result)
+                logger.info(f"[LATENCY] LLM (reused): {t_llm:.0f}ms - {len(reuse_llm_result)} chars")
+                await self._process_tts_with_cached_llm(state, transcript, reuse_llm_result)
             else:
                 # Normal LLM + TTS + MuseTalk
                 await self._process_llm_and_tts(state, transcript)
@@ -557,6 +840,10 @@ class WebSocketHandler:
             state.speculative_stt_result = None
             state.speculative_llm_result = None
             state.speculative_cancelled = False
+            state.speculative_pipeline_complete = False
+            # Clear last speculative results after use to avoid stale data
+            state.last_speculative_stt = None
+            state.last_speculative_llm = None
 
     async def _process_tts_with_cached_llm(
         self,
@@ -571,12 +858,8 @@ class WebSocketHandler:
         await send_message(state, "llm_token", {"token": cached_llm_response, "full_text": cached_llm_response})
         await send_message(state, "llm_complete", {"text": cached_llm_response})
 
-        # Close any existing TTS session and init new one
-        if state.tts_session_id is not None:
-            await self._close_tts_session(state)
-
-        await self._init_tts_session(state)
-
+        # Use the pre-initialized TTS session (initialized after previous response)
+        # Wait for it to be ready
         try:
             await asyncio.wait_for(
                 state.tts_session_ready.wait(),
@@ -629,9 +912,13 @@ class WebSocketHandler:
         # Update conversation
         state.conversation.add_assistant_message(llm_response)
 
-        # Close TTS session
+        # Close TTS session and pre-initialize next one for faster subsequent responses
         if state.tts_session_id is not None:
             await self._close_tts_session(state)
+        
+        # Pre-initialize next TTS session in background (don't await)
+        # This ensures the session is ready for the next utterance
+        asyncio.create_task(self._init_tts_session(state))
 
     async def _process_llm_and_tts(
         self,
@@ -647,12 +934,8 @@ class WebSocketHandler:
 
         await send_message(state, "llm_start", {})
 
-        # Close any existing TTS session and init new one
-        if state.tts_session_id is not None:
-            await self._close_tts_session(state)
-
-        await self._init_tts_session(state)
-
+        # Use the pre-initialized TTS session (initialized after previous response or on connect)
+        # Wait for it to be ready
         try:
             await asyncio.wait_for(
                 state.tts_session_ready.wait(),
@@ -730,9 +1013,13 @@ class WebSocketHandler:
         # Update conversation
         state.conversation.add_assistant_message(llm_response)
 
-        # Close TTS session
+        # Close TTS session and pre-initialize next one for faster subsequent responses
         if state.tts_session_id is not None:
             await self._close_tts_session(state)
+        
+        # Pre-initialize next TTS session in background (don't await)
+        # This ensures the session is ready for the next utterance
+        asyncio.create_task(self._init_tts_session(state))
 
     def _handle_av_frame(self, state: ConnectionState, frame) -> asyncio.Task:
         """Handle AV frame - track last video frame and send to client."""
@@ -762,56 +1049,71 @@ class WebSocketHandler:
 
     async def _init_tts_session(self, state: ConnectionState) -> None:
         """Initialize TTS session for the connection."""
-        state.tts_session_ready.clear()
-
-        if not self.triton_client.is_healthy():
-            await send_message(state, "tts_cache_ready", {
-                "success": False,
-                "session_id": None,
-                "reason": "server_unavailable",
-            })
+        # Prevent multiple concurrent TTS inits
+        if state.tts_init_in_progress:
+            logger.info(f"[TTS_INIT] Already in progress, skipping duplicate init")
             return
+            
+        async with state.tts_init_lock:
+            # Double check after acquiring lock
+            if state.tts_session_ready.is_set() and state.tts_session_id is not None:
+                logger.info(f"[TTS_INIT] Session {state.tts_session_id} already ready, skipping")
+                return
+                
+            state.tts_init_in_progress = True
+            state.tts_session_ready.clear()
 
-        if state.tts_session_id is not None:
-            await self._close_tts_session(state)
-
-        new_session_id = self.tts_service._get_next_session_id()
-        state.tts_session_id = new_session_id
-
-        loop = asyncio.get_event_loop()
-        success = await loop.run_in_executor(
-            None,
-            self.tts_service.init_session,
-            new_session_id,
-        )
-
-        if not state.is_connected:
-            # Connection closed during init
             try:
-                await loop.run_in_executor(
+                if not self.triton_client.is_healthy():
+                    await send_message(state, "tts_cache_ready", {
+                        "success": False,
+                        "session_id": None,
+                        "reason": "server_unavailable",
+                    })
+                    return
+
+                if state.tts_session_id is not None:
+                    await self._close_tts_session(state)
+
+                new_session_id = self.tts_service._get_next_session_id()
+                state.tts_session_id = new_session_id
+
+                loop = asyncio.get_event_loop()
+                success = await loop.run_in_executor(
                     None,
-                    self.tts_service.close_session,
+                    self.tts_service.init_session,
                     new_session_id,
                 )
-            except Exception:
-                pass
-            state.tts_session_id = None
-            return
 
-        if success:
-            state.tts_session_ready.set()
-            await send_message(state, "tts_cache_ready", {
-                "success": True,
-                "session_id": new_session_id,
-            })
-            logger.info(f"TTS cache initialized for session {new_session_id}")
-        else:
-            state.tts_session_id = None
-            await send_message(state, "tts_cache_ready", {
-                "success": False,
-                "session_id": new_session_id,
-                "reason": "init_failed",
-            })
+                if not state.is_connected:
+                    # Connection closed during init
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            self.tts_service.close_session,
+                            new_session_id,
+                        )
+                    except Exception:
+                        pass
+                    state.tts_session_id = None
+                    return
+
+                if success:
+                    state.tts_session_ready.set()
+                    await send_message(state, "tts_cache_ready", {
+                        "success": True,
+                        "session_id": new_session_id,
+                    })
+                    logger.info(f"TTS cache initialized for session {new_session_id}")
+                else:
+                    state.tts_session_id = None
+                    await send_message(state, "tts_cache_ready", {
+                        "success": False,
+                        "session_id": new_session_id,
+                        "reason": "init_failed",
+                    })
+            finally:
+                state.tts_init_in_progress = False
 
     async def _close_tts_session(self, state: ConnectionState) -> None:
         """Close TTS session for the connection."""
@@ -833,6 +1135,18 @@ class WebSocketHandler:
             logger.warning(f"Error closing TTS session {old_session_id}: {exc}")
 
         state.tts_session_id = None
+
+    async def _reset_tts_session_after_cancel(self, state: ConnectionState) -> None:
+        """Reset TTS session after speculative pipeline was cancelled."""
+        # Wait a tiny bit for the cancellation to propagate
+        await asyncio.sleep(0.1)
+        
+        # Close the potentially corrupted session
+        await self._close_tts_session(state)
+        
+        # Re-initialize for the next speculative run
+        await self._init_tts_session(state)
+        logger.info(f"[TTS_RESET] TTS session reset after speculative cancellation")
 
     async def _cleanup_connection(self, state: ConnectionState) -> None:
         """Clean up connection resources."""

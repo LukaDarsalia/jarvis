@@ -268,6 +268,13 @@ class ConversationHistory:
         """Get history as list of dicts for LLM."""
         return [{"role": m.role, "content": m.content} for m in self.messages]
 
+    def get_last_assistant_message(self) -> Optional[str]:
+        """Get the last assistant message content, or None if none."""
+        for msg in reversed(self.messages):
+            if msg.role == "assistant":
+                return msg.content
+        return None
+
     def clear(self) -> None:
         """Clear all history."""
         self.messages.clear()

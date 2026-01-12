@@ -58,6 +58,16 @@ class VoiceAssistant {
         this.lastVideoFrame = null;      // Fallback video frame
         this.framesPlayed = 0;
         this.framesReceived = 0;
+        
+        // Speculative buffer - holds AV frames from background processing
+        // Frames buffered here while user is still in silence period
+        // On utterance_complete, we start playing from this buffer immediately
+        this.speculativeBuffer = new Map();  // frame_index -> frame payload
+        this.speculativeActive = false;       // Is speculative processing active?
+        this.speculativeStartTime = null;     // When speculative started
+        this.speculativeFramesReceived = 0;
+        this.speculativePlaybackPending = false;  // Waiting for frames to arrive?
+        
         this.frameOrderStats = {
             outOfOrder: 0,
             duplicates: 0,
@@ -79,7 +89,7 @@ class VoiceAssistant {
 
         // Buffer configuration - simple manual setting
         this.bufferConfig = {
-            minFrames: 24,          // Initial buffer: ~1 second at 25fps (reduced from 48)
+            minFrames: 1,           // Initial buffer: 1 frame for minimal latency
             maxFrames: 150,         // Maximum buffer size
             missingFrameToleranceMs: 400,
         };
@@ -273,7 +283,7 @@ class VoiceAssistant {
     initializeBufferControls() {
         if (this.elements.bufferFrames) {
             const frames = parseInt(this.elements.bufferFrames.value, 10);
-            this.bufferConfig.minFrames = Number.isFinite(frames) && frames > 0 ? frames : 48;
+            this.bufferConfig.minFrames = Number.isFinite(frames) && frames > 0 ? frames : 1;
         }
         this.updateBufferDisplay();
     }
@@ -281,7 +291,7 @@ class VoiceAssistant {
     updateBufferFrames() {
         if (this.elements.bufferFrames) {
             const frames = parseInt(this.elements.bufferFrames.value, 10);
-            this.bufferConfig.minFrames = Number.isFinite(frames) && frames > 0 ? frames : 48;
+            this.bufferConfig.minFrames = Number.isFinite(frames) && frames > 0 ? frames : 1;
             this.updateBufferDisplay();
         }
     }
@@ -674,12 +684,75 @@ class VoiceAssistant {
                 }
                 break;
 
+            // ============ Speculative Processing Messages ============
+            
+            case 'speculative_stt_start':
+                this.speculativeActive = true;
+                this.speculativeStartTime = performance.now();
+                this.speculativeBuffer.clear();
+                this.speculativeFramesReceived = 0;
+                this.log('Speculative processing started');
+                break;
+            
+            case 'speculative_stt_complete':
+                this.log(`Speculative STT: "${data.text}"`);
+                break;
+            
+            case 'speculative_llm_start':
+                this.log('Speculative LLM + TTS + MuseTalk started');
+                break;
+            
+            case 'speculative_llm_complete':
+                this.log(`Speculative LLM complete: ${data.text?.length || 0} chars`);
+                break;
+            
+            case 'speculative_av_frame':
+                // Buffer speculative AV frames (don't play yet)
+                this.handleSpeculativeAVFrame(data);
+                break;
+            
+            case 'speculative_pipeline_complete':
+                this.log(`Speculative pipeline complete: ${this.speculativeBuffer.size} frames buffered`);
+                // If we're already playing from speculative buffer, mark stream complete
+                if (this.isPlaying && this.speculativeActive) {
+                    this.streamComplete = true;
+                }
+                break;
+            
+            case 'start_speculative_playback':
+                // Utterance completed! Start playing from speculative buffer immediately
+                // even if more frames are still arriving
+                this.startSpeculativePlayback();
+                break;
+            
+            case 'play_speculative_buffer':
+                // Legacy: play all buffered frames (used when pipeline is complete)
+                this.playFromSpeculativeBuffer();
+                break;
+            
+            case 'clear_speculative_buffer':
+                // STT changed or user resumed speaking - clear buffer
+                this.clearSpeculativeBuffer();
+                break;
+
+            case 'stop_playback':
+                // User interrupted (barge-in) - stop current playback immediately
+                this.log('🛑 Barge-in: stopping playback');
+                this.stopGenerationWatchdog();
+                this.isGenerating = false;
+                this.hideStopButton();
+                this.stopPlayback();
+                this.clearSpeculativeBuffer();
+                this.updateAvatarStatus('listening', 'მოსმენა');
+                break;
+
             case 'error':
                 this.log('Error:', data.message);
                 this.stopGenerationWatchdog();  // Stop watchdog timer
                 this.isGenerating = false;
                 this.hideStopButton();
                 this.stopPlayback();
+                this.clearSpeculativeBuffer();
                 this.updateAvatarStatus('error', 'შეცდომა');
                 break;
         }
@@ -824,6 +897,9 @@ class VoiceAssistant {
             underrunCount: 0,
             burstCount: 0,
         };
+        
+        // Note: We intentionally do NOT clear speculativeBuffer here
+        // It's preserved during transition from speculative to normal playback
     }
 
     prepareReplayCapture() {
@@ -1037,6 +1113,235 @@ class VoiceAssistant {
                 }
             }
         }
+    }
+
+    // ============ Speculative Buffer Handling ============
+
+    handleSpeculativeAVFrame(data) {
+        // Update activity to prevent watchdog timeout during speculative buffering
+        this.lastActivityTime = performance.now();
+        
+        // If we're already playing (speculative playback started), add to main buffer instead
+        if (this.isPlaying) {
+            // Playback already started - treat this as a regular frame
+            this.handleAVFrame(data);
+            return;
+        }
+        
+        // Buffer speculative AV frames without playing
+        const frameIndex = Number(data.frame_index);
+        if (!Number.isFinite(frameIndex)) {
+            this.log('Invalid speculative frame index:', data.frame_index);
+            return;
+        }
+
+        // Decode audio if present
+        let audioFloat = null;
+        if (data.audio) {
+            audioFloat = this.decodeAudioBase64(data.audio);
+        }
+
+        const payload = {
+            audio: audioFloat,
+            frame: data.frame,
+            frameIndex: frameIndex,
+            timestampMs: data.timestamp_ms,
+            word: data.word || '',
+            rtf: data.rtf,
+            generation_time_ms: data.generation_time_ms,
+            audio_duration_ms: data.audio_duration_ms,
+        };
+
+        this.speculativeBuffer.set(frameIndex, payload);
+        this.speculativeFramesReceived++;
+
+        // Log progress periodically
+        if (this.speculativeFramesReceived === 1) {
+            this.metricLog(`⏳ First speculative frame buffered (index ${frameIndex})`);
+            
+            // If playback was requested but buffer was empty, start now
+            if (this.speculativePlaybackPending) {
+                this.log('First frame arrived while playback was pending - starting now');
+                this.speculativePlaybackPending = false;
+                this.startSpeculativePlayback();
+            }
+        } else if (this.speculativeFramesReceived % 25 === 0) {
+            const elapsedMs = this.speculativeStartTime 
+                ? performance.now() - this.speculativeStartTime 
+                : 0;
+            this.log(`Speculative buffer: ${this.speculativeBuffer.size} frames (${elapsedMs.toFixed(0)}ms elapsed)`);
+        }
+    }
+
+    playFromSpeculativeBuffer() {
+        // Called when utterance completes and STT matches speculative
+        // Transfer speculative buffer to main buffer and start playback IMMEDIATELY
+        
+        if (this.speculativeBuffer.size === 0) {
+            this.log('No speculative frames to play');
+            return;
+        }
+
+        const bufferMs = this.speculativeStartTime 
+            ? performance.now() - this.speculativeStartTime 
+            : 0;
+        
+        this.metricLog(`🚀 Playing from speculative buffer: ${this.speculativeBuffer.size} frames (buffered for ${bufferMs.toFixed(0)}ms)`);
+
+        // Reset playback state but keep speculative buffer
+        this.stopPlayback();
+        this.frameBuffer = new Map();
+        this.nextFrameIndex = null;
+        this.highestFrameIndex = null;
+        this.framesPlayed = 0;
+        this.framesReceived = 0;
+        this.isBuffering = false;  // Skip buffering - we already have frames!
+        this.isPlaying = false;
+        this.isPaused = false;
+        this.lastVideoFrame = null;
+        this.nextAudioTime = 0;
+        
+        // Reset frame stats
+        this.frameArrivalStats = {
+            lastArrivalTime: null,
+            gapSamples: [],
+            maxSamples: 50,
+            underrunCount: 0,
+            burstCount: 0,
+        };
+
+        // Transfer speculative buffer to main frame buffer
+        for (const [index, payload] of this.speculativeBuffer) {
+            this.frameBuffer.set(index, payload);
+            this.framesReceived++;
+            
+            if (this.nextFrameIndex === null || index < this.nextFrameIndex) {
+                this.nextFrameIndex = index;
+            }
+            if (this.highestFrameIndex === null || index > this.highestFrameIndex) {
+                this.highestFrameIndex = index;
+            }
+        }
+
+        // Also copy to replay buffer
+        this.pendingReplayFrames = new Map(this.speculativeBuffer);
+        
+        // Clear speculative buffer
+        this.speculativeBuffer.clear();
+        this.speculativeActive = false;
+        this.speculativeFramesReceived = 0;
+
+        // Mark stream as complete (all frames already buffered)
+        this.streamComplete = true;
+        
+        // Start playback immediately - NO BUFFERING DELAY
+        this.startNewStreamMetrics();
+        this.runMetrics.ttsStartAt = performance.now();
+        this.runMetrics.firstAVFrameAt = performance.now();
+        
+        // Record the key metric - time from utterance to first frame (should be near 0!)
+        const utteranceToFirstAV = this.runMetrics.vadUtteranceAt !== null
+            ? performance.now() - this.runMetrics.vadUtteranceAt
+            : null;
+        this.metricLog(`⚡ FIRST AV FRAME (from buffer): ${this.formatMs(utteranceToFirstAV)} after utterance end`);
+
+        this.updateAvatarStatus('speaking', 'საუბრობს');
+        this.startPlayback();
+    }
+
+    startSpeculativePlayback() {
+        // Called when utterance completes - start playing from speculative buffer immediately
+        // while more frames may still be arriving from the backend
+        
+        if (this.speculativeBuffer.size === 0) {
+            this.log('No speculative frames buffered yet, waiting for first frame...');
+            // Set flag to start playback when first frame arrives
+            this.speculativePlaybackPending = true;
+            return;
+        }
+        
+        this._doStartSpeculativePlayback();
+    }
+    
+    _doStartSpeculativePlayback() {
+        // Actually start playback from speculative buffer
+        this.speculativePlaybackPending = false;
+
+        const bufferedMs = this.speculativeStartTime 
+            ? performance.now() - this.speculativeStartTime 
+            : 0;
+        
+        this.metricLog(`🚀 Starting speculative playback: ${this.speculativeBuffer.size} frames (buffered for ${bufferedMs.toFixed(0)}ms)`);
+
+        // Record the KEY METRIC - time from utterance to playback start
+        const utteranceToPlayback = this.runMetrics.vadUtteranceAt !== null
+            ? performance.now() - this.runMetrics.vadUtteranceAt
+            : null;
+        this.metricLog(`⚡ PLAYBACK START: ${this.formatMs(utteranceToPlayback)} after utterance end`);
+
+        // Transfer speculative buffer to main frame buffer
+        this.stopPlayback();
+        this.frameBuffer = new Map();
+        this.nextFrameIndex = null;
+        this.highestFrameIndex = null;
+        this.framesPlayed = 0;
+        this.framesReceived = 0;
+        this.isBuffering = false;  // Start playing immediately!
+        this.isPlaying = false;
+        this.isPaused = false;
+        this.lastVideoFrame = null;
+        this.nextAudioTime = 0;
+        this.streamComplete = false;  // More frames may still arrive!
+        
+        // Reset frame stats
+        this.frameArrivalStats = {
+            lastArrivalTime: null,
+            gapSamples: [],
+            maxSamples: 50,
+            underrunCount: 0,
+            burstCount: 0,
+        };
+
+        // Transfer speculative buffer to main frame buffer
+        for (const [index, payload] of this.speculativeBuffer) {
+            this.frameBuffer.set(index, payload);
+            this.framesReceived++;
+            
+            if (this.nextFrameIndex === null || index < this.nextFrameIndex) {
+                this.nextFrameIndex = index;
+            }
+            if (this.highestFrameIndex === null || index > this.highestFrameIndex) {
+                this.highestFrameIndex = index;
+            }
+        }
+
+        // Prepare replay capture
+        this.pendingReplayFrames = new Map(this.speculativeBuffer);
+        
+        // Clear speculative buffer - frames now in main buffer
+        this.speculativeBuffer.clear();
+        // Keep speculativeActive true - we may still receive more frames via synced_av_frame
+        this.speculativeFramesReceived = 0;
+
+        // Start playback metrics
+        this.startNewStreamMetrics();
+        this.runMetrics.ttsStartAt = performance.now();
+        this.runMetrics.firstAVFrameAt = performance.now();
+
+        this.updateAvatarStatus('speaking', 'საუბრობს');
+        this.startPlayback();
+    }
+
+    clearSpeculativeBuffer() {
+        // Called when user resumes speaking or STT doesn't match
+        if (this.speculativeBuffer.size > 0) {
+            this.log(`Clearing speculative buffer: ${this.speculativeBuffer.size} frames discarded`);
+        }
+        this.speculativeBuffer.clear();
+        this.speculativeActive = false;
+        this.speculativeFramesReceived = 0;
+        this.speculativeStartTime = null;
+        this.speculativePlaybackPending = false;  // Cancel any pending playback
     }
 
     startPlayback() {
@@ -1369,6 +1674,13 @@ class VoiceAssistant {
         const isSpeaking = ['speaking', 'speech_start', 'speech_continue'].includes(status);
         if (isSpeaking && this.runMetrics.vadSpeechStartAt === null && !this.isGenerating) {
             this.resetRunMetrics();
+        }
+
+        // If user starts speaking again while speculative is active, clear the buffer
+        // This is important - the speculative content is now invalid
+        if (isSpeaking && this.speculativeActive) {
+            this.log('User resumed speaking, clearing speculative buffer');
+            this.clearSpeculativeBuffer();
         }
 
         if (isSpeaking) {
