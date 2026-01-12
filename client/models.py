@@ -18,6 +18,8 @@ class VADStatus(Enum):
     SPEECH_START = "speech_start"
     SPEAKING = "speaking"
     SPEECH_CONTINUE = "speech_continue"
+    SPEECH_RESUMED = "speech_resumed"  # Speech resumed after early silence - cancel speculative
+    EARLY_SILENCE = "early_silence"  # Early silence detected, can start speculative STT/LLM
     UTTERANCE_COMPLETE = "utterance_complete"
 
 

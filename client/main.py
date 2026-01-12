@@ -201,6 +201,7 @@ async def get_config():
         "vad": {
             "speech_threshold_ms": config.vad.speech_threshold_ms,
             "silence_threshold_ms": config.vad.silence_threshold_ms,
+            "early_silence_threshold_ms": config.vad.early_silence_threshold_ms,
             "prob_threshold": config.vad.prob_threshold,
         },
         "llm": {
@@ -235,6 +236,8 @@ async def update_config(new_config: dict):
             config.vad.speech_threshold_ms = float(vad["speech_threshold_ms"])
         if "silence_threshold_ms" in vad:
             config.vad.silence_threshold_ms = float(vad["silence_threshold_ms"])
+        if "early_silence_threshold_ms" in vad:
+            config.vad.early_silence_threshold_ms = float(vad["early_silence_threshold_ms"])
         if "prob_threshold" in vad:
             config.vad.prob_threshold = float(vad["prob_threshold"])
 
@@ -302,5 +305,5 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
-    os.environ.setdefault("TRITON_URL", "185.151.171.35:46218")
+    os.environ.setdefault("TRITON_URL", "185.151.171.35:51155")
     uvicorn.run(app, host="0.0.0.0", port=8080)

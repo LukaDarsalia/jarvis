@@ -12,6 +12,9 @@ class VADConfig:
     """Voice Activity Detection configuration."""
     speech_threshold_ms: float = 200.0
     silence_threshold_ms: float = 1500.0
+    # Early silence threshold for speculative STT/LLM processing
+    # When silence reaches this threshold, we start STT speculatively to reduce latency
+    early_silence_threshold_ms: float = 500.0
     prob_threshold: float = 0.5
     sample_rate: int = 16000
     chunk_samples: int = 512
@@ -64,8 +67,9 @@ class MuseTalkConfig:
 class StreamingConfig:
     """Streaming and buffering configuration."""
     # Audio processor settings
-    audio_batch_size: int = 5
-    audio_batch_timeout_s: float = 0.05
+    # Reduced batch size and timeout for more responsive VAD
+    audio_batch_size: int = 2  # Reduced from 5 - process fewer chunks per batch
+    audio_batch_timeout_s: float = 0.02  # Reduced from 0.05 - 20ms timeout
     audio_queue_max_size: int = 200
 
     # Adaptive buffer settings

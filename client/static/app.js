@@ -166,6 +166,8 @@ class VoiceAssistant {
             musetalkLastFrameAt: null,
             musetalkFirstFrameIndex: null,
             musetalkLastFrameIndex: null,
+            // Key latency metric: utterance end to first AV frame
+            firstAVFrameAt: null,
         };
     }
 
@@ -215,6 +217,8 @@ class VoiceAssistant {
             speechThresholdValue: document.getElementById('speechThresholdValue'),
             silenceThreshold: document.getElementById('silenceThreshold'),
             silenceThresholdValue: document.getElementById('silenceThresholdValue'),
+            earlySilenceThreshold: document.getElementById('earlySilenceThreshold'),
+            earlySilenceThresholdValue: document.getElementById('earlySilenceThresholdValue'),
             llmTemperature: document.getElementById('llmTemperature'),
             llmTemperatureValue: document.getElementById('llmTemperatureValue'),
             llmTopP: document.getElementById('llmTopP'),
@@ -250,7 +254,7 @@ class VoiceAssistant {
         this.elements.resetSettingsBtn?.addEventListener('click', () => this.resetSettings());
 
         // Sliders
-        ['speechThreshold', 'silenceThreshold', 'llmTemperature', 'llmTopP', 'llmMaxTokens',
+        ['speechThreshold', 'silenceThreshold', 'earlySilenceThreshold', 'llmTemperature', 'llmTopP', 'llmMaxTokens',
          'ttsBackboneTemp', 'ttsBackboneTopP', 'ttsDepthTemp', 'ttsDepthTopP',
          'musetalkBatchSize', 'musetalkLookaheadChunks'].forEach(id => {
             const slider = this.elements[id];
@@ -454,9 +458,15 @@ class VoiceAssistant {
         const effectiveArrivalFps = avgArrivalGapMs ? (1000 / avgArrivalGapMs) : null;
 
         const ttsRtfText = this.formatRate(ttsRtf, '');
+        
+        // KEY METRIC: utterance end to first AV frame
+        const utteranceToFirstAV = metrics.vadUtteranceAt !== null && metrics.firstAVFrameAt !== null
+            ? metrics.firstAVFrameAt - metrics.vadUtteranceAt
+            : null;
 
         this.metricLog(
-            `Final (${reason}) | VAD ${this.formatMs(vadLatencyMs)} | STT ${this.formatMs(sttLatencyMs)} | ` +
+            `Final (${reason}) | ⚡ First AV ${this.formatMs(utteranceToFirstAV)} | ` +
+            `VAD ${this.formatMs(vadLatencyMs)} | STT ${this.formatMs(sttLatencyMs)} | ` +
             `LLM first ${this.formatMs(llmFirstTokenMs)} | LLM speed ${this.formatRate(llmSpeed, ' tok/s')} | ` +
             `TTS first ${this.formatMs(ttsFirstAudioMs)} | TTS RTF ${ttsRtfText} | ` +
             `MuseTalk first ${this.formatMs(musetalkFirstMs)} | MuseTalk eff_fps ${this.formatRate(musetalkEffFps, '')} | ` +
@@ -558,7 +568,10 @@ class VoiceAssistant {
                 break;
 
             case 'stt_start':
+                // Preserve vadUtteranceAt since it was set just before this
+                const savedVadUtteranceAt = this.runMetrics.vadUtteranceAt;
                 this.resetRunMetrics();
+                this.runMetrics.vadUtteranceAt = savedVadUtteranceAt;
                 this.runMetrics.sttStartAt = performance.now();
                 this.updateVadStatus('processing');
                 this.setVadStatusText('ტრანსკრიფცია...');
@@ -921,6 +934,15 @@ class VoiceAssistant {
         if (data.audio) {
             audioFloat = this.decodeAudioBase64(data.audio);
             this.logDecodedAudioStats(audioFloat, frameIndex, data.audio.length);
+        }
+
+        // KEY METRIC: Time from utterance end to first AV frame
+        if (this.runMetrics.firstAVFrameAt === null && (audioFloat || data.frame)) {
+            this.runMetrics.firstAVFrameAt = performance.now();
+            const utteranceToFirstAV = this.runMetrics.vadUtteranceAt !== null
+                ? this.runMetrics.firstAVFrameAt - this.runMetrics.vadUtteranceAt
+                : null;
+            this.metricLog(`⚡ FIRST AV FRAME: ${this.formatMs(utteranceToFirstAV)} after utterance end`);
         }
 
         if (audioFloat && this.runMetrics.ttsFirstAudioAt === null) {
@@ -1536,6 +1558,7 @@ class VoiceAssistant {
 
         setVal('speechThreshold', this.config.vad.speech_threshold_ms);
         setVal('silenceThreshold', this.config.vad.silence_threshold_ms);
+        setVal('earlySilenceThreshold', this.config.vad.early_silence_threshold_ms ?? 500);
         setVal('llmTemperature', this.config.llm.temperature);
         setVal('llmTopP', this.config.llm.top_p);
         setVal('llmMaxTokens', this.config.llm.max_new_tokens);
@@ -1551,6 +1574,7 @@ class VoiceAssistant {
     async saveSettings() {
         this.config.vad.speech_threshold_ms = parseInt(this.elements.speechThreshold?.value || 200);
         this.config.vad.silence_threshold_ms = parseInt(this.elements.silenceThreshold?.value || 1500);
+        this.config.vad.early_silence_threshold_ms = parseInt(this.elements.earlySilenceThreshold?.value || 500);
         this.config.llm.temperature = parseFloat(this.elements.llmTemperature?.value || 0.7);
         this.config.llm.top_p = parseFloat(this.elements.llmTopP?.value || 0.9);
         this.config.llm.max_new_tokens = parseInt(this.elements.llmMaxTokens?.value || 512);
