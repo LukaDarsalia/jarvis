@@ -33,6 +33,7 @@ pip install -U onnx onnxscript
 python3 ./download_data.py
 python3 ./onnx_csm/export_backbone_step_onnx.py
 python3 ./onnx_csm/export_depth_decoder_onnx.py
+python3 ./model_repository/musetalk/export_unet_onnx.py --fp16
 python3 ./onnx_csm/generate_with_backbone_and_depth_onnx.py
 
 # Export MuseTalk UNet to ONNX (FP16 for faster inference)

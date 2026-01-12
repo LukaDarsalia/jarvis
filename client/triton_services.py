@@ -30,6 +30,16 @@ logger = logging.getLogger(__name__)
 class TritonClientBase:
     """Base class for Triton client services."""
 
+    # gRPC keepalive settings - conservative to avoid server rejection
+    # Server may enforce minimum ping intervals, so we use longer intervals
+    GRPC_KEEPALIVE_OPTIONS = [
+        ('grpc.keepalive_time_ms', 60000),  # Send keepalive ping every 60s
+        ('grpc.keepalive_timeout_ms', 20000),  # Wait 20s for ping ack
+        ('grpc.keepalive_permit_without_calls', True),  # Allow keepalive without active calls
+        ('grpc.http2.min_time_between_pings_ms', 60000),  # Min 60s between pings
+        ('grpc.http2.max_pings_without_data', 0),  # Unlimited pings without data
+    ]
+
     def __init__(self, triton_url: str):
         self.triton_url = triton_url
         self._client: Optional[grpc_client.InferenceServerClient] = None
@@ -40,7 +50,10 @@ class TritonClientBase:
         """Get or create the Triton client."""
         with self._lock:
             if self._client is None:
-                self._client = grpc_client.InferenceServerClient(url=self.triton_url)
+                self._client = grpc_client.InferenceServerClient(
+                    url=self.triton_url,
+                    channel_args=self.GRPC_KEEPALIVE_OPTIONS,
+                )
             return self._client
 
     def is_healthy(self) -> bool:
@@ -72,12 +85,15 @@ class VADService(TritonClientBase):
     def __init__(self, triton_url: str, config: VADConfig):
         super().__init__(triton_url)
         self.config = config
+        logger.info(f"[VAD] Initialized with early_silence={config.early_silence_threshold_ms}ms, "
+                   f"silence={config.silence_threshold_ms}ms, speech={config.speech_threshold_ms}ms")
 
         # VAD state machine
         self._is_speaking = False
         self._speech_start_time: Optional[float] = None
         self._last_speech_time: Optional[float] = None
         self._accumulated_audio: List[np.ndarray] = []
+        self._early_silence_triggered = False  # Track if we already sent EARLY_SILENCE
 
     def process_chunk(self, audio_chunk: np.ndarray) -> Tuple[bool, float, bool]:
         """
@@ -122,36 +138,59 @@ class VADService(TritonClientBase):
             current_time_ms: Current time in milliseconds
 
         Returns:
-            Tuple of (status, complete_audio_if_utterance_done)
+            Tuple of (status, audio_if_available)
+            - EARLY_SILENCE: returns audio so far for speculative processing
+            - UTTERANCE_COMPLETE: returns final complete audio
+            - Others: returns None
         """
         is_speech, prob, _ = self.process_chunk(audio_chunk)
 
         if is_speech:
-            if not self._is_speaking:
-                # Speech just started
+            # Check if this is a brand new utterance (after full reset)
+            if self._speech_start_time is None:
                 self._speech_start_time = current_time_ms
                 self._accumulated_audio = []
+                self._early_silence_triggered = False
+                logger.debug(f"[VAD] New utterance started at {current_time_ms:.0f}ms")
+            elif not self._is_speaking:
+                # Speech resuming after a pause within the same utterance
+                # Reset early silence flag so it can trigger again with updated audio
+                was_early_triggered = self._early_silence_triggered
+                logger.info(f"[VAD] Speech resumed at {current_time_ms:.0f}ms, "
+                           f"resetting early_silence_triggered from {self._early_silence_triggered} to False")
+                self._early_silence_triggered = False
+                
+                # If early silence was triggered, we need to signal speech resumed
+                # so speculative processing can be cancelled
+                if was_early_triggered:
+                    self._is_speaking = True
+                    self._last_speech_time = current_time_ms
+                    self._accumulated_audio.append(audio_chunk)
+                    return VADStatus.SPEECH_RESUMED, None
 
             self._is_speaking = True
             self._last_speech_time = current_time_ms
             self._accumulated_audio.append(audio_chunk)
 
-            speech_duration = current_time_ms - self._speech_start_time
-            if speech_duration >= self.config.speech_threshold_ms:
+            # Calculate total speech duration from original start
+            total_speech_duration = self._last_speech_time - self._speech_start_time
+            if total_speech_duration >= self.config.speech_threshold_ms:
                 return VADStatus.SPEAKING, None
             return VADStatus.LISTENING, None
 
         else:
             # No speech detected
-            if self._is_speaking:
+            if self._speech_start_time is not None:
+                # We're in an utterance (may or may not be currently speaking)
                 silence_duration = current_time_ms - self._last_speech_time
                 self._accumulated_audio.append(audio_chunk)
+                
+                # Total speech duration from the original utterance start
+                total_speech_duration = self._last_speech_time - self._speech_start_time
 
+                # Check for full utterance completion first
                 if silence_duration >= self.config.silence_threshold_ms:
-                    # Utterance complete
-                    speech_duration = self._last_speech_time - self._speech_start_time
-
-                    if speech_duration >= self.config.speech_threshold_ms:
+                    if total_speech_duration >= self.config.speech_threshold_ms:
                         complete_audio = np.concatenate(self._accumulated_audio)
                         self.reset_state()
                         return VADStatus.UTTERANCE_COMPLETE, complete_audio
@@ -160,6 +199,31 @@ class VADService(TritonClientBase):
                     self.reset_state()
                     return VADStatus.LISTENING, None
 
+                # Check for early silence (speculative processing trigger)
+                # Can trigger multiple times if speech resumes and then goes silent again
+                early_conditions = (
+                    not self._early_silence_triggered,
+                    silence_duration >= self.config.early_silence_threshold_ms,
+                    total_speech_duration >= self.config.speech_threshold_ms
+                )
+                
+                if silence_duration >= 400:  # Log when approaching threshold
+                    logger.info(f"[VAD] Silence check: duration={silence_duration:.0f}ms, "
+                               f"early_triggered={self._early_silence_triggered}, "
+                               f"conditions={early_conditions}, "
+                               f"early_thresh={self.config.early_silence_threshold_ms}ms")
+                
+                if all(early_conditions):
+                    self._early_silence_triggered = True
+                    # Return copy of audio so far for speculative processing
+                    early_audio = np.concatenate(self._accumulated_audio)
+                    logger.info(f"[VAD] EARLY_SILENCE triggered: silence_duration={silence_duration:.0f}ms, "
+                               f"early_threshold={self.config.early_silence_threshold_ms}ms, "
+                               f"full_threshold={self.config.silence_threshold_ms}ms")
+                    return VADStatus.EARLY_SILENCE, early_audio
+
+                # Mark as not actively speaking (but still in utterance)
+                self._is_speaking = False
                 return VADStatus.SPEAKING, None
 
             return VADStatus.LISTENING, None
@@ -170,6 +234,7 @@ class VADService(TritonClientBase):
         self._last_speech_time = None
         self._accumulated_audio = []
         self._is_speaking = False
+        self._early_silence_triggered = False
 
 
 # ============================================================================
