@@ -350,7 +350,8 @@ class TritonPythonModel:
     def _send_frame(self, sender, frame_data: np.ndarray, frame_index: int, timestamp_ms: float, is_final: bool = False):
         """Send a video frame response"""
         # Encode frame as JPEG for efficient transmission
-        _, jpeg_data = cv2.imencode('.jpg', frame_data, [cv2.IMWRITE_JPEG_QUALITY, 20])
+        _, jpeg_data = cv2.imencode('.jpg', frame_data, [cv2.IMWRITE_JPEG_QUALITY, 20
+                                                         ])
         jpeg_bytes = jpeg_data.tobytes()
         
         frame_tensor = pb_utils.Tensor("VIDEO_FRAME", np.frombuffer(jpeg_bytes, dtype=np.uint8))
