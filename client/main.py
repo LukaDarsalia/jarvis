@@ -251,6 +251,7 @@ async def update_config(new_config: dict):
             config.llm.top_p = float(llm["top_p"])
         if "system_prompt" in llm:
             config.llm.system_prompt = str(llm["system_prompt"])
+            logger.info(f"[CONFIG] Updated system_prompt to: {config.llm.system_prompt[:50]}...")
 
     if "tts" in new_config:
         tts = new_config["tts"]
@@ -305,5 +306,5 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
-    os.environ.setdefault("TRITON_URL", "185.151.171.35:51155")
+    os.environ.setdefault("TRITON_URL", "localhost:8001")
     uvicorn.run(app, host="0.0.0.0", port=8080)

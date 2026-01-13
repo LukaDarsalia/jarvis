@@ -90,6 +90,8 @@ class ConnectionState:
     last_speculative_llm: Optional[str] = None
     # Track if speculative pipeline completed TTS+MuseTalk
     speculative_pipeline_complete: bool = False
+    # Flag to signal that llm_start has been sent to frontend - start streaming tokens
+    speculative_llm_ui_started: bool = False
 
     # Serialize websocket sends to preserve message order
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -381,6 +383,7 @@ class WebSocketHandler:
                     state.speculative_stt_result = None
                     state.speculative_llm_result = None
                     state.speculative_pipeline_complete = False
+                    state.speculative_llm_ui_started = False
                     
                     # Tell frontend to stop playback and clear buffer
                     await send_message(state, "stop_playback", {})
@@ -413,6 +416,7 @@ class WebSocketHandler:
                     state.speculative_stt_result = None
                     state.speculative_llm_result = None
                     state.speculative_pipeline_complete = False
+                    state.speculative_llm_ui_started = False
                     # Tell frontend to clear its speculative buffer
                     await send_message(state, "clear_speculative_buffer", {})
                     
@@ -435,6 +439,8 @@ class WebSocketHandler:
                     state.speculative_cancelled = False
                     state.speculative_stt_result = None
                     state.speculative_llm_result = None
+                    state.speculative_llm_ui_started = False  # Reset UI streaming flag
+                    state.speculative_pipeline_complete = False
                     state.speculative_task = asyncio.create_task(
                         self._process_speculative_stt_llm(state, audio_data)
                     )
@@ -582,6 +588,16 @@ class WebSocketHandler:
                 llm_response = full_text
                 # Update state so partial result is available even before pipeline completes
                 state.speculative_llm_result = full_text
+                
+                # Stream LLM tokens to frontend for live text display
+                # Only do this if utterance has completed (llm_start sent)
+                if state.speculative_llm_ui_started:
+                    asyncio.create_task(
+                        send_message(state, "llm_token", {
+                            "token": token,
+                            "full_text": full_text
+                        })
+                    )
             
             def on_speculative_av_frame(frame):
                 """Send AV frame as speculative (buffered on frontend)."""
@@ -716,14 +732,19 @@ class WebSocketHandler:
                 # Send UI updates for LLM (even if still running, show what we have)
                 await send_message(state, "llm_start", {})
                 
+                # Enable LLM token streaming to frontend from speculative pipeline
+                state.speculative_llm_ui_started = True
+                
                 if state.speculative_llm_result:
-                    # LLM finished, send the result
+                    # LLM already has some/all result, send it immediately
                     await send_message(state, "llm_token", {
                         "token": state.speculative_llm_result,
                         "full_text": state.speculative_llm_result
                     })
-                    await send_message(state, "llm_complete", {"text": state.speculative_llm_result})
-                    state.conversation.add_assistant_message(state.speculative_llm_result)
+                    # Only send llm_complete if pipeline is done
+                    if state.speculative_pipeline_complete:
+                        await send_message(state, "llm_complete", {"text": state.speculative_llm_result})
+                        state.conversation.add_assistant_message(state.speculative_llm_result)
                 
                 await send_message(state, "tts_start", {"text": "", "video_enabled": True})
                 
@@ -743,7 +764,7 @@ class WebSocketHandler:
                 # If we didn't send the LLM result yet (was still generating when playback started),
                 # send it now that pipeline is complete
                 if state.speculative_llm_result:
-                    # Send full LLM text to frontend
+                    # Send full LLM text to frontend (final update)
                     await send_message(state, "llm_token", {
                         "token": "",
                         "full_text": state.speculative_llm_result
@@ -753,6 +774,9 @@ class WebSocketHandler:
                     last_assistant = state.conversation.get_last_assistant_message()
                     if not last_assistant or last_assistant != state.speculative_llm_result:
                         state.conversation.add_assistant_message(state.speculative_llm_result)
+                
+                # Reset UI streaming flag
+                state.speculative_llm_ui_started = False
                 
                 # Signal completion
                 await self._on_tts_complete(state)
