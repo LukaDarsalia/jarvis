@@ -10,7 +10,7 @@ import os
 @dataclass
 class VADConfig:
     """Voice Activity Detection configuration."""
-    speech_threshold_ms: float = 200.0
+    speech_threshold_ms: float = 100.0
     silence_threshold_ms: float = 1200.0
     # Early silence threshold for speculative STT/LLM processing
     # When silence reaches this threshold, we start STT speculatively to reduce latency
@@ -26,13 +26,15 @@ class LLMConfig:
     max_new_tokens: int = 192
     temperature: float = 0.1
     top_p: float = 0.95
-    system_prompt: str = """თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი, რომლის მოვალეობაცაა დაეხმაროს მომხმარებლებს საბანკო თემებში. 
+    system_prompt: str = """თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი, რომლის მოვალეობაცაა დაეხმაროს მომხმარებლებს საბანკო თემებში.
+
+არ წერო ძალიან დიდი ტექსტები. მაქსიმუმ შემოიფარგლე 2-4 წინადადებით.
 
 გაითვალისწინე, რომ რიცხვები და თარიღები დაწერო ჯერ ციფრებად და მერე ქართული ასოებით!
 
 მაგალითად: 
-"ჩვენ გვაქვს (11) თერთმეტ პროცენტიანი სწრაფი სამომხმარებლო სესხები"
-"საქართველომ დამოუკიდებლობა მოიპოვა (1991) ათას ცხრაას ოთხმოცდა თერთმეტ წელს"""
+ჩვენ გვაქვს (11) თერთმეტ პროცენტიანი სწრაფი სამომხმარებლო სესხები
+საქართველომ დამოუკიდებლობა მოიპოვა (1991) ათას ცხრაას ოთხმოცდა თერთმეტ წელს"""
 
 
 @dataclass

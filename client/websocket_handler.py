@@ -90,6 +90,10 @@ class ConnectionState:
     last_speculative_llm: Optional[str] = None
     # Track if speculative pipeline completed TTS+MuseTalk
     speculative_pipeline_complete: bool = False
+    # Track whether speculative pipeline actually started TTS (not LLM-only fallback)
+    speculative_tts_started: bool = False
+    # Track speculative AV frame count for sanity checks
+    speculative_av_frame_count: int = 0
     # Flag to signal that llm_start has been sent to frontend - start streaming tokens
     speculative_llm_ui_started: bool = False
 
@@ -383,6 +387,8 @@ class WebSocketHandler:
                     state.speculative_stt_result = None
                     state.speculative_llm_result = None
                     state.speculative_pipeline_complete = False
+                    state.speculative_tts_started = False
+                    state.speculative_av_frame_count = 0
                     state.speculative_llm_ui_started = False
                     
                     # Tell frontend to stop playback and clear buffer
@@ -416,6 +422,8 @@ class WebSocketHandler:
                     state.speculative_stt_result = None
                     state.speculative_llm_result = None
                     state.speculative_pipeline_complete = False
+                    state.speculative_tts_started = False
+                    state.speculative_av_frame_count = 0
                     state.speculative_llm_ui_started = False
                     # Tell frontend to clear its speculative buffer
                     await send_message(state, "clear_speculative_buffer", {})
@@ -441,6 +449,8 @@ class WebSocketHandler:
                     state.speculative_llm_result = None
                     state.speculative_llm_ui_started = False  # Reset UI streaming flag
                     state.speculative_pipeline_complete = False
+                    state.speculative_tts_started = False
+                    state.speculative_av_frame_count = 0
                     state.speculative_task = asyncio.create_task(
                         self._process_speculative_stt_llm(state, audio_data)
                     )
@@ -486,6 +496,8 @@ class WebSocketHandler:
         try:
             loop = asyncio.get_event_loop()
             state.speculative_pipeline_complete = False
+            state.speculative_tts_started = False
+            state.speculative_av_frame_count = 0
             
             # ================================================================
             # Phase 1: Speculative STT
@@ -521,6 +533,8 @@ class WebSocketHandler:
             
             # Wait for TTS session to be ready
             try:
+                if state.tts_session_id is None and not state.tts_init_in_progress:
+                    asyncio.create_task(self._init_tts_session(state))
                 await asyncio.wait_for(
                     state.tts_session_ready.wait(),
                     timeout=self.config.streaming.tts_init_timeout_s,
@@ -528,16 +542,22 @@ class WebSocketHandler:
             except asyncio.TimeoutError:
                 logger.warning(f"[SPECULATIVE] TTS session not ready, falling back to STT+LLM only")
                 # Fall back to LLM-only speculative
+                state.speculative_tts_started = False
+                state.speculative_av_frame_count = 0
                 await self._speculative_llm_only(state, transcript)
                 return
             
             if state.tts_session_id is None:
                 logger.warning(f"[SPECULATIVE] TTS session not initialized, falling back to STT+LLM only")
+                state.speculative_tts_started = False
+                state.speculative_av_frame_count = 0
                 await self._speculative_llm_only(state, transcript)
                 return
             
             if state.speculative_cancelled:
                 return
+            
+            state.speculative_tts_started = True
             
             # Check video availability
             video_enabled = await self._check_musetalk_available()
@@ -608,6 +628,7 @@ class WebSocketHandler:
                 
                 state.musetalk_frame_index = frame.frame_index + 1
                 self._global_frame_index = frame.frame_index + 1
+                state.speculative_av_frame_count += 1
                 
                 payload = frame.to_websocket_payload()
                 payload["speculative"] = True  # Mark as speculative
@@ -666,6 +687,8 @@ class WebSocketHandler:
     ) -> None:
         """Run LLM-only speculative processing (fallback when TTS not ready)."""
         loop = asyncio.get_event_loop()
+        state.speculative_tts_started = False
+        state.speculative_av_frame_count = 0
         
         prompt = self.triton_client.llm.build_prompt(
             transcript,
@@ -707,7 +730,8 @@ class WebSocketHandler:
         use_speculative = (
             state.speculative_task is not None and
             not state.speculative_cancelled and
-            state.speculative_stt_result is not None
+            state.speculative_stt_result is not None and
+            state.speculative_tts_started
         )
         
         logger.info(f"[VOICE2VOICE] use_speculative={use_speculative}, "
@@ -787,6 +811,41 @@ class WebSocketHandler:
                 asyncio.create_task(self._init_tts_session(state))
                 return
             
+            # If speculative ran LLM-only (no TTS), reuse STT/LLM and run TTS now
+            if (
+                state.speculative_task is not None and
+                not state.speculative_cancelled and
+                state.speculative_stt_result is not None and
+                not state.speculative_tts_started
+            ):
+                transcript = state.speculative_stt_result
+                t_stt = (time.time() - t_start) * 1000
+                logger.info(f"[LATENCY] STT (speculative): {t_stt:.0f}ms - '{transcript}'")
+                await send_message(state, "stt_start", {})
+                await send_message(state, "stt_complete", {"text": transcript, "speculative": True})
+
+                if not transcript.strip():
+                    return
+
+                state.conversation.add_user_message(transcript)
+
+                if state.speculative_task and not state.speculative_task.done():
+                    logger.info("[VOICE2VOICE] Waiting for speculative LLM-only result...")
+                    try:
+                        await state.speculative_task
+                    except asyncio.CancelledError:
+                        pass
+
+                if state.speculative_llm_result:
+                    await self._process_tts_with_cached_llm(
+                        state,
+                        transcript,
+                        state.speculative_llm_result,
+                    )
+                else:
+                    await self._process_llm_and_tts(state, transcript)
+                return
+
             # === Non-speculative path: normal STT processing ===
             await send_message(state, "stt_start", {})
             loop = asyncio.get_event_loop()
@@ -865,6 +924,8 @@ class WebSocketHandler:
             state.speculative_llm_result = None
             state.speculative_cancelled = False
             state.speculative_pipeline_complete = False
+            state.speculative_tts_started = False
+            state.speculative_av_frame_count = 0
             # Clear last speculative results after use to avoid stale data
             state.last_speculative_stt = None
             state.last_speculative_llm = None
@@ -885,6 +946,8 @@ class WebSocketHandler:
         # Use the pre-initialized TTS session (initialized after previous response)
         # Wait for it to be ready
         try:
+            if state.tts_session_id is None and not state.tts_init_in_progress:
+                asyncio.create_task(self._init_tts_session(state))
             await asyncio.wait_for(
                 state.tts_session_ready.wait(),
                 timeout=self.config.streaming.tts_init_timeout_s,
@@ -961,6 +1024,8 @@ class WebSocketHandler:
         # Use the pre-initialized TTS session (initialized after previous response or on connect)
         # Wait for it to be ready
         try:
+            if state.tts_session_id is None and not state.tts_init_in_progress:
+                asyncio.create_task(self._init_tts_session(state))
             await asyncio.wait_for(
                 state.tts_session_ready.wait(),
                 timeout=self.config.streaming.tts_init_timeout_s,
