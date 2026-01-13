@@ -429,6 +429,7 @@ class TTSGenerator:
         min_steps_max: Optional[int] = None,
         min_steps_char_threshold: int = 5,
         min_steps_char_bucket: int = 6,
+        min_steps_scope: str = "full_text",
     ):
         _ = compile_model  # kept for API compatibility
         self.device = torch.device(device)
@@ -450,6 +451,11 @@ class TTSGenerator:
         self.min_steps_max = max(self.min_steps_default, int(min_steps_max))
         self.min_steps_char_threshold = max(1, int(min_steps_char_threshold))
         self.min_steps_char_bucket = max(1, int(min_steps_char_bucket))
+        if min_steps_scope not in ("full_text", "last_word"):
+            raise ValueError(
+                f"min_steps_scope must be 'full_text' or 'last_word', got '{min_steps_scope}'"
+            )
+        self.min_steps_scope = min_steps_scope
 
         # Torch settings
         torch.set_grad_enabled(False)
@@ -601,21 +607,29 @@ class TTSGenerator:
             return self.min_steps_default
         georgian_words = _GEORGIAN_WORD_RE.findall(text)
         if georgian_words and MIN_STEPS_BY_LEN:
-            max_len = max(len(word) for word in georgian_words)
-            if max_len in MIN_STEPS_BY_LEN:
-                steps = MIN_STEPS_BY_LEN[max_len]
+            if self.min_steps_scope == "last_word":
+                target_len = len(georgian_words[-1])
+            else:
+                target_len = max(len(word) for word in georgian_words)
+            if target_len in MIN_STEPS_BY_LEN:
+                steps = MIN_STEPS_BY_LEN[target_len]
             else:
                 keys = sorted(MIN_STEPS_BY_LEN)
                 steps = None
                 for key in keys:
-                    if key >= max_len:
+                    if key >= target_len:
                         steps = MIN_STEPS_BY_LEN[key]
                         break
                 if steps is None:
                     steps = MIN_STEPS_BY_LEN[keys[-1]]
             return min(int(steps), self.min_steps_max)
 
-        letters_count = len(_SPEECH_TEXT_RE.findall(text))
+        if self.min_steps_scope == "last_word":
+            tokens = text.strip().split()
+            target_text = tokens[-1] if tokens else ""
+        else:
+            target_text = text
+        letters_count = len(_SPEECH_TEXT_RE.findall(target_text))
         if letters_count == 0:
             return 0
         extra = max(0, (letters_count - self.min_steps_char_threshold) // self.min_steps_char_bucket)
@@ -1080,6 +1094,7 @@ class TTSConfig:
     min_steps_max: Optional[int] = None
     min_steps_char_threshold: int = 5
     min_steps_char_bucket: int = 6
+    min_steps_scope: str = "full_text"
 
 
 def _split_text_for_streaming(text: str) -> List[str]:
@@ -1117,6 +1132,7 @@ if __name__ == "__main__":
         min_steps_max=config.min_steps_max,
         min_steps_char_threshold=config.min_steps_char_threshold,
         min_steps_char_bucket=config.min_steps_char_bucket,
+        min_steps_scope=config.min_steps_scope,
     )
 
     assistant_texts = [
@@ -1150,6 +1166,7 @@ if __name__ == "__main__":
         print(f"\n[Turn {turn_idx}] {text}")
         print(
             f"[Turn {turn_idx}] min_steps={config.min_steps} max={tts_generator.min_steps_max} "
+            f"scope={tts_generator.min_steps_scope} "
             f"chars>={config.min_steps_char_threshold} "
             f"bucket={config.min_steps_char_bucket} "
             f"words={len(words)} chunks={len(all_chunks)}"
