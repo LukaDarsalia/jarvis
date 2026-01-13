@@ -675,6 +675,12 @@ class VoiceAssistant {
                 this.isGenerating = false;
                 this.hideStopButton();
                 this.finalizeReplayCapture();
+                if (data.idle_frame) {
+                    this.idleFrame = data.idle_frame;
+                    if (!this.isPlaying) {
+                        this.displayFrame(data.idle_frame);
+                    }
+                }
 
                 // If still buffering or paused, force start/resume playback
                 if ((this.isBuffering || this.isPaused) && this.frameBuffer.size > 0) {

@@ -1139,7 +1139,13 @@ class WebSocketHandler:
     async def _on_tts_complete(self, state: ConnectionState) -> None:
         """Handle TTS/video completion."""
         await send_message(state, "tts_complete", {})
-        await send_message(state, "video_complete", {})
+
+        idle_frame = state.last_video_frame or self._global_last_video_frame
+        payload: Dict[str, Any] = {}
+        if idle_frame:
+            payload["idle_frame"] = base64.b64encode(idle_frame).decode("utf-8")
+
+        await send_message(state, "video_complete", payload)
 
     async def _init_tts_session(self, state: ConnectionState) -> None:
         """Initialize TTS session for the connection."""
