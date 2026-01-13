@@ -408,7 +408,7 @@ class TTSGenerator:
         compile_model: bool = True,
         reference_audio_path: Optional[str] = None,
         reference_json_path: Optional[str] = None,
-        max_concurrent_sessions: int = 4,
+        max_concurrent_sessions: int = 64,
         idle_timeout_seconds: float = 300.0,  # 5 minutes default
     ):
         _ = compile_model  # kept for API compatibility
