@@ -574,7 +574,9 @@ class TTSGenerator:
         )
 
     def _min_steps_for_text(self, text: str) -> int:
-        if not text or not _SPEECH_TEXT_RE.search(text):
+        if not text or not text.strip():
+            return self.min_steps_default
+        if not _SPEECH_TEXT_RE.search(text):
             return 0
         return self.min_steps_default
 
