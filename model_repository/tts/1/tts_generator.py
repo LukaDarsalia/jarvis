@@ -414,6 +414,9 @@ class TTSGenerator:
         max_concurrent_sessions: int = 64,
         idle_timeout_seconds: float = 300.0,  # 5 minutes default
         min_steps_default: int = 1,
+        min_steps_max: Optional[int] = None,
+        min_steps_char_threshold: int = 5,
+        min_steps_char_bucket: int = 6,
     ):
         _ = compile_model  # kept for API compatibility
         self.device = torch.device(device)
@@ -427,6 +430,11 @@ class TTSGenerator:
         self.max_concurrent_sessions = max_concurrent_sessions
         self.idle_timeout_seconds = idle_timeout_seconds
         self.min_steps_default = max(0, int(min_steps_default))
+        if min_steps_max is None:
+            min_steps_max = self.min_steps_default + 2
+        self.min_steps_max = max(self.min_steps_default, int(min_steps_max))
+        self.min_steps_char_threshold = max(1, int(min_steps_char_threshold))
+        self.min_steps_char_bucket = max(1, int(min_steps_char_bucket))
 
         # Torch settings
         torch.set_grad_enabled(False)
@@ -576,11 +584,19 @@ class TTSGenerator:
     def _min_steps_for_text(self, text: str) -> int:
         if not text or not text.strip():
             return self.min_steps_default
-        if not _SPEECH_TEXT_RE.search(text):
+        letters_count = len(_SPEECH_TEXT_RE.findall(text))
+        if letters_count == 0:
             return 0
-        return self.min_steps_default
+        extra = max(0, (letters_count - self.min_steps_char_threshold) // self.min_steps_char_bucket)
+        return min(self.min_steps_default + extra, self.min_steps_max)
 
-    def append_texts(self, session_id: int, texts: List[str], speaker_id: int = 0) -> bool:
+    def append_texts(
+        self,
+        session_id: int,
+        texts: List[str],
+        speaker_id: int = 0,
+        min_steps_overrides: Optional[List[int]] = None,
+    ) -> bool:
         """
         Append additional text segments to an existing session's input queue.
 
@@ -593,8 +609,11 @@ class TTSGenerator:
             self.sessions[session_id].last_activity_time = time.time()
 
         new_inputs: List[Dict[str, Any]] = []
-        for text in texts:
-            min_steps = self._min_steps_for_text(text)
+        for idx, text in enumerate(texts):
+            if min_steps_overrides and idx < len(min_steps_overrides):
+                min_steps = max(0, int(min_steps_overrides[idx]))
+            else:
+                min_steps = self._min_steps_for_text(text)
             conversation = [
                 {
                     "role": f"{speaker_id}",
@@ -1027,6 +1046,9 @@ class TTSConfig:
     device: str = "cuda"
     max_steps: int = 125 // 2
     min_steps: int = 1
+    min_steps_max: Optional[int] = None
+    min_steps_char_threshold: int = 5
+    min_steps_char_bucket: int = 6
 
 
 def _split_text_for_streaming(text: str) -> List[str]:
@@ -1061,6 +1083,9 @@ if __name__ == "__main__":
         reference_audio_path="local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav",
         reference_json_path="local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
         min_steps_default=config.min_steps,
+        min_steps_max=config.min_steps_max,
+        min_steps_char_threshold=config.min_steps_char_threshold,
+        min_steps_char_bucket=config.min_steps_char_bucket,
     )
 
     assistant_texts = [
@@ -1092,13 +1117,31 @@ if __name__ == "__main__":
         first_chunk_time = None
 
         print(f"\n[Turn {turn_idx}] {text}")
-        print(f"[Turn {turn_idx}] min_steps={config.min_steps} words={len(words)} chunks={len(all_chunks)}")
+        print(
+            f"[Turn {turn_idx}] min_steps={config.min_steps} max={tts_generator.min_steps_max} "
+            f"chars>={config.min_steps_char_threshold} "
+            f"bucket={config.min_steps_char_bucket} "
+            f"words={len(words)} chunks={len(all_chunks)}"
+        )
 
         # NEW: collect streamed chunks here (each is length chunk_len)
         streamed_chunks: List[np.ndarray] = []
 
         for chunk_idx, chunk in enumerate(all_chunks, start=1):
-            appended = tts_generator.append_texts(seq_id, [chunk], speaker_id=0)
+            word_idx = chunk_idx - 1
+            if word_idx < len(words):
+                word_label = words[word_idx]
+                word_min_steps = tts_generator._min_steps_for_text(word_label)
+            else:
+                word_label = "<empty>"
+                word_min_steps = tts_generator.min_steps_default
+
+            appended = tts_generator.append_texts(
+                seq_id,
+                [chunk],
+                speaker_id=0,
+                min_steps_overrides=[word_min_steps],
+            )
             if not appended:
                 raise RuntimeError(f"Failed to append text for session {seq_id}.")
 
@@ -1119,15 +1162,10 @@ if __name__ == "__main__":
                 streamed_chunks.append(out_chunk)
                 chunk_samples += out_chunk.shape[-1]
 
-            word_idx = chunk_idx - 1
-            if word_idx < len(words):
-                word_label = words[word_idx]
-            else:
-                word_label = "<empty>"
             chunk_ms = (chunk_samples / output_sample_rate) * 1000.0
             print(
                 f"[Turn {turn_idx}] Word {chunk_idx}/{len(words)} '{word_label}': "
-                f"{chunk_ms:.1f} ms ({chunk_samples} samples)"
+                f"min_steps={word_min_steps} {chunk_ms:.1f} ms ({chunk_samples} samples)"
             )
 
         torch.cuda.synchronize()
