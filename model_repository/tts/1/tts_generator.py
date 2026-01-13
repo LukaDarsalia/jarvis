@@ -429,7 +429,7 @@ class TTSGenerator:
         min_steps_max: Optional[int] = None,
         min_steps_char_threshold: int = 5,
         min_steps_char_bucket: int = 6,
-        min_steps_scope: str = "full_text",
+        min_steps_scope: str = "last_word",
     ):
         _ = compile_model  # kept for API compatibility
         self.device = torch.device(device)
@@ -1094,7 +1094,7 @@ class TTSConfig:
     min_steps_max: Optional[int] = None
     min_steps_char_threshold: int = 5
     min_steps_char_bucket: int = 6
-    min_steps_scope: str = "full_text"
+    min_steps_scope: str = "last_word"
 
 
 def _split_text_for_streaming(text: str) -> List[str]:
