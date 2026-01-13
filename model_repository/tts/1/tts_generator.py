@@ -413,6 +413,7 @@ class TTSGenerator:
         reference_json_path: Optional[str] = None,
         max_concurrent_sessions: int = 64,
         idle_timeout_seconds: float = 300.0,  # 5 minutes default
+        min_steps_default: int = 1,
     ):
         _ = compile_model  # kept for API compatibility
         self.device = torch.device(device)
@@ -425,6 +426,7 @@ class TTSGenerator:
         self.decoder_top_p = decoder_top_p
         self.max_concurrent_sessions = max_concurrent_sessions
         self.idle_timeout_seconds = idle_timeout_seconds
+        self.min_steps_default = max(0, int(min_steps_default))
 
         # Torch settings
         torch.set_grad_enabled(False)
@@ -574,7 +576,7 @@ class TTSGenerator:
     def _min_steps_for_text(self, text: str) -> int:
         if not text or not _SPEECH_TEXT_RE.search(text):
             return 0
-        return 1
+        return self.min_steps_default
 
     def append_texts(self, session_id: int, texts: List[str], speaker_id: int = 0) -> bool:
         """
@@ -1022,6 +1024,7 @@ class TTSConfig:
     model_path: str = "local_models/tts_model/georgian-csm-1b"
     device: str = "cuda"
     max_steps: int = 125 // 2
+    min_steps: int = 1
 
 
 def _split_text_for_streaming(text: str) -> List[str]:
@@ -1055,6 +1058,7 @@ if __name__ == "__main__":
         compile_model=True,
         reference_audio_path="local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav",
         reference_json_path="local_models/tts_model/georgian-csm-1b/context_text_for_inference.json",
+        min_steps_default=config.min_steps,
     )
 
     assistant_texts = [
@@ -1075,6 +1079,7 @@ if __name__ == "__main__":
     for turn_idx, text in enumerate(assistant_texts, start=1):
         seq_id = 100 + turn_idx
         all_chunks = _split_text_for_streaming(text)
+        words = text.replace("\n", " ").strip().split()
 
         ok = tts_generator.initialize_session(seq_id, speaker_id=0)
         if not ok:
@@ -1085,6 +1090,7 @@ if __name__ == "__main__":
         first_chunk_time = None
 
         print(f"\n[Turn {turn_idx}] {text}")
+        print(f"[Turn {turn_idx}] min_steps={config.min_steps} words={len(words)} chunks={len(all_chunks)}")
 
         # NEW: collect streamed chunks here (each is length chunk_len)
         streamed_chunks: List[np.ndarray] = []
@@ -1094,6 +1100,7 @@ if __name__ == "__main__":
             if not appended:
                 raise RuntimeError(f"Failed to append text for session {seq_id}.")
 
+            chunk_samples = 0
             for out_chunk in tts_generator.stream_session_audio(
                 session_id=seq_id,
                 chunk_len=chunk_len,
@@ -1108,6 +1115,18 @@ if __name__ == "__main__":
 
                 # NEW: store the chunk
                 streamed_chunks.append(out_chunk)
+                chunk_samples += out_chunk.shape[-1]
+
+            word_idx = chunk_idx - 1
+            if word_idx < len(words):
+                word_label = words[word_idx]
+            else:
+                word_label = "<empty>"
+            chunk_ms = (chunk_samples / output_sample_rate) * 1000.0
+            print(
+                f"[Turn {turn_idx}] Word {chunk_idx}/{len(words)} '{word_label}': "
+                f"{chunk_ms:.1f} ms ({chunk_samples} samples)"
+            )
 
         torch.cuda.synchronize()
         gen_time = time.perf_counter() - start_time
