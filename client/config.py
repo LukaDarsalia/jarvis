@@ -14,7 +14,7 @@ class VADConfig:
     silence_threshold_ms: float = 1200.0
     # Early silence threshold for speculative STT/LLM processing
     # When silence reaches this threshold, we start STT speculatively to reduce latency
-    early_silence_threshold_ms: float = 100.0
+    early_silence_threshold_ms: float = 400.0
     prob_threshold: float = 0.5
     sample_rate: int = 16000
     chunk_samples: int = 512

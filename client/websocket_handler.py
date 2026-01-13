@@ -103,6 +103,8 @@ class ConnectionState:
     # Lock to prevent multiple TTS init calls
     tts_init_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tts_init_in_progress: bool = False
+    # Lock to avoid resetting/closing TTS while a pipeline is using it
+    tts_pipeline_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     
     # Key latency metric: time from utterance end to first AV frame
     utterance_end_time: Optional[float] = None  # When VAD detected utterance complete
@@ -638,18 +640,19 @@ class WebSocketHandler:
             
             # Run full pipeline with speculative AV frame handler
             try:
-                final_response = await self.pipeline.process_llm_and_tts(
-                    llm_generator=llm_generator(),
-                    tts_session_id=state.tts_session_id,
-                    video_enabled=video_enabled,
-                    base_frame_index=state.musetalk_frame_index,
-                    is_generating=lambda: not state.speculative_cancelled,
-                    on_llm_token=on_llm_token,
-                    on_av_frame=on_speculative_av_frame,
-                    on_error=lambda msg: logger.error(f"[SPECULATIVE] Pipeline error: {msg}"),
-                    on_llm_complete=lambda text: None,
-                    on_tts_complete=lambda: None,
-                )
+                async with state.tts_pipeline_lock:
+                    final_response = await self.pipeline.process_llm_and_tts(
+                        llm_generator=llm_generator(),
+                        tts_session_id=state.tts_session_id,
+                        video_enabled=video_enabled,
+                        base_frame_index=state.musetalk_frame_index,
+                        is_generating=lambda: not state.speculative_cancelled,
+                        on_llm_token=on_llm_token,
+                        on_av_frame=on_speculative_av_frame,
+                        on_error=lambda msg: logger.error(f"[SPECULATIVE] Pipeline error: {msg}"),
+                        on_llm_complete=lambda text: None,
+                        on_tts_complete=lambda: None,
+                    )
                 
                 if state.speculative_cancelled:
                     if llm_response.strip():
@@ -981,20 +984,21 @@ class WebSocketHandler:
                 yield token
 
         # Process through pipeline with cached LLM
-        llm_response = await self.pipeline.process_llm_and_tts(
-            llm_generator=cached_llm_generator(),
-            tts_session_id=state.tts_session_id,
-            video_enabled=video_enabled,
-            base_frame_index=state.musetalk_frame_index,
-            is_generating=lambda: state.is_generating,
-            on_llm_token=lambda token, full: None,  # Already sent above
-            on_av_frame=lambda frame: self._handle_av_frame(state, frame),
-            on_error=lambda msg: asyncio.create_task(
-                send_message(state, "error", {"message": msg})
-            ),
-            on_llm_complete=lambda text: None,  # Already sent above
-            on_tts_complete=lambda: asyncio.create_task(self._on_tts_complete(state)),
-        )
+        async with state.tts_pipeline_lock:
+            llm_response = await self.pipeline.process_llm_and_tts(
+                llm_generator=cached_llm_generator(),
+                tts_session_id=state.tts_session_id,
+                video_enabled=video_enabled,
+                base_frame_index=state.musetalk_frame_index,
+                is_generating=lambda: state.is_generating,
+                on_llm_token=lambda token, full: None,  # Already sent above
+                on_av_frame=lambda frame: self._handle_av_frame(state, frame),
+                on_error=lambda msg: asyncio.create_task(
+                    send_message(state, "error", {"message": msg})
+                ),
+                on_llm_complete=lambda text: None,  # Already sent above
+                on_tts_complete=lambda: asyncio.create_task(self._on_tts_complete(state)),
+            )
 
         # Update conversation
         state.conversation.add_assistant_message(llm_response)
@@ -1080,24 +1084,25 @@ class WebSocketHandler:
                     continue
 
         # Process through pipeline
-        llm_response = await self.pipeline.process_llm_and_tts(
-            llm_generator=llm_generator(),
-            tts_session_id=state.tts_session_id,
-            video_enabled=video_enabled,
-            base_frame_index=state.musetalk_frame_index,
-            is_generating=lambda: state.is_generating,
-            on_llm_token=lambda token, full: asyncio.create_task(
-                send_message(state, "llm_token", {"token": token, "full_text": full})
-            ),
-            on_av_frame=lambda frame: self._handle_av_frame(state, frame),
-            on_error=lambda msg: asyncio.create_task(
-                send_message(state, "error", {"message": msg})
-            ),
-            on_llm_complete=lambda text: asyncio.create_task(
-                send_message(state, "llm_complete", {"text": text})
-            ),
-            on_tts_complete=lambda: asyncio.create_task(self._on_tts_complete(state)),
-        )
+        async with state.tts_pipeline_lock:
+            llm_response = await self.pipeline.process_llm_and_tts(
+                llm_generator=llm_generator(),
+                tts_session_id=state.tts_session_id,
+                video_enabled=video_enabled,
+                base_frame_index=state.musetalk_frame_index,
+                is_generating=lambda: state.is_generating,
+                on_llm_token=lambda token, full: asyncio.create_task(
+                    send_message(state, "llm_token", {"token": token, "full_text": full})
+                ),
+                on_av_frame=lambda frame: self._handle_av_frame(state, frame),
+                on_error=lambda msg: asyncio.create_task(
+                    send_message(state, "error", {"message": msg})
+                ),
+                on_llm_complete=lambda text: asyncio.create_task(
+                    send_message(state, "llm_complete", {"text": text})
+                ),
+                on_tts_complete=lambda: asyncio.create_task(self._on_tts_complete(state)),
+            )
 
         # Update conversation
         state.conversation.add_assistant_message(llm_response)
@@ -1229,13 +1234,14 @@ class WebSocketHandler:
         """Reset TTS session after speculative pipeline was cancelled."""
         # Wait a tiny bit for the cancellation to propagate
         await asyncio.sleep(0.1)
-        
-        # Close the potentially corrupted session
-        await self._close_tts_session(state)
-        
-        # Re-initialize for the next speculative run
-        await self._init_tts_session(state)
-        logger.info(f"[TTS_RESET] TTS session reset after speculative cancellation")
+        # Avoid closing while a pipeline is still using the session
+        async with state.tts_pipeline_lock:
+            # Close the potentially corrupted session
+            await self._close_tts_session(state)
+            
+            # Re-initialize for the next speculative run
+            await self._init_tts_session(state)
+            logger.info(f"[TTS_RESET] TTS session reset after speculative cancellation")
 
     async def _cleanup_connection(self, state: ConnectionState) -> None:
         """Clean up connection resources."""
