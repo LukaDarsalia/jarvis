@@ -28,6 +28,8 @@ from models import AudioFrame, AVFrame, TTSMetrics, StreamingStats
 from streaming_chunker import StreamingTTSChunker
 from tts_service import TTSService
 from triton_services import MuseTalkService
+from text_utils.numbers_to_text import NumberConverter
+from text_utils.streaming_text_processor import StreamingTextProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -842,7 +844,9 @@ class VoiceToVoicePipeline:
         text_input_queue: Queue = Queue()
 
         llm_response = ""
-        chunker = StreamingTTSChunker()
+        chunker = StreamingTTSChunker(
+            text_processor=StreamingTextProcessor(num_converter=NumberConverter()),
+        )
 
         # LLM token processing task
         async def process_llm_tokens():
