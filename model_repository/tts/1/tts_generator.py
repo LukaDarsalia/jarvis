@@ -402,6 +402,8 @@ class GenerationState:
     eos: torch.Tensor
     has_active_text: bool       # True if currently generating for a chunk
     min_steps: int              # Minimum steps before allowing EOS
+    pending_words: List[str]    # Lookahead queue for output-word alignment
+    chunk_index: int            # Number of text chunks queued so far
     last_activity_time: float = field(default_factory=time.time)  # Track last activity
 
 
@@ -635,6 +637,22 @@ class TTSGenerator:
         extra = max(0, (letters_count - self.min_steps_char_threshold) // self.min_steps_char_bucket)
         return min(self.min_steps_default + extra, self.min_steps_max)
 
+    def _expected_output_word(
+        self, pending_words: List[str], chunk_index: int, text: str
+    ) -> tuple[str, List[str], int]:
+        stripped = text.strip()
+
+        if chunk_index == 0:
+            words = stripped.split()
+            expected = words[0] if words else ""
+            pending_words = words[1:] if len(words) > 1 else []
+        else:
+            expected = pending_words.pop(0) if pending_words else ""
+            if stripped:
+                pending_words.append(stripped)
+
+        return expected, pending_words, chunk_index + 1
+
     def append_texts(
         self,
         session_id: int,
@@ -650,15 +668,26 @@ class TTSGenerator:
         with self.session_lock:
             if session_id not in self.sessions:
                 return False
+            state = self.sessions[session_id]
             # Update activity time
-            self.sessions[session_id].last_activity_time = time.time()
+            state.last_activity_time = time.time()
+            pending_words = list(state.pending_words)
+            chunk_index = state.chunk_index
+
+        expected_words: List[str] = []
+        for text in texts:
+            expected, pending_words, chunk_index = self._expected_output_word(
+                pending_words, chunk_index, text
+            )
+            expected_words.append(expected)
 
         new_inputs: List[Dict[str, Any]] = []
         for idx, text in enumerate(texts):
             if min_steps_overrides and idx < len(min_steps_overrides):
                 min_steps = max(0, int(min_steps_overrides[idx]))
             else:
-                min_steps = self._min_steps_for_text(text)
+                target_text = text if self.min_steps_scope == "full_text" else expected_words[idx]
+                min_steps = self._min_steps_for_text(target_text)
             conversation = [
                 {
                     "role": f"{speaker_id}",
@@ -680,8 +709,11 @@ class TTSGenerator:
         with self.session_lock:
             if session_id not in self.sessions:
                 return False
-            self.sessions[session_id].input_queue.extend(new_inputs)
-            self.sessions[session_id].last_activity_time = time.time()
+            state = self.sessions[session_id]
+            state.pending_words = pending_words
+            state.chunk_index = chunk_index
+            state.input_queue.extend(new_inputs)
+            state.last_activity_time = time.time()
 
         return True
 
@@ -762,6 +794,8 @@ class TTSGenerator:
             eos=eos,
             has_active_text=False,   # no text chunk yet
             min_steps=0,
+            pending_words=[],
+            chunk_index=0,
         )
 
         with self.session_lock:
