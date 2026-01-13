@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,17 @@ DEPTH_DECODER_ONNX_FILENAME = "csm_depth_decoder_step_past31.onnx"
 BACKBONE_PAST_LEN = 4095
 DEPTH_DECODER_PAST_LEN = 31
 _SPEECH_TEXT_RE = re.compile(r"[0-9A-Za-z\u10A0-\u10FF]")
+_GEORGIAN_LETTER_RE = re.compile(r"[\u10A0-\u10FF]")
+_GEORGIAN_WORD_RE = re.compile(r"[\u10A0-\u10FF]+")
+
+_STATS_DIR = Path(__file__).resolve().parents[1]
+if str(_STATS_DIR) not in sys.path:
+    sys.path.insert(0, str(_STATS_DIR))
+
+try:
+    from word_duration_stats import MIN_STEPS_BY_LEN
+except Exception:
+    MIN_STEPS_BY_LEN = {}
 
 
 def sample_from_logits(
@@ -431,7 +443,10 @@ class TTSGenerator:
         self.idle_timeout_seconds = idle_timeout_seconds
         self.min_steps_default = max(0, int(min_steps_default))
         if min_steps_max is None:
-            min_steps_max = self.min_steps_default + 2
+            if MIN_STEPS_BY_LEN:
+                min_steps_max = max(MIN_STEPS_BY_LEN.values())
+            else:
+                min_steps_max = self.min_steps_default + 2
         self.min_steps_max = max(self.min_steps_default, int(min_steps_max))
         self.min_steps_char_threshold = max(1, int(min_steps_char_threshold))
         self.min_steps_char_bucket = max(1, int(min_steps_char_bucket))
@@ -584,6 +599,22 @@ class TTSGenerator:
     def _min_steps_for_text(self, text: str) -> int:
         if not text or not text.strip():
             return self.min_steps_default
+        georgian_words = _GEORGIAN_WORD_RE.findall(text)
+        if georgian_words and MIN_STEPS_BY_LEN:
+            max_len = max(len(word) for word in georgian_words)
+            if max_len in MIN_STEPS_BY_LEN:
+                steps = MIN_STEPS_BY_LEN[max_len]
+            else:
+                keys = sorted(MIN_STEPS_BY_LEN)
+                steps = None
+                for key in keys:
+                    if key >= max_len:
+                        steps = MIN_STEPS_BY_LEN[key]
+                        break
+                if steps is None:
+                    steps = MIN_STEPS_BY_LEN[keys[-1]]
+            return min(int(steps), self.min_steps_max)
+
         letters_count = len(_SPEECH_TEXT_RE.findall(text))
         if letters_count == 0:
             return 0
