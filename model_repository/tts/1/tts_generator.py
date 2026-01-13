@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ BACKBONE_ONNX_FILENAME = "csm_backbone_step_past4095.onnx"
 DEPTH_DECODER_ONNX_FILENAME = "csm_depth_decoder_step_past31.onnx"
 BACKBONE_PAST_LEN = 4095
 DEPTH_DECODER_PAST_LEN = 31
+_SPEECH_TEXT_RE = re.compile(r"[0-9A-Za-z\u10A0-\u10FF]")
 
 
 def sample_from_logits(
@@ -387,6 +389,7 @@ class GenerationState:
     counter: int                # index of next text chunk to inject
     eos: torch.Tensor
     has_active_text: bool       # True if currently generating for a chunk
+    min_steps: int              # Minimum steps before allowing EOS
     last_activity_time: float = field(default_factory=time.time)  # Track last activity
 
 
@@ -568,6 +571,11 @@ class TTSGenerator:
             top_k=top_k,
         )
 
+    def _min_steps_for_text(self, text: str) -> int:
+        if not text or not _SPEECH_TEXT_RE.search(text):
+            return 0
+        return 1
+
     def append_texts(self, session_id: int, texts: List[str], speaker_id: int = 0) -> bool:
         """
         Append additional text segments to an existing session's input queue.
@@ -582,6 +590,7 @@ class TTSGenerator:
 
         new_inputs: List[Dict[str, Any]] = []
         for text in texts:
+            min_steps = self._min_steps_for_text(text)
             conversation = [
                 {
                     "role": f"{speaker_id}",
@@ -593,7 +602,12 @@ class TTSGenerator:
                 tokenize=True,
                 return_dict=True,
             ).to(self.device)
-            new_inputs.append(cur_input)
+            new_inputs.append(
+                {
+                    "input_ids": cur_input["input_ids"],
+                    "min_steps": min_steps,
+                }
+            )
 
         with self.session_lock:
             if session_id not in self.sessions:
@@ -679,6 +693,7 @@ class TTSGenerator:
             counter=0,               # next text index to inject
             eos=eos,
             has_active_text=False,   # no text chunk yet
+            min_steps=0,
         )
 
         with self.session_lock:
@@ -739,6 +754,7 @@ class TTSGenerator:
                             state.h_last = h_last
                         state.has_active_text = True
                         state.cur_step = 0
+                        state.min_steps = int(inject_inputs.get("min_steps", 0))
                         state.counter += 1  # consumed this text chunk
                         continue
                     else:
@@ -746,14 +762,20 @@ class TTSGenerator:
                         break
 
                 # 2) We have an active text chunk: generate one frame
+                logits = state.logits_next
+                if state.cur_step < state.min_steps:
+                    logits = logits.clone()
+                    logits[..., int(state.eos.item())] = -1e9
                 c0 = self.sample_from_logits(
-                    state.logits_next,
+                    logits,
                     method="nucleus",
                     temperature=self.temperature,
                     top_p=self.top_p,
                 )
                 c0_1d = c0.view(-1).to(torch.long)
-                reached_eos = (c0_1d == state.eos.view(-1)).any()
+                reached_eos = False
+                if state.cur_step >= state.min_steps:
+                    reached_eos = (c0_1d == state.eos.view(-1)).any()
 
                 if bool(reached_eos):
                     # End of this text chunk; next loop may inject new chunk
@@ -846,19 +868,26 @@ class TTSGenerator:
                             state.h_last = h_last
                         state.has_active_text = True
                         state.cur_step = 0
+                        state.min_steps = int(inject_inputs.get("min_steps", 0))
                         state.counter += 1
                         steps_for_chunk = 0
                     else:
                         return
                 else:
+                    logits = state.logits_next
+                    if state.cur_step < state.min_steps:
+                        logits = logits.clone()
+                        logits[..., int(state.eos.item())] = -1e9
                     c0 = self.sample_from_logits(
-                        state.logits_next,
+                        logits,
                         method="nucleus",
                         temperature=self.temperature,
                         top_p=self.top_p,
                     )
                     c0_1d = c0.view(-1).to(torch.long)
-                    reached_eos = (c0_1d == state.eos.view(-1)).any()
+                    reached_eos = False
+                    if state.cur_step >= state.min_steps:
+                        reached_eos = (c0_1d == state.eos.view(-1)).any()
 
                     if bool(reached_eos):
                         state.has_active_text = False
