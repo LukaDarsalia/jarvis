@@ -8,7 +8,13 @@ from .numbers_to_text import NumberConverter, strip_punctuation, restore_punctua
 _REMOVAL_INFLECTIONS = ["-ს", "-ად"]
 _ADDITION_INFLECTIONS = ["-მა", "-ო"]
 _KEEP_INFLECTIONS = ["-ის", "-ით"]
-_ALL_INFLECTIONS = _REMOVAL_INFLECTIONS + _ADDITION_INFLECTIONS + _KEEP_INFLECTIONS
+_LOCATIVE_INFLECTIONS = ["-დან", "-მდე"]
+_ALL_INFLECTIONS = (
+    _REMOVAL_INFLECTIONS
+    + _ADDITION_INFLECTIONS
+    + _KEEP_INFLECTIONS
+    + _LOCATIVE_INFLECTIONS
+)
 
 _DASH_ONLY_RE = re.compile(r"^[-–—]+$")
 _NUM_TOKEN_RE = re.compile(r"^(-?\d+(?:[.,]\d+)?)(%?)(.*)$")
@@ -115,7 +121,7 @@ class StreamingTextProcessor:
     def __init__(
         self,
         num_converter: Optional[NumberConverter] = None,
-        comma_multiplier: int = 3,
+        comma_multiplier: int = 1,
         dash_to_comma: bool = True,
         remove_asterisks: bool = True,
     ) -> None:
@@ -169,7 +175,7 @@ class StreamingTextProcessor:
             number_words = self.num_converter.georgian_number(number_part)
             percent_word = self.num_converter.percent_string
             if tail:
-                percent_word = percent_word + tail
+                percent_word = self._apply_inflection_to_word(percent_word, tail)
             words = number_words.split()
             if not words:
                 return [word]
@@ -248,6 +254,14 @@ class StreamingTextProcessor:
         return words
 
     def _apply_inflection_to_word(self, word: str, inflection: str) -> str:
+        if inflection == "-დან":
+            if word.endswith("ი"):
+                return word[:-1] + "იდან"
+            return word + "დან"
+        if inflection == "-მდე":
+            if word.endswith("ი"):
+                return word[:-1] + "ამდე"
+            return word + "მდე"
         if inflection in _ALL_INFLECTIONS:
             return word.removesuffix("ი") + inflection[1:]
         return word + inflection.replace("-", "")
@@ -300,6 +314,15 @@ class StreamingTextProcessor:
     def _apply_inflection(self, prev_word: str, current_word: str) -> Tuple[str, str]:
         prev_base, prev_punct = strip_punctuation(prev_word)
         cur_base, cur_punct = strip_punctuation(current_word)
+
+        for inflection in _LOCATIVE_INFLECTIONS:
+            if inflection in cur_base:
+                base = cur_base.removesuffix(inflection)
+                new_cur = self._apply_inflection_to_word(base, inflection)
+                return (
+                    restore_punctuation(prev_base, prev_punct),
+                    restore_punctuation(new_cur, cur_punct),
+                )
 
         if cur_base in _ALL_INFLECTIONS:
             new_prev = prev_base.removesuffix("ი") + cur_base[1:]
