@@ -4,4 +4,5 @@ tritonserver \
   --log-verbose 0 \
   --log-info true \
   --log-warning true \
-  --log-error true
+  --log-error true \
+  --http-port 8081

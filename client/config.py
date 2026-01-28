@@ -10,11 +10,11 @@ import os
 @dataclass
 class VADConfig:
     """Voice Activity Detection configuration."""
-    speech_threshold_ms: float = 200.0
-    silence_threshold_ms: float = 1500.0
+    speech_threshold_ms: float = 100.0
+    silence_threshold_ms: float = 1200.0
     # Early silence threshold for speculative STT/LLM processing
     # When silence reaches this threshold, we start STT speculatively to reduce latency
-    early_silence_threshold_ms: float = 500.0
+    early_silence_threshold_ms: float = 400.0
     prob_threshold: float = 0.5
     sample_rate: int = 16000
     chunk_samples: int = 512
@@ -23,13 +23,20 @@ class VADConfig:
 @dataclass
 class LLMConfig:
     """Large Language Model configuration."""
-    max_new_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    system_prompt: str = (
-        "თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი, "
-        "რომლის მოვალეობაცაა დაეხმაროს მომხმარებლებს საბანკო თემებში"
-    )
+    max_new_tokens: int = 192
+    temperature: float = 0.1
+    top_p: float = 0.95
+    system_prompt: str = """თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი, რომლის მოვალეობაცაა დაეხმაროს მომხმარებლებს საბანკო თემებში.
+
+არ წერო ძალიან დიდი ტექსტები. მაქსიმუმ შემოიფარგლე 2-4 წინადადებით.
+
+გაითვალისწინე, რომ არ გამოიყენო ლათინური ასოები. წერე ქართულად და თუ საჭიროა ტრანსკრიფცია გააკეთე ტექსტის.
+
+მაგალითად:
+Mastercard -  მასტერქარდი
+Visa - ვიზა
+SMS - ესემესი
+"""
 
 
 @dataclass
@@ -53,12 +60,12 @@ class MuseTalkConfig:
     fps: int = 25
     # Number of video frames to generate per Triton batch call
     # Higher = more efficient but higher latency, Lower = lower latency but less efficient
-    # With 600ms Triton round-trip: batch_size=16 gives ~26fps sustained (16 frames / 600ms)
-    batch_size: int = 8
+    # With 600ms Triton round-trip: batch_size=24 gives ~40fps sustained (24 frames / 600ms)
+    batch_size: int = 24
     # Number of TTS chunks (80ms each) to keep as lookahead for Whisper context
     # This provides future audio context for better lip-sync accuracy
-    # 2 chunks = 160ms lookahead
-    lookahead_chunks: int = 2
+    # 1 chunk = 80ms lookahead
+    lookahead_chunks: int = 1
     # Samples per video frame (24kHz / 25fps = 960 samples per frame)
     samples_per_frame: int = 960
 

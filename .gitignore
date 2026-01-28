@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 local_models
 playground.ipynb
+batch_000
+analysis
 # C extensions
 *.so
 *.onnx

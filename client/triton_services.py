@@ -301,6 +301,7 @@ class LLMService(TritonClientBase):
         Returns:
             Formatted prompt string
         """
+        logger.debug(f"[LLM] Building prompt with system_prompt: {self.config.system_prompt[:50]}...")
         messages = [{"role": "system", "content": self.config.system_prompt}]
 
         if conversation_history:

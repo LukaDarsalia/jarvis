@@ -5,7 +5,10 @@ Streaming chunker for LLM tokens -> TTS word chunks.
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from text_utils.streaming_text_processor import StreamingTextProcessor
 
 
 _TOKEN_REPLACEMENTS = {
@@ -64,11 +67,12 @@ class StreamingWordBuffer:
 
 
 class StreamingTTSChunker:
-    def __init__(self) -> None:
+    def __init__(self, text_processor: Optional["StreamingTextProcessor"] = None) -> None:
         self._word_buffer = StreamingWordBuffer()
         self._words: List[str] = []
         self._started = False
         self._sent_words = 0
+        self._text_processor = text_processor
 
     def push_token(self, token: str) -> List[str]:
         if token:
@@ -78,13 +82,17 @@ class StreamingTTSChunker:
         new_words = self._word_buffer.push(token)
         if new_words:
             for word in new_words:
-                self._append_word(word)
+                self._append_processed_word(word)
         return self._emit_ready_chunks()
 
     def finalize(self) -> List[str]:
         new_words = self._word_buffer.flush()
         if new_words:
             for word in new_words:
+                self._append_processed_word(word)
+
+        if self._text_processor is not None:
+            for word in self._text_processor.flush():
                 self._append_word(word)
 
         chunks = self._emit_ready_chunks()
@@ -120,3 +128,10 @@ class StreamingTTSChunker:
             self._words[-1] += word
             return
         self._words.append(word)
+
+    def _append_processed_word(self, word: str) -> None:
+        if self._text_processor is None:
+            self._append_word(word)
+            return
+        for processed in self._text_processor.push_word(word):
+            self._append_word(processed)
