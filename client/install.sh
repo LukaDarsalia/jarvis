@@ -78,12 +78,28 @@ if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
 
   AVATAR_PY_VER="$("$AVATAR_PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
   AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION:-}"
+  AVATAR_TORCHVISION_VERSION="${AVATAR_TORCHVISION_VERSION:-}"
+  AVATAR_TORCHAUDIO_VERSION="${AVATAR_TORCHAUDIO_VERSION:-}"
   if [ -z "$AVATAR_TORCH_VERSION" ]; then
     if [ "$AVATAR_PY_VER" = "3.12" ]; then
       AVATAR_TORCH_VERSION="2.2.2"
       echo "Python $AVATAR_PY_VER detected for avatar venv; defaulting torch==$AVATAR_TORCH_VERSION."
     else
       AVATAR_TORCH_VERSION="2.0.1"
+    fi
+  fi
+  if [ -z "$AVATAR_TORCHVISION_VERSION" ]; then
+    if [ "$AVATAR_PY_VER" = "3.12" ]; then
+      AVATAR_TORCHVISION_VERSION="0.17.2"
+    else
+      AVATAR_TORCHVISION_VERSION="0.15.2"
+    fi
+  fi
+  if [ -z "$AVATAR_TORCHAUDIO_VERSION" ]; then
+    if [ "$AVATAR_PY_VER" = "3.12" ]; then
+      AVATAR_TORCHAUDIO_VERSION="2.2.2"
+    else
+      AVATAR_TORCHAUDIO_VERSION="2.0.2"
     fi
   fi
   if [ "$AVATAR_PY_VER" = "3.12" ] && [ "$AVATAR_TORCH_VERSION" = "2.0.1" ]; then
@@ -95,12 +111,30 @@ if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
   "$AVATAR_PY" -m pip install --upgrade pip setuptools wheel
 
   if [ "$AVATAR_TORCH_DEVICE" = "cpu" ]; then
+    if [[ "$AVATAR_TORCH_VERSION" != *"+"* ]]; then
+      AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION}+cpu"
+    fi
+    if [[ "$AVATAR_TORCHVISION_VERSION" != *"+"* ]]; then
+      AVATAR_TORCHVISION_VERSION="${AVATAR_TORCHVISION_VERSION}+cpu"
+    fi
+    if [[ "$AVATAR_TORCHAUDIO_VERSION" != *"+"* ]]; then
+      AVATAR_TORCHAUDIO_VERSION="${AVATAR_TORCHAUDIO_VERSION}+cpu"
+    fi
     "$AVATAR_PY" -m pip install \
-      torch=="$AVATAR_TORCH_VERSION" torchvision==0.15.2 torchaudio==2.0.2 \
+      torch=="$AVATAR_TORCH_VERSION" torchvision=="$AVATAR_TORCHVISION_VERSION" torchaudio=="$AVATAR_TORCHAUDIO_VERSION" \
       --index-url https://download.pytorch.org/whl/cpu
   else
+    if [[ "$AVATAR_TORCH_VERSION" != *"+"* ]]; then
+      AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION}+cu118"
+    fi
+    if [[ "$AVATAR_TORCHVISION_VERSION" != *"+"* ]]; then
+      AVATAR_TORCHVISION_VERSION="${AVATAR_TORCHVISION_VERSION}+cu118"
+    fi
+    if [[ "$AVATAR_TORCHAUDIO_VERSION" != *"+"* ]]; then
+      AVATAR_TORCHAUDIO_VERSION="${AVATAR_TORCHAUDIO_VERSION}+cu118"
+    fi
     "$AVATAR_PY" -m pip install \
-      torch=="$AVATAR_TORCH_VERSION" torchvision==0.15.2 torchaudio==2.0.2 \
+      torch=="$AVATAR_TORCH_VERSION" torchvision=="$AVATAR_TORCHVISION_VERSION" torchaudio=="$AVATAR_TORCHAUDIO_VERSION" \
       --index-url https://download.pytorch.org/whl/cu118
   fi
 
