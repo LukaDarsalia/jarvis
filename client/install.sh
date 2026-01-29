@@ -50,9 +50,11 @@ fi
 
 echo "Client venv ready: $SCRIPT_DIR/$VENV_DIR"
 
-# Optional avatar venv (older torch stack)
-if [ "${INSTALL_AVATAR_VENV:-0}" = "1" ]; then
+# Avatar venv (older torch stack) — enabled by default to match docker-compose
+if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
   AVATAR_VENV_DIR="${AVATAR_VENV_DIR:-avatar_venv}"
+  AVATAR_DEVICE="${AVATAR_DEVICE:-cpu}"
+  AVATAR_TORCH_DEVICE="${AVATAR_TORCH_DEVICE:-$AVATAR_DEVICE}"
   if [ ! -d "$AVATAR_VENV_DIR" ]; then
     echo "Creating avatar venv at $AVATAR_VENV_DIR"
     "$PYTHON_BIN" -m venv "$AVATAR_VENV_DIR"
@@ -61,7 +63,7 @@ if [ "${INSTALL_AVATAR_VENV:-0}" = "1" ]; then
   AVATAR_PIP="$AVATAR_VENV_DIR/bin/pip"
   "$AVATAR_PIP" install --upgrade pip setuptools wheel
 
-  if [ "${AVATAR_TORCH_DEVICE:-cuda}" = "cpu" ]; then
+  if [ "$AVATAR_TORCH_DEVICE" = "cpu" ]; then
     "$AVATAR_PIP" install \
       torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
       --index-url https://download.pytorch.org/whl/cpu
@@ -82,16 +84,23 @@ if [ "${INSTALL_AVATAR_VENV:-0}" = "1" ]; then
   fi
 
   echo "Avatar venv ready: $SCRIPT_DIR/$AVATAR_VENV_DIR"
-  echo "Export to use it:" 
-  echo "  export AVATAR_PYTHON=$SCRIPT_DIR/$AVATAR_VENV_DIR/bin/python"
-  echo "  export AVATAR_CREATE_SCRIPT=$SCRIPT_DIR/../model_repository/musetalk/create_avatar.py"
-  echo "  export AVATAR_MODEL_ROOT=$SCRIPT_DIR/../local_models/musetalk_model"
-  echo "  export AVATAR_RESULT_DIR=$SCRIPT_DIR/../local_models/musetalk_model/testing_avatar_creation"
-  echo "  export AVATAR_ROOT=$SCRIPT_DIR/../local_models/musetalk_model/testing_avatar_creation/v15/avatars"
-  echo "  export AVATAR_VERSION=v15"
-  echo "  export AVATAR_DEVICE=cpu"
-  echo "  export AVATAR_MAX_SIDE=512"
+  AVATAR_ENV_FILE="${AVATAR_ENV_FILE:-avatar_env.sh}"
+  cat > "$AVATAR_ENV_FILE" <<EOF
+export AVATAR_PYTHON="$SCRIPT_DIR/$AVATAR_VENV_DIR/bin/python"
+export AVATAR_CREATE_SCRIPT="$SCRIPT_DIR/../model_repository/musetalk/create_avatar.py"
+export AVATAR_MODEL_ROOT="$SCRIPT_DIR/../local_models/musetalk_model"
+export AVATAR_RESULT_DIR="$SCRIPT_DIR/../local_models/musetalk_model/testing_avatar_creation"
+export AVATAR_ROOT="$SCRIPT_DIR/../local_models/musetalk_model/testing_avatar_creation/v15/avatars"
+export AVATAR_VERSION="v15"
+export AVATAR_DEVICE="$AVATAR_DEVICE"
+export AVATAR_MAX_SIDE="\${AVATAR_MAX_SIDE:-512}"
+EOF
+  echo "Avatar env file written: $SCRIPT_DIR/$AVATAR_ENV_FILE"
 fi
 
 echo "Done. You can run the client with:"
-echo "  $VENV_PY main.py"
+if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
+  echo "  source ${AVATAR_ENV_FILE:-avatar_env.sh} && $VENV_PY main.py"
+else
+  echo "  $VENV_PY main.py"
+fi
