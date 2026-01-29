@@ -77,35 +77,35 @@ if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
   fi
 
   AVATAR_PY_VER="$("$AVATAR_PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-  AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION:-}"
-  AVATAR_TORCHVISION_VERSION="${AVATAR_TORCHVISION_VERSION:-}"
-  AVATAR_TORCHAUDIO_VERSION="${AVATAR_TORCHAUDIO_VERSION:-}"
-  if [ -z "$AVATAR_TORCH_VERSION" ]; then
-    if [ "$AVATAR_PY_VER" = "3.12" ]; then
-      AVATAR_TORCH_VERSION="2.2.2"
-      echo "Python $AVATAR_PY_VER detected for avatar venv; defaulting torch==$AVATAR_TORCH_VERSION."
+  AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION:-2.0.1}"
+  AVATAR_TORCHVISION_VERSION="${AVATAR_TORCHVISION_VERSION:-0.15.2}"
+  AVATAR_TORCHAUDIO_VERSION="${AVATAR_TORCHAUDIO_VERSION:-2.0.2}"
+
+  REQUIREMENTS_FILE="$SCRIPT_DIR/avatar_requirements.txt"
+  NEEDS_NUMPY_1235=0
+  if [ -f "$REQUIREMENTS_FILE" ]; then
+    if command -v rg >/dev/null 2>&1; then
+      if rg -q "^numpy==1\\.23\\.5" "$REQUIREMENTS_FILE"; then
+        NEEDS_NUMPY_1235=1
+      fi
     else
-      AVATAR_TORCH_VERSION="2.0.1"
+      if grep -q "^numpy==1\\.23\\.5" "$REQUIREMENTS_FILE"; then
+        NEEDS_NUMPY_1235=1
+      fi
     fi
   fi
-  if [ -z "$AVATAR_TORCHVISION_VERSION" ]; then
-    if [ "$AVATAR_PY_VER" = "3.12" ]; then
-      AVATAR_TORCHVISION_VERSION="0.17.2"
-    else
-      AVATAR_TORCHVISION_VERSION="0.15.2"
+
+  if [ "$AVATAR_PY_VER" = "3.12" ]; then
+    if [ "$AVATAR_TORCH_VERSION" = "2.0.1" ]; then
+      echo "Avatar venv uses Python $AVATAR_PY_VER, but torch==$AVATAR_TORCH_VERSION wheels are not available."
+      echo "Install Python 3.10/3.11 and rerun with AVATAR_PYTHON_BIN=python3.10"
+      exit 1
     fi
-  fi
-  if [ -z "$AVATAR_TORCHAUDIO_VERSION" ]; then
-    if [ "$AVATAR_PY_VER" = "3.12" ]; then
-      AVATAR_TORCHAUDIO_VERSION="2.2.2"
-    else
-      AVATAR_TORCHAUDIO_VERSION="2.0.2"
+    if [ "$NEEDS_NUMPY_1235" = "1" ]; then
+      echo "avatar_requirements.txt pins numpy==1.23.5, which is not compatible with Python $AVATAR_PY_VER."
+      echo "Install Python 3.10/3.11 and rerun with AVATAR_PYTHON_BIN=python3.10"
+      exit 1
     fi
-  fi
-  if [ "$AVATAR_PY_VER" = "3.12" ] && [ "$AVATAR_TORCH_VERSION" = "2.0.1" ]; then
-    echo "Avatar venv uses Python $AVATAR_PY_VER, but torch==$AVATAR_TORCH_VERSION wheels are not available."
-    echo "Set AVATAR_TORCH_VERSION=2.2.2 (or newer) or use Python 3.10/3.11 via AVATAR_PYTHON_BIN."
-    exit 1
   fi
 
   "$AVATAR_PY" -m pip install --upgrade pip setuptools wheel
