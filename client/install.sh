@@ -77,10 +77,18 @@ if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
   fi
 
   AVATAR_PY_VER="$("$AVATAR_PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-  AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION:-2.0.1}"
+  AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION:-}"
+  if [ -z "$AVATAR_TORCH_VERSION" ]; then
+    if [ "$AVATAR_PY_VER" = "3.12" ]; then
+      AVATAR_TORCH_VERSION="2.2.2"
+      echo "Python $AVATAR_PY_VER detected for avatar venv; defaulting torch==$AVATAR_TORCH_VERSION."
+    else
+      AVATAR_TORCH_VERSION="2.0.1"
+    fi
+  fi
   if [ "$AVATAR_PY_VER" = "3.12" ] && [ "$AVATAR_TORCH_VERSION" = "2.0.1" ]; then
     echo "Avatar venv uses Python $AVATAR_PY_VER, but torch==$AVATAR_TORCH_VERSION wheels are not available."
-    echo "Install python3.10 (recommended) or set AVATAR_PYTHON_BIN to a compatible Python (3.10/3.11)."
+    echo "Set AVATAR_TORCH_VERSION=2.2.2 (or newer) or use Python 3.10/3.11 via AVATAR_PYTHON_BIN."
     exit 1
   fi
 
