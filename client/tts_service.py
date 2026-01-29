@@ -89,10 +89,28 @@ class TTSSession:
 
     def initialize(self, timeout: float = 30.0) -> bool:
         """
-        Initialize the TTS session and allocate KV cache.
+        Initialize the TTS session and allocate cache.
 
         Returns:
             True if initialization was successful
+        """
+        return self.initialize_with_voice(timeout=timeout)
+
+    def initialize_with_voice(
+        self,
+        timeout: float = 30.0,
+        voice_prompt_audio: Optional[np.ndarray] = None,
+        voice_prompt_sample_rate: Optional[int] = None,
+        voice_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Initialize the TTS session with an optional voice prompt or voice ID.
+
+        Args:
+            timeout: Timeout for initialization.
+            voice_prompt_audio: Optional PCM float32 audio prompt.
+            voice_prompt_sample_rate: Sample rate for the prompt audio.
+            voice_id: Optional predefined voice ID (e.g., "alba").
         """
         with self._lock:
             if self._is_closed:
@@ -118,6 +136,25 @@ class TTSSession:
                 ]
                 inputs[0].set_data_from_numpy(np.array([True], dtype=bool))
                 inputs[1].set_data_from_numpy(np.array([self.session_id], dtype=np.int64))
+
+                if voice_id:
+                    voice_bytes = np.array([voice_id.encode("utf-8")], dtype=object)
+                    voice_inp = grpc_client.InferInput("VOICE_ID", [1], "BYTES")
+                    voice_inp.set_data_from_numpy(voice_bytes)
+                    inputs.append(voice_inp)
+
+                if voice_prompt_audio is not None and voice_prompt_audio.size > 0:
+                    prompt_audio = np.asarray(voice_prompt_audio, dtype=np.float32).reshape(-1)
+                    audio_inp = grpc_client.InferInput("VOICE_PROMPT_PCM", prompt_audio.shape, "FP32")
+                    audio_inp.set_data_from_numpy(prompt_audio)
+                    inputs.append(audio_inp)
+
+                    if voice_prompt_sample_rate is not None:
+                        sr_inp = grpc_client.InferInput("VOICE_PROMPT_SAMPLE_RATE", [1], "INT32")
+                        sr_inp.set_data_from_numpy(
+                            np.array([int(voice_prompt_sample_rate)], dtype=np.int32)
+                        )
+                        inputs.append(sr_inp)
 
                 outputs = [grpc_client.InferRequestedOutput("AUDIO_FRAME")]
 
@@ -175,11 +212,8 @@ class TTSSession:
         """
         Generate audio from text chunks.
 
-        The TTS model uses 2-word lookahead:
-        - When sending text chunk[i], audio for word[i-2] is generated
-        - First 3 words are sent together
-        - Subsequent words are sent one at a time with leading space
-        - Two empty strings at end to flush remaining words
+        Text is sent in chunks for streaming synthesis.
+        Empty chunks are ignored.
 
         Args:
             text_chunks: Pre-split text chunks for streaming TTS
@@ -222,6 +256,9 @@ class TTSSession:
 
         try:
             for i, chunk in enumerate(text_chunks):
+                if not chunk.strip():
+                    logger.debug(f"TTS chunk {i}: empty (skipped)")
+                    continue
                 expected_word = all_words[word_audio_index] if word_audio_index < len(all_words) else ""
 
                 logger.debug(f"TTS chunk {i}: '{chunk}' -> expecting word '{expected_word}'")
@@ -517,7 +554,13 @@ class TTSService:
         with self._session_lock:
             return self._active_sessions.get(session_id)
 
-    def init_session(self, session_id: int) -> bool:
+    def init_session(
+        self,
+        session_id: int,
+        voice_prompt_audio: Optional[np.ndarray] = None,
+        voice_prompt_sample_rate: Optional[int] = None,
+        voice_id: Optional[str] = None,
+    ) -> bool:
         """
         Initialize a TTS session (creates if needed).
 
@@ -535,7 +578,12 @@ class TTSService:
                 self._active_sessions.pop(session_id, None)
 
         session = TTSSession(self.triton_url, session_id, self.config)
-        success = session.initialize()
+        effective_voice_id = voice_id or self.config.voice_id
+        success = session.initialize_with_voice(
+            voice_prompt_audio=voice_prompt_audio,
+            voice_prompt_sample_rate=voice_prompt_sample_rate,
+            voice_id=effective_voice_id,
+        )
 
         if success:
             with self._session_lock:

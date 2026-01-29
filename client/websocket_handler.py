@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple
@@ -110,6 +111,17 @@ class ConnectionState:
     utterance_end_time: Optional[float] = None  # When VAD detected utterance complete
     first_av_frame_sent: bool = False  # Track if we've sent first frame this generation
 
+    # Voice prompt (voice cloning)
+    voice_prompt_mode: bool = False
+    voice_prompt_buffer: List[bytes] = field(default_factory=list)
+    voice_prompt_audio: Optional[np.ndarray] = None
+    voice_prompt_sample_rate: Optional[int] = None
+    voice_id: Optional[str] = None
+    custom_voice_prompts: Dict[str, Tuple[np.ndarray, int]] = field(default_factory=dict)
+
+    # Avatar selection
+    avatar_id: Optional[str] = None
+
 # ============================================================================
 # Message Helpers
 # ============================================================================
@@ -177,6 +189,28 @@ class WebSocketHandler:
         self._global_last_video_frame: Optional[bytes] = None
         # Global frame index - continues avatar animation across connections
         self._global_frame_index: int = 0
+        # Global custom voice prompts - survive across connections while server is running
+        self._custom_voice_prompts: Dict[str, Tuple[np.ndarray, int]] = {}
+
+    def _normalize_custom_voice_name(self, raw: str) -> Optional[str]:
+        name = re.sub(r"[^a-zA-Z0-9 _-]", "", raw).strip()
+        if not name:
+            return None
+        return name[:32]
+
+    def _resolve_custom_voice_prompt(
+        self,
+        state: ConnectionState,
+        voice_id: Optional[str],
+    ) -> Tuple[Optional[np.ndarray], Optional[int]]:
+        if not voice_id or not voice_id.startswith("custom:"):
+            return state.voice_prompt_audio, state.voice_prompt_sample_rate
+        prompt = state.custom_voice_prompts.get(voice_id)
+        if prompt is None:
+            prompt = self._custom_voice_prompts.get(voice_id)
+        if prompt is None:
+            return None, None
+        return prompt
 
     async def handle_connection(self, websocket: WebSocket) -> None:
         """Handle a new WebSocket connection."""
@@ -188,6 +222,15 @@ class WebSocketHandler:
             connection_id=connection_id,
             musetalk_frame_index=self._global_frame_index,  # Continue from global index
         )
+        state.voice_id = self.config.tts.voice_id
+        state.avatar_id = self.config.musetalk.avatar_id
+        if state.voice_id and state.voice_id.startswith("custom:"):
+            prompt = self._custom_voice_prompts.get(state.voice_id)
+            if prompt is not None:
+                state.custom_voice_prompts[state.voice_id] = prompt
+                state.voice_prompt_audio, state.voice_prompt_sample_rate = prompt
+            else:
+                state.voice_id = None
         self.active_connections[connection_id] = state
 
         logger.info(f"WebSocket connected: {connection_id}")
@@ -210,6 +253,7 @@ class WebSocketHandler:
                 idle_frame = await loop.run_in_executor(
                     None,
                     self.triton_client.musetalk.get_idle_frame,
+                    state.avatar_id,
                 )
 
             await send_message(state, "musetalk_ready", {
@@ -256,6 +300,9 @@ class WebSocketHandler:
     async def _handle_audio_data(self, state: ConnectionState, audio_bytes: bytes) -> None:
         """Handle incoming audio data."""
         try:
+            if state.voice_prompt_mode:
+                state.voice_prompt_buffer.append(audio_bytes)
+                return
             state.audio_queue.put_nowait(audio_bytes)
         except asyncio.QueueFull:
             # Drop oldest and add new
@@ -278,6 +325,18 @@ class WebSocketHandler:
         elif msg_type == "recording_stop":
             await self._handle_recording_stop(state)
 
+        elif msg_type == "voice_prompt_start":
+            await self._handle_voice_prompt_start(state)
+
+        elif msg_type == "voice_prompt_stop":
+            await self._handle_voice_prompt_stop(state, data)
+
+        elif msg_type == "set_voice_id":
+            await self._handle_set_voice_id(state, data)
+
+        elif msg_type == "set_avatar_id":
+            await self._handle_set_avatar_id(state, data)
+
     async def _handle_stop_generation(self, state: ConnectionState) -> None:
         """Handle stop generation request."""
         state.is_generating = False
@@ -292,6 +351,8 @@ class WebSocketHandler:
         """Handle recording start request."""
         state.is_recording = True
         state.vad_time_ms = 0.0
+        state.voice_prompt_mode = False
+        state.voice_prompt_buffer.clear()
 
         self.triton_client.vad.reset_state()
 
@@ -316,6 +377,110 @@ class WebSocketHandler:
 
         if not state.is_generating:
             await self._close_tts_session(state)
+
+    async def _handle_voice_prompt_start(self, state: ConnectionState) -> None:
+        """Start capturing a voice prompt for cloning."""
+        state.voice_prompt_mode = True
+        state.voice_prompt_buffer.clear()
+
+    async def _handle_voice_prompt_stop(
+        self,
+        state: ConnectionState,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Stop capturing voice prompt and store it."""
+        state.voice_prompt_mode = False
+        data = data or {}
+        raw_name = str(data.get("voice_name") or data.get("voice_id") or "").strip()
+        voice_name = self._normalize_custom_voice_name(raw_name)
+
+        if not state.voice_prompt_buffer:
+            await send_message(state, "voice_prompt_error", {"message": "no_audio"})
+            return
+
+        try:
+            chunks = [np.frombuffer(b, dtype=np.float32) for b in state.voice_prompt_buffer]
+            audio = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+            state.voice_prompt_buffer.clear()
+
+            if audio.size == 0:
+                await send_message(state, "voice_prompt_error", {"message": "empty_audio"})
+                return
+
+            state.voice_prompt_audio = audio
+            state.voice_prompt_sample_rate = 16000
+            if voice_name:
+                custom_voice_id = f"custom:{voice_name}"
+                state.custom_voice_prompts[custom_voice_id] = (audio, 16000)
+                self._custom_voice_prompts[custom_voice_id] = (audio, 16000)
+                state.voice_id = custom_voice_id
+
+            duration_ms = int(audio.size / 16.0)
+            await send_message(
+                state,
+                "voice_prompt_ready",
+                {
+                    "duration_ms": duration_ms,
+                    "voice_id": state.voice_id,
+                    "voice_name": voice_name,
+                },
+            )
+
+            # Re-init TTS session to apply new voice prompt
+            await self._close_tts_session(state)
+            await self._init_tts_session(state)
+        except Exception as exc:
+            logger.error(f"Voice prompt processing error: {exc}")
+            await send_message(state, "voice_prompt_error", {"message": "processing_failed"})
+
+    async def _handle_set_voice_id(self, state: ConnectionState, data: Dict[str, Any]) -> None:
+        """Update the predefined voice ID."""
+        voice_id = data.get("voice_id")
+        if not voice_id:
+            return
+        state.voice_id = str(voice_id)
+        if state.voice_id.startswith("custom:"):
+            prompt = state.custom_voice_prompts.get(state.voice_id)
+            if prompt is None:
+                prompt = self._custom_voice_prompts.get(state.voice_id)
+            if prompt is not None:
+                state.voice_prompt_audio, state.voice_prompt_sample_rate = prompt
+            else:
+                state.voice_prompt_audio = None
+                state.voice_prompt_sample_rate = None
+                state.voice_id = None
+                await send_message(state, "voice_prompt_error", {"message": "unknown_voice"})
+        else:
+            # Selecting a preset clears any recorded voice prompt
+            state.voice_prompt_audio = None
+            state.voice_prompt_sample_rate = None
+        # Re-init TTS session to apply new voice preset
+        await self._close_tts_session(state)
+        await self._init_tts_session(state)
+
+    async def _handle_set_avatar_id(self, state: ConnectionState, data: Dict[str, Any]) -> None:
+        """Update the avatar ID for MuseTalk."""
+        avatar_id = data.get("avatar_id")
+        if not avatar_id:
+            return
+        state.avatar_id = str(avatar_id)
+        state.musetalk_frame_index = 0
+        try:
+            loop = asyncio.get_event_loop()
+            idle_frame = await loop.run_in_executor(
+                None,
+                self.triton_client.musetalk.get_idle_frame,
+                state.avatar_id,
+            )
+            if idle_frame:
+                state.last_video_frame = idle_frame
+                self._global_last_video_frame = idle_frame
+                await send_message(state, "avatar_ready", {
+                    "avatar_id": state.avatar_id,
+                    "idle_frame": base64.b64encode(idle_frame).decode("utf-8"),
+                })
+        except Exception as exc:
+            logger.warning(f"Failed to load avatar idle frame: {exc}")
 
     async def _audio_processor_loop(self, state: ConnectionState) -> None:
         """Process incoming audio chunks."""
@@ -646,6 +811,7 @@ class WebSocketHandler:
                         tts_session_id=state.tts_session_id,
                         video_enabled=video_enabled,
                         base_frame_index=state.musetalk_frame_index,
+                        avatar_id=state.avatar_id,
                         is_generating=lambda: not state.speculative_cancelled,
                         on_llm_token=on_llm_token,
                         on_av_frame=on_speculative_av_frame,
@@ -990,6 +1156,7 @@ class WebSocketHandler:
                 tts_session_id=state.tts_session_id,
                 video_enabled=video_enabled,
                 base_frame_index=state.musetalk_frame_index,
+                avatar_id=state.avatar_id,
                 is_generating=lambda: state.is_generating,
                 on_llm_token=lambda token, full: None,  # Already sent above
                 on_av_frame=lambda frame: self._handle_av_frame(state, frame),
@@ -1090,6 +1257,7 @@ class WebSocketHandler:
                 tts_session_id=state.tts_session_id,
                 video_enabled=video_enabled,
                 base_frame_index=state.musetalk_frame_index,
+                avatar_id=state.avatar_id,
                 is_generating=lambda: state.is_generating,
                 on_llm_token=lambda token, full: asyncio.create_task(
                     send_message(state, "llm_token", {"token": token, "full_text": full})
@@ -1179,10 +1347,20 @@ class WebSocketHandler:
                 state.tts_session_id = new_session_id
 
                 loop = asyncio.get_event_loop()
+                voice_prompt_audio, voice_prompt_sample_rate = self._resolve_custom_voice_prompt(
+                    state,
+                    state.voice_id,
+                )
+                voice_id = state.voice_id
+                if not voice_id and self.config.tts.voice_id.startswith("custom:"):
+                    voice_id = "alba"
                 success = await loop.run_in_executor(
                     None,
                     self.tts_service.init_session,
                     new_session_id,
+                    voice_prompt_audio,
+                    voice_prompt_sample_rate,
+                    voice_id,
                 )
 
                 if not state.is_connected:

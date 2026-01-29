@@ -1,0 +1,15 @@
+# Minimal deps for create_avatar.py (runs in /opt/avatar_venv)
+# Torch/torchvision/torchaudio are installed separately to allow CPU/CUDA selection.
+
+numpy==1.23.5
+opencv-python-headless==4.9.0.80
+soundfile==0.12.1
+librosa==0.11.0
+einops==0.8.1
+tqdm==4.66.4
+Pillow==10.4.0
+diffusers==0.30.2
+accelerate==0.28.0
+transformers==4.39.2
+huggingface_hub==0.30.2
+safetensors==0.4.5

@@ -10,6 +10,24 @@ input [
     dims: [ -1 ]   # list of text chunks
   },
   {
+    name: "VOICE_PROMPT_PCM"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+    optional: true
+  },
+  {
+    name: "VOICE_PROMPT_SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "VOICE_ID"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
+  {
     name: "BACKBONE_TEMPERATURE"
     data_type: TYPE_FP32
     dims: [ 1 ]
@@ -104,16 +122,6 @@ instance_group [
 ]
 
 parameters: {
-  key: "model_path"
-  value: { string_value: "/local_models/tts_model" }
-}
-
-parameters: {
-  key: "reference_audio_path"
-  value: { string_value: "/local_models/tts_model/georgian-csm-1b/context_audio_for_inference.wav" }
-}
-
-parameters: {
-  key: "reference_json_path"
-  value: { string_value: "/local_models/tts_model/georgian-csm-1b/context_text_for_inference.json" }
+  key: "default_voice_id"
+  value: { string_value: "alba" }
 }

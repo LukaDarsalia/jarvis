@@ -37,11 +37,11 @@ class UNet():
             unet_config = json.load(f)
         self.model = UNet2DConditionModel(**unet_config)
         self.pe = PositionalEncoding(d_model=384)
-        if device != None:
+        if device is not None:
             self.device = device
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        weights = torch.load(model_path) if torch.cuda.is_available() else torch.load(model_path, map_location=self.device)
+        weights = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(weights)
         if use_float16:
             self.model = self.model.half()

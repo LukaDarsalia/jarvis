@@ -12,7 +12,13 @@ class VAE():
     VAE (Variational Autoencoder) class for image processing.
     """
 
-    def __init__(self, model_path="./models/sd-vae-ft-mse/", resized_img=256, use_float16=False):
+    def __init__(
+        self,
+        model_path="./models/sd-vae-ft-mse/",
+        resized_img=256,
+        use_float16=False,
+        device=None,
+    ):
         """
         Initialize the VAE instance.
 
@@ -30,7 +36,10 @@ class VAE():
         # It will automatically fall back from .safetensors to .bin if needed
         self.vae = AutoencoderKL.from_pretrained(model_path, use_safetensors=False)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = device
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.vae.to(self.device)
 
         if use_float16:
@@ -84,7 +93,7 @@ class VAE():
         x = self.transform(x)
         
         x = x.unsqueeze(0) # [1, 3, 256, 256] torch tensor
-        x = x.to(self.vae.device)
+        x = x.to(self.device)
 
         return x
 

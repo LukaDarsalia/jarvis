@@ -21,11 +21,14 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import re
+import tempfile
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +38,9 @@ from triton_services import TritonClient
 from tts_service import TTSService
 from pipeline import VoiceToVoicePipeline, StreamingMetricsManager, PipelineConfig
 from websocket_handler import WebSocketHandler
+
+import numpy as np
+import cv2
 
 # ============================================================================
 # Logging Configuration
@@ -158,6 +164,62 @@ static_path = Path(__file__).parent / "static"
 if static_path.exists():
     app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
 
+AVATAR_ROOT = os.environ.get(
+    "AVATAR_ROOT",
+    "/local_models/musetalk_model/testing_avatar_creation/v15/avatars",
+)
+AVATAR_RESULT_DIR = os.environ.get(
+    "AVATAR_RESULT_DIR",
+    "/local_models/musetalk_model/testing_avatar_creation",
+)
+AVATAR_PYTHON = os.environ.get("AVATAR_PYTHON", "/opt/avatar_venv/bin/python")
+AVATAR_SCRIPT = os.environ.get("AVATAR_CREATE_SCRIPT", "/app/musetalk/create_avatar.py")
+AVATAR_MODEL_ROOT = os.environ.get("AVATAR_MODEL_ROOT", "/local_models/musetalk_model")
+AVATAR_DEFAULT_VERSION = os.environ.get("AVATAR_VERSION", "v15")
+AVATAR_DEVICE = os.environ.get("AVATAR_DEVICE", "cuda")
+AVATAR_MAX_SIDE = os.environ.get("AVATAR_MAX_SIDE", "0")
+
+
+def _sanitize_avatar_id(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    name = re.sub(r"[^a-zA-Z0-9_-]+", "_", raw).strip("_")
+    return name[:48] if name else None
+
+
+def _list_avatars() -> List[str]:
+    if not os.path.isdir(AVATAR_ROOT):
+        return []
+    items: List[str] = []
+    for entry in os.listdir(AVATAR_ROOT):
+        full = os.path.join(AVATAR_ROOT, entry)
+        if os.path.isdir(full):
+            items.append(entry)
+    return sorted(items)
+
+
+def _write_image_video(
+    image_bytes: bytes,
+    output_path: str,
+    fps: int = 25,
+    duration_s: float = 1.0,
+) -> None:
+    data = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Unable to decode image data")
+    h, w = img.shape[:2]
+    if w <= 0 or h <= 0:
+        raise ValueError("Invalid image dimensions")
+    frame_count = max(1, int(round(fps * duration_s)))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+    if not writer.isOpened():
+        raise RuntimeError("Failed to open VideoWriter for avatar video")
+    for _ in range(frame_count):
+        writer.write(img)
+    writer.release()
+
 
 # ============================================================================
 # Routes
@@ -202,6 +264,7 @@ async def get_config():
             "speech_threshold_ms": config.vad.speech_threshold_ms,
             "silence_threshold_ms": config.vad.silence_threshold_ms,
             "early_silence_threshold_ms": config.vad.early_silence_threshold_ms,
+            "enable_speculative": config.vad.enable_speculative,
             "prob_threshold": config.vad.prob_threshold,
         },
         "llm": {
@@ -216,12 +279,103 @@ async def get_config():
             "depth_temperature": config.tts.depth_temperature,
             "depth_top_p": config.tts.depth_top_p,
             "sample_rate": config.tts.sample_rate,
+            "voice_id": config.tts.voice_id,
         },
         "musetalk": {
             "batch_size": config.musetalk.batch_size,
             "lookahead_chunks": config.musetalk.lookahead_chunks,
+            "avatar_id": config.musetalk.avatar_id,
         },
     }
+
+
+@app.get("/avatars")
+async def list_avatars():
+    """List available avatar IDs."""
+    return {"avatars": _list_avatars()}
+
+
+@app.post("/avatar/create")
+async def create_avatar(
+    image: UploadFile = File(...),
+    avatar_id: str = Form(...),
+    force_recreate: bool = Form(False),
+    fps: int = Form(25),
+    version: str = Form(AVATAR_DEFAULT_VERSION),
+    duration_s: float = Form(1.0),
+):
+    """Create a MuseTalk avatar from an uploaded image."""
+    safe_avatar_id = _sanitize_avatar_id(avatar_id)
+    if not safe_avatar_id:
+        raise HTTPException(status_code=400, detail="Invalid avatar_id")
+
+    if image.content_type and not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are supported")
+
+    data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty image upload")
+
+    os.makedirs(AVATAR_RESULT_DIR, exist_ok=True)
+    if not os.path.exists(AVATAR_PYTHON):
+        raise HTTPException(status_code=500, detail="Avatar venv Python not found")
+    if not os.path.exists(AVATAR_SCRIPT):
+        raise HTTPException(status_code=500, detail="Avatar creation script not found")
+
+    temp_dir = tempfile.mkdtemp(prefix="avatar_")
+    image_path = os.path.join(temp_dir, f"{safe_avatar_id}.png")
+    video_path = os.path.join(temp_dir, f"{safe_avatar_id}.mp4")
+
+    try:
+        with open(image_path, "wb") as f:
+            f.write(data)
+
+        _write_image_video(data, video_path, fps=fps, duration_s=duration_s)
+
+        cmd = [
+            AVATAR_PYTHON,
+            AVATAR_SCRIPT,
+            "--video_path",
+            video_path,
+            "--result_dir",
+            AVATAR_RESULT_DIR,
+            "--version",
+            version,
+            "--model_root",
+            AVATAR_MODEL_ROOT,
+            "--device",
+            AVATAR_DEVICE,
+            "--max_side",
+            AVATAR_MAX_SIDE,
+            "--fps",
+            str(fps),
+            "--batch_size",
+            "8",
+            "--avatar_id",
+            safe_avatar_id,
+            "--force_recreate" if force_recreate else "",
+        ]
+        cmd = [c for c in cmd if c]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            detail = (stderr or stdout).decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=500, detail=detail or "Avatar creation failed")
+
+        return {"avatar_id": safe_avatar_id}
+    finally:
+        try:
+            for path in (image_path, video_path):
+                if os.path.exists(path):
+                    os.unlink(path)
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
 
 
 @app.post("/config")
@@ -238,6 +392,8 @@ async def update_config(new_config: dict):
             config.vad.silence_threshold_ms = float(vad["silence_threshold_ms"])
         if "early_silence_threshold_ms" in vad:
             config.vad.early_silence_threshold_ms = float(vad["early_silence_threshold_ms"])
+        if "enable_speculative" in vad:
+            config.vad.enable_speculative = bool(vad["enable_speculative"])
         if "prob_threshold" in vad:
             config.vad.prob_threshold = float(vad["prob_threshold"])
 
@@ -265,6 +421,8 @@ async def update_config(new_config: dict):
             config.tts.depth_top_p = float(tts["depth_top_p"])
         if "sample_rate" in tts:
             config.tts.sample_rate = int(tts["sample_rate"])
+        if "voice_id" in tts:
+            config.tts.voice_id = str(tts["voice_id"])
 
     if "musetalk" in new_config:
         mt_cfg = new_config["musetalk"]
@@ -278,6 +436,8 @@ async def update_config(new_config: dict):
                 config.musetalk.lookahead_chunks = max(0, int(mt_cfg["lookahead_chunks"]))
             except (TypeError, ValueError):
                 logger.warning(f"Ignoring invalid lookahead_chunks: {mt_cfg['lookahead_chunks']}")
+        if "avatar_id" in mt_cfg:
+            config.musetalk.avatar_id = str(mt_cfg["avatar_id"])
 
     return await get_config()
 

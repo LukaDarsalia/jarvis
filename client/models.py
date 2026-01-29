@@ -42,6 +42,10 @@ class MessageType(Enum):
     RECORDING_START = "recording_start"
     RECORDING_STOP = "recording_stop"
     STOP_GENERATION = "stop_generation"
+    VOICE_PROMPT_START = "voice_prompt_start"
+    VOICE_PROMPT_STOP = "voice_prompt_stop"
+    SET_VOICE_ID = "set_voice_id"
+    SET_AVATAR_ID = "set_avatar_id"
 
     # Server -> Client
     CONNECTED = "connected"
@@ -58,6 +62,9 @@ class MessageType(Enum):
     TTS_CACHE_READY = "tts_cache_ready"
     MUSETALK_READY = "musetalk_ready"
     ERROR = "error"
+    VOICE_PROMPT_READY = "voice_prompt_ready"
+    VOICE_PROMPT_ERROR = "voice_prompt_error"
+    AVATAR_READY = "avatar_ready"
 
 
 # ============================================================================

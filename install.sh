@@ -25,15 +25,15 @@ pip install opencv-python-headless==4.10.0.84 \
     einops==0.8.1 \
     sounddevice==0.5.3 
 
+# Pocket-TTS (English TTS)
+pip install pocket-tts scipy==1.14.1
+
 pip install gdown
 pip install coloredlogs flatbuffers numpy packaging protobuf sympy
 pip install -U --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
 pip install -U onnx onnxscript
 
 python3 ./download_data.py
-python3 ./onnx_csm/export_backbone_step_onnx.py
-python3 ./onnx_csm/export_depth_decoder_onnx.py
-python3 ./onnx_csm/generate_with_backbone_and_depth_onnx.py
 
 mv ./local_models /local_models
 
@@ -48,5 +48,3 @@ python3 ./model_repository/musetalk/export_unet_onnx.py --fp16 --device cuda --o
 # Benchmark UNet to verify ONNX is working
 echo "=== Benchmarking UNet (PyTorch vs ONNX) ==="
 python3 ./model_repository/musetalk/benchmark_unet_speed.py --device cuda --fp16 --iters 20 --warmup 5
-
-python3 model_repository/tts/1/tts_generator.py

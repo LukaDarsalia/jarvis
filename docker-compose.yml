@@ -1,5 +1,7 @@
 services:
   triton:
+    env_file:
+      - .env
     build:
       context: .
       dockerfile: Dockerfile
@@ -32,6 +34,26 @@ services:
       - triton
     environment:
       - TRITON_URL=triton:8001
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - AVATAR_PYTHON=/opt/avatar_venv/bin/python
+      - AVATAR_CREATE_SCRIPT=/app/musetalk/create_avatar.py
+      - AVATAR_MODEL_ROOT=/local_models/musetalk_model
+      - AVATAR_RESULT_DIR=/local_models/musetalk_model/testing_avatar_creation
+      - AVATAR_ROOT=/local_models/musetalk_model/testing_avatar_creation/v15/avatars
+      - AVATAR_VERSION=v15
+      - AVATAR_DEVICE=cpu
+      - AVATAR_MAX_SIDE=512
+    volumes:
+      - ./local_models:/local_models
+      - ./model_repository/musetalk:/app/musetalk
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     networks:
       - triton-network
 

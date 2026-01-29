@@ -127,10 +127,29 @@ class VoiceAssistant {
         // Config
         this.config = {
             vad: { speech_threshold_ms: 200, silence_threshold_ms: 1500 },
-            llm: { temperature: 0.7, top_p: 0.9, max_new_tokens: 512, system_prompt: 'თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი' },
-            tts: { backbone_temperature: 0.01, backbone_top_p: 0.999, depth_temperature: 0.01, depth_top_p: 0.999 },
-            musetalk: { batch_size: 8, lookahead_chunks: 2 },
+            llm: {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_new_tokens: 512,
+                system_prompt: 'You are the TBC Bank digital assistant. Be concise and helpful.'
+            },
+            tts: {
+                backbone_temperature: 0.01,
+                backbone_top_p: 0.999,
+                depth_temperature: 0.01,
+                depth_top_p: 0.999,
+                voice_id: 'alba'
+            },
+            musetalk: { batch_size: 8, lookahead_chunks: 2, avatar_id: 'default' },
         };
+
+        // Voice prompt capture (voice cloning)
+        this.voicePromptRecording = false;
+        this.voicePromptTimer = null;
+        this.voicePromptStream = null;
+        this.voicePromptContext = null;
+        this.voicePromptProcessor = null;
+        this.voicePromptSource = null;
 
         // DOM Elements
         this.elements = {};
@@ -201,6 +220,7 @@ class VoiceAssistant {
             avatarImage: document.getElementById('avatarImage'),
             avatarLoading: document.getElementById('avatarLoading'),
             avatarStatus: document.getElementById('avatarStatus'),
+            avatarUploadStatus: document.getElementById('avatarUploadStatus'),
             avatarMetrics: document.getElementById('avatarMetrics'),
             videoFps: document.getElementById('videoFps'),
             videoFrames: document.getElementById('videoFrames'),
@@ -248,6 +268,25 @@ class VoiceAssistant {
             musetalkBatchSizeValue: document.getElementById('musetalkBatchSizeValue'),
             musetalkLookaheadChunks: document.getElementById('musetalkLookaheadChunks'),
             musetalkLookaheadChunksValue: document.getElementById('musetalkLookaheadChunksValue'),
+            voiceId: document.getElementById('voiceId'),
+            voicePromptBtn: document.getElementById('voicePromptBtn'),
+            voicePromptStatus: document.getElementById('voicePromptStatus'),
+            voicePromptName: document.getElementById('voicePromptName'),
+            voicePromptFile: document.getElementById('voicePromptFile'),
+            voicePromptUploadBtn: document.getElementById('voicePromptUploadBtn'),
+            avatarId: document.getElementById('avatarId'),
+            avatarName: document.getElementById('avatarName'),
+            avatarImageUpload: document.getElementById('avatarImageUpload'),
+            avatarUploadBtn: document.getElementById('avatarUploadBtn'),
+            avatarCaptureBtn: document.getElementById('avatarCaptureBtn'),
+            avatarStatus: document.getElementById('avatarStatus'),
+            avatarUploadStatus: document.getElementById('avatarUploadStatus'),
+            cameraModal: document.getElementById('cameraModal'),
+            cameraBackdrop: document.getElementById('cameraBackdrop'),
+            cameraVideo: document.getElementById('cameraVideo'),
+            cameraCloseBtn: document.getElementById('cameraCloseBtn'),
+            cameraCancelBtn: document.getElementById('cameraCancelBtn'),
+            cameraShootBtn: document.getElementById('cameraShootBtn'),
             bufferFrames: document.getElementById('bufferFrames'),
             bufferCurrent: document.getElementById('bufferCurrent'),
         };
@@ -271,6 +310,47 @@ class VoiceAssistant {
             const valueEl = this.elements[id + 'Value'];
             if (slider && valueEl) {
                 slider.addEventListener('input', () => valueEl.textContent = slider.value);
+            }
+        });
+
+        this.elements.voicePromptBtn?.addEventListener('click', () => this.toggleVoicePromptRecording());
+        this.elements.voicePromptUploadBtn?.addEventListener('click', () => {
+            this.elements.voicePromptFile?.click();
+        });
+        this.elements.voicePromptFile?.addEventListener('change', (e) => {
+            const file = e.target?.files?.[0];
+            if (file) this.handleVoicePromptFile(file);
+            e.target.value = '';
+        });
+        this.elements.voiceId?.addEventListener('change', () => {
+            this.config.tts.voice_id = this.elements.voiceId?.value || 'alba';
+            this.sendMessage('set_voice_id', { voice_id: this.config.tts.voice_id });
+            if (this.elements.voicePromptStatus) {
+                this.elements.voicePromptStatus.textContent = 'Preset voice selected';
+            }
+        });
+
+        this.elements.avatarUploadBtn?.addEventListener('click', () => {
+            this.elements.avatarImageUpload?.click();
+        });
+        this.elements.avatarCaptureBtn?.addEventListener('click', () => {
+            this.openCameraModal();
+        });
+        this.elements.avatarImageUpload?.addEventListener('change', (e) => {
+            const file = e.target?.files?.[0];
+            if (file) this.handleAvatarFile(file);
+            e.target.value = '';
+        });
+        this.elements.cameraBackdrop?.addEventListener('click', () => this.closeCameraModal());
+        this.elements.cameraCloseBtn?.addEventListener('click', () => this.closeCameraModal());
+        this.elements.cameraCancelBtn?.addEventListener('click', () => this.closeCameraModal());
+        this.elements.cameraShootBtn?.addEventListener('click', () => this.captureAvatarPhoto());
+        this.elements.avatarId?.addEventListener('change', () => {
+            const avatarId = this.elements.avatarId?.value || 'default';
+            this.config.musetalk.avatar_id = avatarId;
+            this.sendMessage('set_avatar_id', { avatar_id: avatarId });
+            if (this.elements.avatarUploadStatus) {
+                this.elements.avatarUploadStatus.textContent = `Active avatar: ${avatarId}`;
             }
         });
 
@@ -573,6 +653,40 @@ class VoiceAssistant {
                 }
                 break;
 
+            case 'voice_prompt_ready':
+                if (this.elements.voicePromptStatus) {
+                    const label = this.getVoiceLabel(data.voice_id || '');
+                    const suffix = label ? ` as "${label}"` : '';
+                    this.elements.voicePromptStatus.textContent = `Voice sample ready${suffix} (${data.duration_ms || 0}ms)`;
+                }
+                if (data.voice_id) {
+                    this.ensureVoiceOption(data.voice_id);
+                    if (this.elements.voiceId) {
+                        this.elements.voiceId.value = data.voice_id;
+                    }
+                    this.config.tts.voice_id = data.voice_id;
+                }
+                break;
+
+            case 'voice_prompt_error':
+                if (this.elements.voicePromptStatus) {
+                    this.elements.voicePromptStatus.textContent = `Voice prompt error: ${data.message || 'unknown'}`;
+                }
+                if (this.elements.voicePromptBtn) {
+                    this.elements.voicePromptBtn.textContent = 'Record voice sample';
+                }
+                break;
+
+            case 'avatar_ready':
+                if (data.idle_frame) {
+                    this.idleFrame = data.idle_frame;
+                    this.displayFrame(data.idle_frame);
+                }
+                if (this.elements.avatarUploadStatus) {
+                    this.elements.avatarUploadStatus.textContent = `Avatar ready: ${data.avatar_id || ''}`;
+                }
+                break;
+
             case 'vad_status':
                 this.updateVadStatus(data.status);
                 break;
@@ -854,6 +968,344 @@ class VoiceAssistant {
         // Force reset VAD visual state
         this.resetVadVisualState();
 
+    }
+
+    async toggleVoicePromptRecording() {
+        if (this.voicePromptRecording) {
+            this.stopVoicePromptRecording();
+        } else {
+            await this.startVoicePromptRecording();
+        }
+    }
+
+    async startVoicePromptRecording() {
+        try {
+            if (this.isRecording) {
+                this.stopRecording();
+            }
+
+            if (!navigator.mediaDevices?.getUserMedia) {
+                this.setVadStatusText('Browser microphone access unavailable');
+                return;
+            }
+
+            this.voicePromptStream = await navigator.mediaDevices.getUserMedia({
+                audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+            });
+
+            this.voicePromptContext = new AudioContext({ sampleRate: 16000 });
+            const source = this.voicePromptContext.createMediaStreamSource(this.voicePromptStream);
+            const processor = this.voicePromptContext.createScriptProcessor(512, 1, 1);
+
+            const BATCH_SIZE = 5;
+            let audioBatch = [];
+
+            processor.onaudioprocess = (e) => {
+                if (!this.voicePromptRecording) return;
+
+                audioBatch.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+
+                if (audioBatch.length >= BATCH_SIZE) {
+                    if (this.ws?.readyState === WebSocket.OPEN && this.ws.bufferedAmount < 256 * 1024) {
+                        const totalSamples = audioBatch.reduce((sum, arr) => sum + arr.length, 0);
+                        const combined = new Float32Array(totalSamples);
+                        let offset = 0;
+                        for (const chunk of audioBatch) {
+                            combined.set(chunk, offset);
+                            offset += chunk.length;
+                        }
+                        this.ws.send(combined.buffer);
+                    }
+                    audioBatch = [];
+                }
+            };
+
+            source.connect(processor);
+            processor.connect(this.voicePromptContext.destination);
+
+            this.voicePromptSource = source;
+            this.voicePromptProcessor = processor;
+            this.voicePromptRecording = true;
+
+            if (this.elements.voicePromptStatus) {
+                this.elements.voicePromptStatus.textContent = 'Recording...';
+            }
+            if (this.elements.voicePromptBtn) {
+                this.elements.voicePromptBtn.textContent = 'Stop recording';
+            }
+
+            this.sendMessage('voice_prompt_start');
+
+        } catch (e) {
+            console.error('Failed to start voice prompt recording:', e);
+            if (this.elements.voicePromptStatus) {
+                this.elements.voicePromptStatus.textContent = 'Voice prompt failed';
+            }
+        }
+    }
+
+    stopVoicePromptRecording() {
+        this.voicePromptRecording = false;
+        const rawName = this.elements.voicePromptName?.value?.trim() || '';
+        const defaultName = `custom-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        const voiceName = rawName || defaultName;
+        this.sendMessage('voice_prompt_stop', { voice_name: voiceName });
+
+        this.voicePromptProcessor?.disconnect();
+        this.voicePromptSource?.disconnect();
+        this.voicePromptStream?.getTracks().forEach(track => track.stop());
+        this.voicePromptContext?.close();
+
+        this.voicePromptProcessor = null;
+        this.voicePromptSource = null;
+        this.voicePromptStream = null;
+        this.voicePromptContext = null;
+
+        if (this.elements.voicePromptStatus) {
+            this.elements.voicePromptStatus.textContent = 'Uploading...';
+        }
+        if (this.elements.voicePromptBtn) {
+            this.elements.voicePromptBtn.textContent = 'Record voice sample';
+        }
+    }
+
+    async handleVoicePromptFile(file) {
+        try {
+            if (this.isRecording) {
+                this.stopRecording();
+            }
+            if (this.voicePromptRecording) {
+                this.stopVoicePromptRecording();
+            }
+
+            if (this.elements.voicePromptStatus) {
+                this.elements.voicePromptStatus.textContent = 'Processing file...';
+            }
+
+            const arrayBuffer = await file.arrayBuffer();
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const decoded = await ctx.decodeAudioData(arrayBuffer);
+            const mono = await this.resampleToMono(decoded, 16000);
+            await ctx.close();
+
+            const samples = mono.getChannelData(0);
+            if (!samples || samples.length === 0) {
+                throw new Error('empty audio');
+            }
+
+            const rawName = this.elements.voicePromptName?.value?.trim() || '';
+            const fallbackName = file.name ? file.name.replace(/\.[^.]+$/, '') : '';
+            const defaultName = `custom-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+            const voiceName = rawName || fallbackName || defaultName;
+
+            if (this.elements.voicePromptStatus) {
+                this.elements.voicePromptStatus.textContent = 'Uploading...';
+            }
+
+            this.sendMessage('voice_prompt_start');
+            await this.sendFloat32InChunks(samples);
+            this.sendMessage('voice_prompt_stop', { voice_name: voiceName });
+        } catch (e) {
+            console.error('Voice prompt upload failed:', e);
+            if (this.elements.voicePromptStatus) {
+                this.elements.voicePromptStatus.textContent = 'Voice prompt upload failed';
+            }
+        }
+    }
+
+    async resampleToMono(audioBuffer, targetRate) {
+        let monoBuffer = audioBuffer;
+        if (audioBuffer.numberOfChannels > 1) {
+            const tmp = new AudioBuffer({
+                length: audioBuffer.length,
+                sampleRate: audioBuffer.sampleRate,
+                numberOfChannels: 1
+            });
+            const monoData = tmp.getChannelData(0);
+            for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+                const data = audioBuffer.getChannelData(ch);
+                for (let i = 0; i < data.length; i++) {
+                    monoData[i] += data[i];
+                }
+            }
+            for (let i = 0; i < monoData.length; i++) {
+                monoData[i] /= audioBuffer.numberOfChannels;
+            }
+            monoBuffer = tmp;
+        }
+
+        if (monoBuffer.sampleRate === targetRate) {
+            return monoBuffer;
+        }
+
+        const length = Math.ceil(monoBuffer.duration * targetRate);
+        const offline = new OfflineAudioContext(1, length, targetRate);
+        const source = offline.createBufferSource();
+        source.buffer = monoBuffer;
+        source.connect(offline.destination);
+        source.start(0);
+        return await offline.startRendering();
+    }
+
+    async sendFloat32InChunks(samples) {
+        const CHUNK_SAMPLES = 4096;
+        let offset = 0;
+        while (offset < samples.length) {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                break;
+            }
+            if (this.ws.bufferedAmount > 512 * 1024) {
+                await new Promise(resolve => setTimeout(resolve, 10));
+                continue;
+            }
+            const slice = samples.subarray(offset, offset + CHUNK_SAMPLES);
+            this.ws.send(slice.buffer);
+            offset += CHUNK_SAMPLES;
+        }
+    }
+
+    getVoiceLabel(voiceId) {
+        if (!voiceId) return '';
+        return voiceId.startsWith('custom:') ? voiceId.slice('custom:'.length) : voiceId;
+    }
+
+    ensureVoiceOption(voiceId) {
+        if (!voiceId || !this.elements.voiceId) return;
+        const existing = Array.from(this.elements.voiceId.options).find(opt => opt.value === voiceId);
+        if (existing) return;
+        const option = document.createElement('option');
+        option.value = voiceId;
+        option.textContent = this.getVoiceLabel(voiceId) || voiceId;
+        this.elements.voiceId.appendChild(option);
+    }
+
+    getAvatarLabel(avatarId) {
+        return avatarId || '';
+    }
+
+    ensureAvatarOption(avatarId) {
+        if (!avatarId || !this.elements.avatarId) return;
+        const existing = Array.from(this.elements.avatarId.options).find(opt => opt.value === avatarId);
+        if (existing) return;
+        const option = document.createElement('option');
+        option.value = avatarId;
+        option.textContent = this.getAvatarLabel(avatarId);
+        this.elements.avatarId.appendChild(option);
+    }
+
+    async fetchAvatarList(selectId = null) {
+        try {
+            const res = await fetch('/avatars');
+            const data = await res.json();
+            if (!this.elements.avatarId) return;
+            this.elements.avatarId.innerHTML = '';
+            const avatars = Array.isArray(data.avatars) ? data.avatars : [];
+            if (avatars.length === 0) {
+                this.ensureAvatarOption('default');
+            }
+            avatars.forEach(id => this.ensureAvatarOption(id));
+            const target = selectId || this.config.musetalk?.avatar_id || 'default';
+            this.ensureAvatarOption(target);
+            this.elements.avatarId.value = target;
+        } catch (e) {
+            console.error('Failed to fetch avatars:', e);
+        }
+    }
+
+    async handleAvatarFile(file) {
+        try {
+            if (this.elements.avatarUploadStatus) {
+                this.elements.avatarUploadStatus.textContent = 'Uploading avatar...';
+            }
+            const rawName = this.elements.avatarName?.value?.trim() || '';
+            const fallback = file.name ? file.name.replace(/\.[^.]+$/, '') : '';
+            const avatarId = rawName || fallback || `avatar-${Date.now()}`;
+
+            const form = new FormData();
+            form.append('avatar_id', avatarId);
+            form.append('image', file, file.name || 'avatar.png');
+
+            const resp = await fetch('/avatar/create', { method: 'POST', body: form });
+            if (!resp.ok) {
+                const errText = await resp.text();
+                throw new Error(errText || 'Avatar creation failed');
+            }
+            const payload = await resp.json();
+            const createdId = payload.avatar_id || avatarId;
+
+            await this.fetchAvatarList(createdId);
+            this.config.musetalk.avatar_id = createdId;
+            this.sendMessage('set_avatar_id', { avatar_id: createdId });
+
+            if (this.elements.avatarUploadStatus) {
+                this.elements.avatarUploadStatus.textContent = `Avatar created: ${createdId}`;
+            }
+        } catch (e) {
+            console.error('Avatar upload failed:', e);
+            if (this.elements.avatarUploadStatus) {
+                this.elements.avatarUploadStatus.textContent = 'Avatar upload failed';
+            }
+        }
+    }
+
+    async openCameraModal() {
+        if (!this.elements.cameraModal || !this.elements.cameraVideo) return;
+        try {
+            const constraints = {
+                audio: false,
+                video: {
+                    facingMode: 'user',
+                    width: { ideal: 720 },
+                    height: { ideal: 720 },
+                }
+            };
+            this.cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
+            this.elements.cameraVideo.srcObject = this.cameraStream;
+            this.elements.cameraModal.classList.remove('hidden');
+        } catch (err) {
+            console.error('Camera access failed:', err);
+            if (this.elements.avatarUploadStatus) {
+                this.elements.avatarUploadStatus.textContent = 'Camera permission denied';
+            }
+        }
+    }
+
+    closeCameraModal() {
+        if (this.elements.cameraModal) {
+            this.elements.cameraModal.classList.add('hidden');
+        }
+        if (this.elements.cameraVideo) {
+            this.elements.cameraVideo.srcObject = null;
+        }
+        if (this.cameraStream) {
+            this.cameraStream.getTracks().forEach(track => track.stop());
+            this.cameraStream = null;
+        }
+    }
+
+    async captureAvatarPhoto() {
+        const video = this.elements.cameraVideo;
+        if (!video) return;
+        const width = video.videoWidth || 720;
+        const height = video.videoHeight || 720;
+        const size = Math.min(width, height);
+        const sx = Math.floor((width - size) / 2);
+        const sy = Math.floor((height - size) / 2);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.drawImage(video, sx, sy, size, size, 0, 0, size, size);
+
+        canvas.toBlob(async (blob) => {
+            if (!blob) return;
+            const filename = (this.elements.avatarName?.value?.trim() || 'avatar') + '.png';
+            const file = new File([blob], filename, { type: 'image/png' });
+            this.closeCameraModal();
+            await this.handleAvatarFile(file);
+        }, 'image/png');
     }
 
     resetVadVisualState() {
@@ -1887,6 +2339,14 @@ class VoiceAssistant {
         setVal('ttsDepthTopP', this.config.tts.depth_top_p);
         setVal('musetalkBatchSize', this.config.musetalk?.batch_size ?? 8);
         setVal('musetalkLookaheadChunks', this.config.musetalk?.lookahead_chunks ?? 2);
+        if (this.elements.voiceId) {
+            this.ensureVoiceOption(this.config.tts.voice_id);
+            this.elements.voiceId.value = this.config.tts.voice_id || 'alba';
+        }
+        if (this.elements.avatarId) {
+            this.ensureAvatarOption(this.config.musetalk?.avatar_id || 'default');
+            this.elements.avatarId.value = this.config.musetalk?.avatar_id || 'default';
+        }
     }
 
     async saveSettings() {
@@ -1901,8 +2361,10 @@ class VoiceAssistant {
         this.config.tts.backbone_top_p = parseFloat(this.elements.ttsBackboneTopP?.value || 0.9);
         this.config.tts.depth_temperature = parseFloat(this.elements.ttsDepthTemp?.value || 0.8);
         this.config.tts.depth_top_p = parseFloat(this.elements.ttsDepthTopP?.value || 0.9);
+        this.config.tts.voice_id = this.elements.voiceId?.value || 'alba';
         this.config.musetalk.batch_size = parseInt(this.elements.musetalkBatchSize?.value || 8);
         this.config.musetalk.lookahead_chunks = parseInt(this.elements.musetalkLookaheadChunks?.value || 2);
+        this.config.musetalk.avatar_id = this.elements.avatarId?.value || 'default';
 
         localStorage.setItem('voiceAssistantConfig', JSON.stringify(this.config));
 
@@ -1913,6 +2375,7 @@ class VoiceAssistant {
                 body: JSON.stringify(this.config)
             });
             this.log('Settings saved');
+            this.sendMessage('set_voice_id', { voice_id: this.config.tts.voice_id || 'alba' });
         } catch (e) {
             console.error('Failed to save settings:', e);
         }
@@ -1923,11 +2386,31 @@ class VoiceAssistant {
     resetSettings() {
         this.config = {
             vad: { speech_threshold_ms: 200, silence_threshold_ms: 1500 },
-            llm: { temperature: 0.7, top_p: 0.9, max_new_tokens: 512, system_prompt: 'თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი' },
-            tts: { backbone_temperature: 0.01, backbone_top_p: 0.999, depth_temperature: 0.01, depth_top_p: 0.999 },
-            musetalk: { batch_size: 8, lookahead_chunks: 2 },
+            llm: {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_new_tokens: 512,
+                system_prompt: 'You are the TBC Bank digital assistant. Be concise and helpful.'
+            },
+            tts: {
+                backbone_temperature: 0.01,
+                backbone_top_p: 0.999,
+                depth_temperature: 0.01,
+                depth_top_p: 0.999,
+                voice_id: 'alba'
+            },
+            musetalk: { batch_size: 8, lookahead_chunks: 2, avatar_id: 'default' },
         };
         this.loadSettingsToUI();
+        if (this.elements.voicePromptStatus) {
+            this.elements.voicePromptStatus.textContent = 'No sample';
+        }
+        if (this.elements.voicePromptName) {
+            this.elements.voicePromptName.value = '';
+        }
+        if (this.elements.avatarName) {
+            this.elements.avatarName.value = '';
+        }
     }
 
     loadConfig() {
@@ -1950,7 +2433,10 @@ class VoiceAssistant {
                 if (serverConfig.musetalk) this.config.musetalk = { ...this.config.musetalk, ...serverConfig.musetalk };
                 this.loadSettingsToUI();
             })
-            .catch(e => this.log('Could not load server config:', e));
+            .catch(e => this.log('Could not load server config:', e))
+            .finally(() => {
+                this.fetchAvatarList();
+            });
     }
 }
 

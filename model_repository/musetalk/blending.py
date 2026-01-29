@@ -93,23 +93,91 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     return body[:, :, ::-1]  # 返回处理后的图像（BGR 转 RGB）
 
 
-def get_image_blending(image, face, face_box, mask_array, crop_box):
-    body = Image.fromarray(image[:,:,::-1])
-    face = Image.fromarray(face[:,:,::-1])
+def _extract_crop_with_padding(image: np.ndarray, x_s: int, y_s: int, x_e: int, y_e: int) -> np.ndarray:
+    """Extract crop (with zero padding) for out-of-bounds boxes."""
+    h, w = image.shape[:2]
+    crop_w = max(0, x_e - x_s)
+    crop_h = max(0, y_e - y_s)
+    if crop_w == 0 or crop_h == 0:
+        return np.zeros((0, 0, 3), dtype=image.dtype)
 
+    crop = np.zeros((crop_h, crop_w, 3), dtype=image.dtype)
+    src_x0 = max(0, x_s)
+    src_y0 = max(0, y_s)
+    src_x1 = min(w, x_e)
+    src_y1 = min(h, y_e)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return crop
+    dst_x0 = src_x0 - x_s
+    dst_y0 = src_y0 - y_s
+    dst_x1 = dst_x0 + (src_x1 - src_x0)
+    dst_y1 = dst_y0 + (src_y1 - src_y0)
+    crop[dst_y0:dst_y1, dst_x0:dst_x1] = image[src_y0:src_y1, src_x0:src_x1]
+    return crop
+
+
+def _paste_crop_with_padding(image: np.ndarray, crop: np.ndarray, x_s: int, y_s: int, x_e: int, y_e: int) -> None:
+    """Paste crop back into image with bounds checking."""
+    h, w = image.shape[:2]
+    src_x0 = max(0, x_s)
+    src_y0 = max(0, y_s)
+    src_x1 = min(w, x_e)
+    src_y1 = min(h, y_e)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return
+    dst_x0 = src_x0 - x_s
+    dst_y0 = src_y0 - y_s
+    dst_x1 = dst_x0 + (src_x1 - src_x0)
+    dst_y1 = dst_y0 + (src_y1 - src_y0)
+    image[src_y0:src_y1, src_x0:src_x1] = crop[dst_y0:dst_y1, dst_x0:dst_x1]
+
+
+def get_image_blending(image, face, face_box, mask_array, crop_box):
+    """Fast numpy-based blending to replace PIL-heavy path."""
     x, y, x1, y1 = face_box
     x_s, y_s, x_e, y_e = crop_box
-    face_large = body.crop(crop_box)
 
+    # Extract crop with padding (to mimic PIL behavior for out-of-bounds boxes)
+    face_large = _extract_crop_with_padding(image, x_s, y_s, x_e, y_e)
+    if face_large.size == 0:
+        return image
+
+    # Normalize mask to single-channel float alpha
     if isinstance(mask_array, Image.Image):
-        mask_image = mask_array
+        mask = np.array(mask_array.convert("L"))
     else:
-        mask_image = Image.fromarray(mask_array)
-        mask_image = mask_image.convert("L")
-    face_large.paste(face, (x-x_s, y-y_s, x1-x_s, y1-y_s))
-    body.paste(face_large, crop_box[:2], mask_image)
-    body = np.array(body)
-    return body[:,:,::-1]
+        mask = np.array(mask_array)
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+
+    crop_h, crop_w = face_large.shape[:2]
+    if mask.shape[0] != crop_h or mask.shape[1] != crop_w:
+        mask = cv2.resize(mask, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+
+    # Place face patch into crop
+    fx0 = x - x_s
+    fy0 = y - y_s
+    fx1 = fx0 + (x1 - x)
+    fy1 = fy0 + (y1 - y)
+    face_large_with_patch = face_large.copy()
+    # Clamp to crop bounds just in case
+    px0 = max(0, fx0)
+    py0 = max(0, fy0)
+    px1 = min(crop_w, fx1)
+    py1 = min(crop_h, fy1)
+    if px1 > px0 and py1 > py0:
+        src_x0 = px0 - fx0
+        src_y0 = py0 - fy0
+        src_x1 = src_x0 + (px1 - px0)
+        src_y1 = src_y0 + (py1 - py0)
+        face_large_with_patch[py0:py1, px0:px1] = face[src_y0:src_y1, src_x0:src_x1]
+
+    alpha = (mask.astype(np.float32) / 255.0)[..., None]
+    blended = (alpha * face_large_with_patch + (1.0 - alpha) * face_large).astype(np.uint8)
+
+    out = image.copy()
+    _paste_crop_with_padding(out, blended, x_s, y_s, x_e, y_e)
+    return out
 
 
 def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5, fp=None, mode="raw"):

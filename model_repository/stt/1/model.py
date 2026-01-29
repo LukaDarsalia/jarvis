@@ -1,9 +1,28 @@
+import os
 import numpy as np
 import torch
 import triton_python_backend_utils as pb_utils
 import nemo.collections.asr as nemo_asr
-import soundfile as sf
 import time
+
+
+def _find_nemo_file(model_dir: str) -> str:
+    """Find a .nemo file inside the model directory."""
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"STT model directory not found: {model_dir}")
+
+    candidates = []
+    for root, _, files in os.walk(model_dir):
+        for filename in files:
+            if filename.endswith(".nemo"):
+                candidates.append(os.path.join(root, filename))
+
+    if not candidates:
+        raise FileNotFoundError(f"No .nemo files found under {model_dir}")
+
+    # Prefer a deterministic order
+    candidates.sort()
+    return candidates[0]
 
 class TritonPythonModel:
 
@@ -11,7 +30,8 @@ class TritonPythonModel:
         """
         This runs ONCE when Triton loads the model.
         """
-        model_path = "/local_models/stt_model/fast_conformer_georgian.nemo"
+        model_dir = os.environ.get("STT_MODEL_DIR", "/local_models/stt_model")
+        model_path = _find_nemo_file(model_dir)
 
         # Load NeMo ASR model (FastConformer)
         self.asr_model = nemo_asr.models.ASRModel.restore_from(

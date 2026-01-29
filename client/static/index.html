@@ -222,7 +222,7 @@
                         </div>
                         <div class="setting-item full-width">
                             <label for="systemPrompt">სისტემური პრომპტი</label>
-                            <textarea id="systemPrompt" rows="3">თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი, რომლის მოვალეობაცაა დაეხმაროს მომხმარებლებს საბანკო თემებში</textarea>
+                            <textarea id="systemPrompt" rows="3">You are the TBC Bank digital assistant. Help users with banking questions. Keep responses concise.</textarea>
                         </div>
                     </div>
 
@@ -255,6 +255,30 @@
                             <input type="range" id="ttsDepthTopP" min="0.1" max="1" value="0.999" step="0.001">
                             <span class="setting-value" id="ttsDepthTopPValue">0.999</span>
                         </div>
+                        <div class="setting-item">
+                            <label for="voiceId">Voice preset</label>
+                            <select id="voiceId">
+                                <option value="alba">Alba</option>
+                                <option value="marius">Marius</option>
+                                <option value="javert">Javert</option>
+                                <option value="jean">Jean</option>
+                                <option value="fantine">Fantine</option>
+                                <option value="cosette">Cosette</option>
+                                <option value="eponine">Eponine</option>
+                                <option value="azelma">Azelma</option>
+                            </select>
+                            <span class="setting-hint">Preset voice</span>
+                        </div>
+                        <div class="setting-item full-width">
+                            <label>Voice cloning (optional)</label>
+                            <div class="setting-row">
+                                <input type="text" id="voicePromptName" class="voice-prompt-name" placeholder="Custom voice name">
+                                <button class="btn btn-secondary" id="voicePromptBtn">Record voice sample</button>
+                                <input type="file" id="voicePromptFile" class="voice-prompt-file" accept=".wav,audio/wav">
+                                <button class="btn btn-secondary" id="voicePromptUploadBtn">Upload WAV</button>
+                                <span class="setting-hint" id="voicePromptStatus">No sample</span>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- MuseTalk Settings -->
@@ -281,6 +305,32 @@
                         <div class="setting-hint">Batch: ფრეიმები Triton-ზე (1=40ms). Lookahead: TTS chunk-ები (1=80ms)</div>
                     </div>
 
+                    <!-- Avatar Selection / Creation -->
+                    <div class="settings-section">
+                        <h3>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="8" r="4"/>
+                                <path d="M4 20c1.5-4 6.5-6 8-6s6.5 2 8 6"/>
+                            </svg>
+                            Avatar (dynamic)
+                        </h3>
+                        <div class="setting-item">
+                            <label for="avatarId">Choose avatar</label>
+                            <select id="avatarId"></select>
+                            <span class="setting-hint">Active avatar</span>
+                        </div>
+                        <div class="setting-item full-width">
+                            <label>Create new avatar (image)</label>
+                            <div class="setting-row">
+                                <input type="text" id="avatarName" class="avatar-name-input" placeholder="Avatar name">
+                                <input type="file" id="avatarImageUpload" class="avatar-file" accept="image/*">
+                                <button class="btn btn-secondary" id="avatarUploadBtn">Upload image</button>
+                                <button class="btn btn-secondary" id="avatarCaptureBtn">Use camera</button>
+                                <span class="setting-hint" id="avatarUploadStatus">No upload</span>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Buffer / Sync Settings -->
                     <div class="settings-section">
                         <h3>
@@ -297,7 +347,7 @@
                                 <label for="bufferFrames">საჭირო ფრეიმების რაოდენობა</label>
                             </div>
                             <div class="buffer-controls">
-                                <input type="number" id="bufferFrames" min="1" max="100" step="1" value="1">
+                                <input type="number" id="bufferFrames" min="1" max="100" step="1" value="5">
                                 <span class="setting-hint">რამდენი ფრეიმი უნდა დაგროვდეს დაწყებამდე (1 ფრეიმი = 40ms @ 25fps)</span>
                             </div>
                             <div class="setting-hint" id="bufferCurrent">ბუფერი: 24 ფრეიმი = 960ms</div>
@@ -308,6 +358,29 @@
                 <div class="settings-footer">
                     <button class="btn btn-secondary" id="resetSettingsBtn">ნაგულისხმევი</button>
                     <button class="btn btn-primary" id="saveSettingsBtn">შენახვა</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Camera Capture Modal -->
+        <div class="camera-modal hidden" id="cameraModal">
+            <div class="camera-backdrop" id="cameraBackdrop"></div>
+            <div class="camera-panel">
+                <div class="camera-header">
+                    <h3>Capture Avatar Photo</h3>
+                    <button class="close-btn" id="cameraCloseBtn" title="Close">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"/>
+                            <line x1="6" y1="6" x2="18" y2="18"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="camera-preview">
+                    <video id="cameraVideo" autoplay playsinline></video>
+                </div>
+                <div class="camera-actions">
+                    <button class="btn btn-secondary" id="cameraCancelBtn">Cancel</button>
+                    <button class="btn btn-primary" id="cameraShootBtn">Shoot</button>
                 </div>
             </div>
         </div>

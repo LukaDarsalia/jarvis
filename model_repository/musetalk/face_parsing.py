@@ -8,10 +8,19 @@ from custom_models import BiSeNet
 import torchvision.transforms as transforms
 
 class FaceParsing():
-    def __init__(self, left_cheek_width=80, right_cheek_width=80, 
-                 resnet_path='./models/face-parse-bisent/resnet18-5c106cde.pth',
-                 model_pth='./models/face-parse-bisent/79999_iter.pth'):
-        self.net = self.model_init(resnet_path=resnet_path, model_pth=model_pth)
+    def __init__(
+        self,
+        left_cheek_width=80,
+        right_cheek_width=80,
+        resnet_path='./models/face-parse-bisent/resnet18-5c106cde.pth',
+        model_pth='./models/face-parse-bisent/79999_iter.pth',
+        device=None,
+    ):
+        if device is not None:
+            self.device = device
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.net = self.model_init(resnet_path=resnet_path, model_pth=model_pth, device=self.device)
         self.preprocess = self.image_preprocess()
         # Ensure all size parameters are integers
         cone_height = 21
@@ -58,9 +67,12 @@ class FaceParsing():
         cv2.rectangle(mask, (center + right_cheek_width, 0), (512, 512), 255, -1)  # Right cheek
         return mask
 
-    def model_init(self, 
-                   resnet_path='./models/face-parse-bisent/resnet18-5c106cde.pth', 
-                   model_pth='./models/face-parse-bisent/79999_iter.pth'):
+    def model_init(
+        self,
+        resnet_path='./models/face-parse-bisent/resnet18-5c106cde.pth',
+        model_pth='./models/face-parse-bisent/79999_iter.pth',
+        device=None,
+    ):
         # Ensure paths are absolute
         import os
         if not os.path.isabs(resnet_path):
@@ -69,11 +81,13 @@ class FaceParsing():
             model_pth = os.path.abspath(model_pth)
         
         net = BiSeNet(resnet_path)
-        if torch.cuda.is_available():
-            net.cuda()
-            net.load_state_dict(torch.load(model_pth)) 
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            net = net.to(device)
+            net.load_state_dict(torch.load(model_pth))
         else:
-            net.load_state_dict(torch.load(model_pth, map_location=torch.device('cpu')))
+            net.load_state_dict(torch.load(model_pth, map_location=device))
         net.eval()
         return net
 
@@ -91,10 +105,7 @@ class FaceParsing():
         with torch.no_grad():
             image = image.resize(size, Image.BILINEAR)
             img = self.preprocess(image)
-            if torch.cuda.is_available():
-                img = torch.unsqueeze(img, 0).cuda()
-            else:
-                img = torch.unsqueeze(img, 0)
+            img = torch.unsqueeze(img, 0).to(self.device)
             out = self.net(img)[0]
             parsing = out.squeeze(0).cpu().numpy().argmax(0)
             

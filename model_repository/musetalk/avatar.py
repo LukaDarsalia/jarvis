@@ -52,6 +52,7 @@ class AvatarConfig:
     batch_size: int = 20
     audio_padding_length_left: int = 2
     audio_padding_length_right: int = 2
+    max_side: int = 0
 
 
 @dataclass
@@ -161,7 +162,11 @@ class Avatar:
                     else:
                         self._load_cached_material()
                 else:
-                    self._load_cached_material()
+                    try:
+                        self._load_cached_material()
+                    except FileNotFoundError:
+                        shutil.rmtree(self.avatar_path)
+                        self._prepare_fresh_avatar()
             else:
                 self._prepare_fresh_avatar()
         else:
@@ -234,9 +239,13 @@ class Avatar:
 
         print("extracting landmarks...")
         # Import here to avoid pulling heavy dependencies when only loading avatars.
-        from musetalk.utils.preprocessing import get_landmark_and_bbox
+        from preprocessing import get_landmark_and_bbox
 
-        coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
+        coord_list, frame_list = get_landmark_and_bbox(
+            input_img_list,
+            self.bbox_shift,
+            max_side=self.config.max_side,
+        )
 
         input_latent_list = []
         coord_placeholder = (0.0, 0.0, 0.0, 0.0)

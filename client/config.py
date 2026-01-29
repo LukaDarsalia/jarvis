@@ -15,6 +15,7 @@ class VADConfig:
     # Early silence threshold for speculative STT/LLM processing
     # When silence reaches this threshold, we start STT speculatively to reduce latency
     early_silence_threshold_ms: float = 400.0
+    enable_speculative: bool = False
     prob_threshold: float = 0.5
     sample_rate: int = 16000
     chunk_samples: int = 512
@@ -26,17 +27,10 @@ class LLMConfig:
     max_new_tokens: int = 192
     temperature: float = 0.1
     top_p: float = 0.95
-    system_prompt: str = """თქვენ ხართ თიბისი ბანკის ციფრული ასისტენტი, რომლის მოვალეობაცაა დაეხმაროს მომხმარებლებს საბანკო თემებში.
-
-არ წერო ძალიან დიდი ტექსტები. მაქსიმუმ შემოიფარგლე 2-4 წინადადებით.
-
-გაითვალისწინე, რომ არ გამოიყენო ლათინური ასოები. წერე ქართულად და თუ საჭიროა ტრანსკრიფცია გააკეთე ტექსტის.
-
-მაგალითად:
-Mastercard -  მასტერქარდი
-Visa - ვიზა
-SMS - ესემესი
-"""
+    system_prompt: str = (
+        "You are the TBC Bank digital assistant. Help users with banking questions.\n\n"
+        "Keep responses concise (2-4 sentences). Be clear and polite."
+    )
 
 
 @dataclass
@@ -51,6 +45,8 @@ class TTSConfig:
     chunk_samples: int = 1920
     # Lookahead: TTS generates audio for word[i-2] when receiving word[i]
     lookahead_words: int = 2
+    # Pocket-TTS predefined voice (used if no voice prompt is provided)
+    voice_id: str = "alba"
 
 
 @dataclass
@@ -89,6 +85,8 @@ class StreamingConfig:
     tts_timeout_s: float = 120.0
     tts_init_timeout_s: float = 35.0
     musetalk_timeout_s: float = 60.0
+    # Extra silence padding appended after TTS generation (ms)
+    tts_silence_padding_ms: float = 500.0
 
 
 @dataclass

@@ -199,28 +199,29 @@ class VADService(TritonClientBase):
                     self.reset_state()
                     return VADStatus.LISTENING, None
 
-                # Check for early silence (speculative processing trigger)
-                # Can trigger multiple times if speech resumes and then goes silent again
-                early_conditions = (
-                    not self._early_silence_triggered,
-                    silence_duration >= self.config.early_silence_threshold_ms,
-                    total_speech_duration >= self.config.speech_threshold_ms
-                )
-                
-                if silence_duration >= 400:  # Log when approaching threshold
-                    logger.info(f"[VAD] Silence check: duration={silence_duration:.0f}ms, "
-                               f"early_triggered={self._early_silence_triggered}, "
-                               f"conditions={early_conditions}, "
-                               f"early_thresh={self.config.early_silence_threshold_ms}ms")
-                
-                if all(early_conditions):
-                    self._early_silence_triggered = True
-                    # Return copy of audio so far for speculative processing
-                    early_audio = np.concatenate(self._accumulated_audio)
-                    logger.info(f"[VAD] EARLY_SILENCE triggered: silence_duration={silence_duration:.0f}ms, "
-                               f"early_threshold={self.config.early_silence_threshold_ms}ms, "
-                               f"full_threshold={self.config.silence_threshold_ms}ms")
-                    return VADStatus.EARLY_SILENCE, early_audio
+                if self.config.enable_speculative:
+                    # Check for early silence (speculative processing trigger)
+                    # Can trigger multiple times if speech resumes and then goes silent again
+                    early_conditions = (
+                        not self._early_silence_triggered,
+                        silence_duration >= self.config.early_silence_threshold_ms,
+                        total_speech_duration >= self.config.speech_threshold_ms
+                    )
+
+                    if silence_duration >= 400:  # Log when approaching threshold
+                        logger.info(f"[VAD] Silence check: duration={silence_duration:.0f}ms, "
+                                   f"early_triggered={self._early_silence_triggered}, "
+                                   f"conditions={early_conditions}, "
+                                   f"early_thresh={self.config.early_silence_threshold_ms}ms")
+
+                    if all(early_conditions):
+                        self._early_silence_triggered = True
+                        # Return copy of audio so far for speculative processing
+                        early_audio = np.concatenate(self._accumulated_audio)
+                        logger.info(f"[VAD] EARLY_SILENCE triggered: silence_duration={silence_duration:.0f}ms, "
+                                   f"early_threshold={self.config.early_silence_threshold_ms}ms, "
+                                   f"full_threshold={self.config.silence_threshold_ms}ms")
+                        return VADStatus.EARLY_SILENCE, early_audio
 
                 # Mark as not actively speaking (but still in utterance)
                 self._is_speaking = False
@@ -309,10 +310,15 @@ class LLMService(TritonClientBase):
 
         messages.append({"role": "user", "content": user_message})
 
-        prompt_parts = ["<s>"]
+        # Llama 3.x chat template
+        prompt_parts = ["<|begin_of_text|>"]
         for msg in messages:
-            prompt_parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n")
-        prompt_parts.append("<|im_start|>assistant\n")
+            role = msg["role"]
+            content = msg["content"]
+            prompt_parts.append(
+                f"<|start_header_id|>{role}<|end_header_id|>\n{content}<|eot_id|>"
+            )
+        prompt_parts.append("<|start_header_id|>assistant<|end_header_id|>\n")
 
         return "".join(prompt_parts)
 
@@ -442,6 +448,7 @@ class MuseTalkService(TritonClientBase):
         self,
         audio: np.ndarray,
         frame_index: int = 0,
+        avatar_id: Optional[str] = None,
         on_frame: Optional[Callable[[bytes, int, float], None]] = None,
         timeout: float = 60.0,
     ) -> Generator[Tuple[bytes, int, float], None, None]:
@@ -488,6 +495,11 @@ class MuseTalkService(TritonClientBase):
             ]
             inputs[0].set_data_from_numpy(audio)
             inputs[1].set_data_from_numpy(np.array([frame_index], dtype=np.int32))
+            if avatar_id:
+                avatar_bytes = np.array([avatar_id.encode("utf-8")], dtype=object)
+                avatar_input = grpc_client.InferInput("AVATAR_ID", [1], "BYTES")
+                avatar_input.set_data_from_numpy(avatar_bytes)
+                inputs.append(avatar_input)
 
             outputs = [
                 grpc_client.InferRequestedOutput("VIDEO_FRAME"),
@@ -547,7 +559,7 @@ class MuseTalkService(TritonClientBase):
             except Exception:
                 pass
 
-    def get_idle_frame(self, timeout: float = 30.0) -> Optional[bytes]:
+    def get_idle_frame(self, avatar_id: Optional[str] = None, timeout: float = 30.0) -> Optional[bytes]:
         """
         Get a single idle frame from MuseTalk.
 
@@ -561,6 +573,7 @@ class MuseTalkService(TritonClientBase):
             for frame_bytes, _, _ in self.generate_frames(
                 audio=silent_audio,
                 frame_index=0,
+                avatar_id=avatar_id,
                 timeout=timeout,
             ):
                 logger.info(f"MuseTalk: Got idle frame ({len(frame_bytes)} bytes)")

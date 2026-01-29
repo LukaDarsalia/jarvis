@@ -30,7 +30,15 @@ RUN pip install --no-cache \
 RUN pip install --no-cache opencv-python-headless==4.10.0.84 \
     diffusers==0.30.2 \
     einops==0.8.1 \
-    sounddevice==0.5.3 
+    sounddevice==0.5.3
+
+# Pocket-TTS (English TTS) + scipy for resampling
+RUN pip install --no-cache pocket-tts scipy==1.14.1
+
+RUN pip install gdown
+RUN pip install coloredlogs flatbuffers numpy packaging protobuf sympy
+RUN pip install -U --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
+RUN pip install -U onnx onnxscript
 
 EXPOSE 8001
 

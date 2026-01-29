@@ -4,33 +4,38 @@ import os
 
 
 TOKEN = os.environ["HF_TOKEN"]
+HF_HOME = os.environ.get("HF_HOME", "local_models/hf_cache")
+os.makedirs(HF_HOME, exist_ok=True)
 
 
-snapshot_download(repo_id="tbilisi-ai-lab/kona2-12B",
+# LLM (English)
+snapshot_download(
+    repo_id="meta-llama/Llama-3.2-1B-Instruct",
     local_dir="local_models/llm_model",
     resume_download=True,
-    token=TOKEN)
+    token=TOKEN,
+)
 
-snapshot_download(repo_id="Darsala/speech-to-text-ka",
+# STT (English, NeMo)
+snapshot_download(
+    repo_id="nvidia/stt_en_fastconformer_hybrid_large_pc",
     local_dir="local_models/stt_model",
     resume_download=True,
-    token=TOKEN)
-
-snapshot_download(repo_id="Darsala/georgian-csm-1b",
-    local_dir="local_models/tts_model/georgian-csm-1b",
-    resume_download=True,
-    token=TOKEN)
-
-snapshot_download(repo_id="sesame/csm-1b",
-    local_dir="local_models/tts_model/csm-1b-base",
-    resume_download=True,
-    token=TOKEN)
-
-snapshot_download(
-    repo_id="sesame/csm-1b",
-    local_dir="local_models/tts_model/csm-1b-processor",
     token=TOKEN,
-    allow_patterns=["*.json", "*.txt", "*.py", "*.jinja"],  # Just config/tokenizer files
+)
+
+# TTS (Pocket-TTS weights + voice presets cache)
+snapshot_download(
+    repo_id="kyutai/pocket-tts",
+    cache_dir=HF_HOME,
+    resume_download=True,
+    token=TOKEN,
+)
+snapshot_download(
+    repo_id="kyutai/pocket-tts-without-voice-cloning",
+    cache_dir=HF_HOME,
+    resume_download=True,
+    token=TOKEN,
 )
 
 musetalk_install = f"""

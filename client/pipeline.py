@@ -25,11 +25,8 @@ import numpy as np
 
 from config import TTSConfig, MuseTalkConfig, StreamingConfig
 from models import AudioFrame, AVFrame, TTSMetrics, StreamingStats
-from streaming_chunker import StreamingTTSChunker
 from tts_service import TTSService
 from triton_services import MuseTalkService
-from text_utils.numbers_to_text import NumberConverter
-from text_utils.streaming_text_processor import StreamingTextProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +125,7 @@ class AVPipeline:
         session_id: int,
         video_enabled: bool,
         base_frame_index: int,
+        avatar_id: Optional[str],
         is_generating: Callable[[], bool],
         on_frame: Callable[[AVFrame], None],
         on_error: Callable[[str], None],
@@ -285,6 +283,26 @@ class AVPipeline:
                         musetalk_queue.put(frame)
                         local_frame_index += 1
                         total_audio_samples += len(audio_buffer)
+
+                    # Add trailing silence padding (default 1s)
+                    padding_ms = float(
+                        getattr(self.config.streaming_config, "tts_silence_padding_ms", 0.0) or 0.0
+                    )
+                    if padding_ms > 0:
+                        silence_frames = int(np.ceil(padding_ms / 40.0))
+                        silence_samples = np.zeros((self._samples_per_frame,), dtype=np.float32)
+                        for _ in range(silence_frames):
+                            frame = AudioFrame(
+                                index=local_frame_index,
+                                samples=silence_samples.copy(),
+                                word="",
+                                metrics=None,
+                                timestamp_ms=(local_frame_index - base_frame_index) * 40.0,
+                            )
+                            audio_frame_queue.put(frame)
+                            musetalk_queue.put(frame)
+                            local_frame_index += 1
+                            total_audio_samples += len(silence_samples)
 
                     # Signal completion
                     audio_frame_queue.put(None)
@@ -455,6 +473,7 @@ class AVPipeline:
                         for frame_bytes, frame_idx, _ in self.musetalk_service.generate_frames(
                             process_audio,
                             frame_index=process_start_index,
+                            avatar_id=avatar_id,
                         ):
                             frames_generated += 1
                             # Only cache frames that are NEW (after lookahead region)
@@ -544,7 +563,6 @@ class AVPipeline:
 
                         # Get video frame (wait briefly if not ready yet)
                         video_bytes = None
-                        # First check if it's already available (no wait)
                         with video_lock:
                             video_bytes = video_cache.pop(frame.index, None)
                         
@@ -712,6 +730,7 @@ class VoiceToVoicePipeline:
         tts_session_id: int,
         video_enabled: bool,
         base_frame_index: int,
+        avatar_id: Optional[str] = None,
         check_cancelled: Callable[[], bool] = lambda: False,
     ):
         """
@@ -765,6 +784,7 @@ class VoiceToVoicePipeline:
                 tts_session_id=tts_session_id,
                 video_enabled=video_enabled,
                 base_frame_index=base_frame_index,
+                avatar_id=avatar_id,
                 is_generating=is_generating,
                 on_llm_token=on_llm_token,
                 on_av_frame=on_av_frame,
@@ -816,6 +836,7 @@ class VoiceToVoicePipeline:
         tts_session_id: int,
         video_enabled: bool,
         base_frame_index: int,
+        avatar_id: Optional[str],
         is_generating: Callable[[], bool],
         on_llm_token: Callable[[str, str], None],
         on_av_frame: Callable[[AVFrame], None],
@@ -844,9 +865,6 @@ class VoiceToVoicePipeline:
         text_input_queue: Queue = Queue()
 
         llm_response = ""
-        chunker = StreamingTTSChunker(
-            text_processor=StreamingTextProcessor(num_converter=NumberConverter()),
-        )
 
         # LLM token processing task
         async def process_llm_tokens():
@@ -859,17 +877,11 @@ class VoiceToVoicePipeline:
                 llm_response += token
                 on_llm_token(token, llm_response)
 
-                # Use StreamingTTSChunker to handle word chunking with proper punctuation handling
-                chunks = chunker.push_token(token)
-                for chunk in chunks:
-                    text_input_queue.put([chunk])
-
             on_llm_complete(llm_response)
 
-            # Finalize - get any remaining chunks and flush signals
-            final_chunks = chunker.finalize()
-            for chunk in final_chunks:
-                text_input_queue.put([chunk])
+            # Only start TTS after LLM finishes: send full text as one chunk
+            if llm_response.strip():
+                text_input_queue.put([llm_response])
 
             text_input_queue.put(None)
 
@@ -882,6 +894,7 @@ class VoiceToVoicePipeline:
                 session_id=tts_session_id,
                 video_enabled=video_enabled,
                 base_frame_index=base_frame_index,
+                avatar_id=avatar_id,
                 is_generating=is_generating,
                 on_frame=on_av_frame,
                 on_error=on_error,

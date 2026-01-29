@@ -12,6 +12,7 @@ import pickle
 import traceback
 import tempfile
 import time
+import threading
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
@@ -101,6 +102,10 @@ class TritonPythonModel:
             self.avatar_data = self._load_avatar(self.config.default_avatar_id)
             self.num_avatar_frames = len(self.avatar_data['frame_list_cycle'])
             pb_utils.Logger.log_info(f"Avatar loaded with {self.num_avatar_frames} frames")
+            self.avatar_cache: Dict[str, Dict[str, Any]] = {
+                self.config.default_avatar_id: self.avatar_data
+            }
+            self.avatar_cache_lock = threading.Lock()
             
             pb_utils.Logger.log_info("MuseTalk Triton model initialized successfully (stateless)")
             
@@ -121,6 +126,18 @@ class TritonPythonModel:
     def _get_bool_param(self, params, key, default: bool) -> bool:
         value = self._get_param(params, key, str(default))
         return str(value).lower() in {"1", "true", "yes", "y", "on"}
+
+    def _get_str_input(self, request, name: str) -> Optional[str]:
+        tensor = pb_utils.get_input_tensor_by_name(request, name)
+        if tensor is None:
+            return None
+        arr = tensor.as_numpy()
+        if arr.size == 0:
+            return None
+        value = arr.reshape(-1)[0]
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
     
     def _load_models(self):
         """Load all required models"""
@@ -128,29 +145,9 @@ class TritonPythonModel:
         
         pb_utils.Logger.log_info(f"Loading VAE model from {self.config.vae_model_path}...")
         self.vae = VAE(model_path=self.config.vae_model_path, use_float16=True)
-        
-        pb_utils.Logger.log_info(f"Loading UNet model from {self.config.unet_model_path}...")
-        self.unet = UNet(
-            unet_config=self.config.unet_config,
-            model_path=self.config.unet_model_path,
-            device=device,
-            use_float16=True
-        )
-        
-        pb_utils.Logger.log_info("Loading Positional Encoding...")
-        self.pe = PositionalEncoding(d_model=384)
-        
-        pb_utils.Logger.log_info(f"Loading Whisper model from {self.config.whisper_dir}...")
-        self.whisper = WhisperModel.from_pretrained(self.config.whisper_dir)
-        
-        # Convert to half precision and move to device
-        self.pe = self.pe.half()
-        # self.vae.vae = self.vae.vae.half()
-        # self.unet.model = self.unet.model.half()
-        self.whisper = self.whisper.to(device=device, dtype=torch.float16).eval()
-        self.whisper.requires_grad_(False)
-        
-        self.weight_dtype = self.unet.model.dtype
+
+        self.unet = None
+        self.weight_dtype = torch.float16
         self.device = device
         self.timesteps = torch.tensor([0], device=device)
         self.unet_onnx_session = None
@@ -190,11 +187,33 @@ class TritonPythonModel:
                 pb_utils.Logger.log_info(
                     f"UNet ONNX ready | dtype={self.unet_onnx_dtype} | batch={self.unet_onnx_batch}"
                 )
+                if self.unet_onnx_dtype == np.float32:
+                    self.weight_dtype = torch.float32
             except Exception as exc:
                 pb_utils.Logger.log_error(f"Failed to initialize UNet ONNX: {exc}")
                 self.unet_onnx_session = None
                 if self.config.use_onnx_unet:
                     raise
+
+        if self.unet_onnx_session is None:
+            pb_utils.Logger.log_info(f"Loading UNet model from {self.config.unet_model_path}...")
+            self.unet = UNet(
+                unet_config=self.config.unet_config,
+                model_path=self.config.unet_model_path,
+                device=device,
+                use_float16=True
+            )
+            self.weight_dtype = self.unet.model.dtype
+
+        pb_utils.Logger.log_info("Loading Positional Encoding...")
+        self.pe = PositionalEncoding(d_model=384).to(device=device, dtype=self.weight_dtype)
+        
+        pb_utils.Logger.log_info(f"Loading Whisper model from {self.config.whisper_dir}...")
+        self.whisper = WhisperModel.from_pretrained(self.config.whisper_dir)
+        
+        # Convert to target precision and move to device
+        self.whisper = self.whisper.to(device=device, dtype=self.weight_dtype).eval()
+        self.whisper.requires_grad_(False)
         
         pb_utils.Logger.log_info("Loading Audio Processor...")
         self.audio_processor = AudioProcessor(feature_extractor_path=self.config.whisper_dir)
@@ -202,7 +221,8 @@ class TritonPythonModel:
         pb_utils.Logger.log_info(f"Loading Face Parser from {self.config.face_parse_model_path}...")
         self.face_parser = FaceParsing(
             resnet_path=self.config.face_parse_resnet_path,
-            model_pth=self.config.face_parse_model_path
+            model_pth=self.config.face_parse_model_path,
+            device=device,
         )
         
         pb_utils.Logger.log_info("All models loaded successfully")
@@ -249,12 +269,10 @@ class TritonPythonModel:
         input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
         
         mask_list_cycle = []
-        mask_pil_list_cycle = []
         for mask_img_path in input_mask_list:
-            mask = cv2.imread(mask_img_path)
+            mask = cv2.imread(mask_img_path, cv2.IMREAD_GRAYSCALE)
             if mask is not None:
                 mask_list_cycle.append(mask)
-                mask_pil_list_cycle.append(Image.fromarray(mask).convert("L"))
         
         pb_utils.Logger.log_info(f"Avatar loaded: {len(frame_list_cycle)} frames, {len(mask_list_cycle)} masks")
         
@@ -269,7 +287,6 @@ class TritonPythonModel:
             'coord_list_cycle': coord_list_cycle,
             'frame_list_cycle': frame_list_cycle,
             'mask_list_cycle': mask_list_cycle,
-            'mask_pil_list_cycle': mask_pil_list_cycle,
             'mask_coords_list_cycle': mask_coords_list_cycle,
         }
     
@@ -394,45 +411,43 @@ class TritonPythonModel:
             )
             audio = audio[-max_samples:]
         
-        # Create temp file for audio
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as temp_file:
-            # Resample and save
-            resampled = self._resample_audio(audio)
-            sf.write(temp_file.name, resampled, self.config.whisper_sample_rate)
-            
-            try:
-                # Get audio features using existing AudioProcessor
-                whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(
-                    temp_file.name,
-                    weight_dtype=self.weight_dtype
-                )
-                
-                if not whisper_input_features:
-                    return None
-                
-                # Get whisper chunks
-                whisper_chunks = self.audio_processor.get_whisper_chunk(
-                    whisper_input_features=whisper_input_features,
-                    device=self.device,
-                    weight_dtype=self.weight_dtype,
-                    whisper=self.whisper,
-                    librosa_length=librosa_length,
-                    fps=self.config.fps,
-                    audio_padding_length_left=self.config.audio_padding_length_left,
-                    audio_padding_length_right=self.config.audio_padding_length_right
-                )
-                
-                return whisper_chunks
-                
-            except Exception as e:
-                pb_utils.Logger.log_error(f"Whisper processing failed: {e}\n{traceback.format_exc()}")
+        # Resample in-memory (avoid temp file IO)
+        resampled = self._resample_audio(audio)
+
+        try:
+            whisper_input_features, librosa_length = self.audio_processor.get_audio_feature_from_array(
+                resampled,
+                sampling_rate=self.config.whisper_sample_rate,
+                weight_dtype=self.weight_dtype,
+            )
+
+            if not whisper_input_features:
                 return None
+
+            whisper_chunks = self.audio_processor.get_whisper_chunk(
+                whisper_input_features=whisper_input_features,
+                device=self.device,
+                weight_dtype=self.weight_dtype,
+                whisper=self.whisper,
+                librosa_length=librosa_length,
+                fps=self.config.fps,
+                audio_padding_length_left=self.config.audio_padding_length_left,
+                audio_padding_length_right=self.config.audio_padding_length_right
+            )
+
+            return whisper_chunks
+
+        except Exception as e:
+            pb_utils.Logger.log_error(f"Whisper processing failed: {e}\n{traceback.format_exc()}")
+            return None
     
     @torch.no_grad()
     def _generate_frames(
         self,
         whisper_chunks: torch.Tensor,
         start_frame_index: int,
+        avatar_data: Dict[str, Any],
+        num_avatar_frames: int,
         stats: Optional[Dict[str, float]] = None,
     ) -> List[tuple]:
         """
@@ -466,13 +481,13 @@ class TritonPythonModel:
             latent_batch = []
             for i in range(batch_start, batch_end):
                 # Cycle through avatar frames starting from start_frame_index
-                cycle_idx = (start_frame_index + i) % self.num_avatar_frames
-                latent_batch.append(self.avatar_data['input_latent_list_cycle'][cycle_idx])
+                cycle_idx = (start_frame_index + i) % num_avatar_frames
+                latent_batch.append(avatar_data['input_latent_list_cycle'][cycle_idx])
             latent_batch = torch.cat(latent_batch, dim=0)
             
             # Forward pass through models
             audio_feature_batch = self.pe(whisper_batch.to(self.device))
-            latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
+            latent_batch = latent_batch.to(device=self.device, dtype=self.weight_dtype)
 
             unet_start = time.perf_counter()
             if self.unet_onnx_session is not None:
@@ -495,13 +510,13 @@ class TritonPythonModel:
             # Blend each frame
             for i, res_frame in enumerate(recon):
                 frame_num = batch_start + i
-                cycle_idx = (start_frame_index + frame_num) % self.num_avatar_frames
+                cycle_idx = (start_frame_index + frame_num) % num_avatar_frames
                 
                 frame_data = {
-                    'bbox': self.avatar_data['coord_list_cycle'][cycle_idx],
-                    'ori_frame': self.avatar_data['frame_list_cycle'][cycle_idx],
-                    'mask': self.avatar_data['mask_pil_list_cycle'][cycle_idx],
-                    'mask_coords': self.avatar_data['mask_coords_list_cycle'][cycle_idx],
+                    'bbox': avatar_data['coord_list_cycle'][cycle_idx],
+                    'ori_frame': avatar_data['frame_list_cycle'][cycle_idx],
+                    'mask': avatar_data['mask_list_cycle'][cycle_idx],
+                    'mask_coords': avatar_data['mask_coords_list_cycle'][cycle_idx],
                 }
                 
                 x1, y1, x2, y2 = frame_data['bbox']
@@ -543,6 +558,16 @@ class TritonPythonModel:
             # Get inputs
             audio = self._get_audio_input(request)
             frame_index = self._get_int_input(request, "FRAME_INDEX", 0)
+            avatar_id = self._get_str_input(request, "AVATAR_ID") or self.config.default_avatar_id
+
+            with self.avatar_cache_lock:
+                avatar_data = self.avatar_cache.get(avatar_id)
+            if avatar_data is None:
+                pb_utils.Logger.log_info(f"Loading avatar '{avatar_id}' on demand")
+                avatar_data = self._load_avatar(avatar_id)
+                with self.avatar_cache_lock:
+                    self.avatar_cache[avatar_id] = avatar_data
+            num_avatar_frames = len(avatar_data["frame_list_cycle"])
             
             if audio is None or len(audio) == 0:
                 pb_utils.Logger.log_error("AUDIO input is required and must not be empty")
@@ -566,7 +591,13 @@ class TritonPythonModel:
 
             # Generate all frames
             stats: Dict[str, float] = {}
-            frames = self._generate_frames(whisper_chunks, frame_index, stats=stats)
+            frames = self._generate_frames(
+                whisper_chunks,
+                frame_index,
+                avatar_data=avatar_data,
+                num_avatar_frames=num_avatar_frames,
+                stats=stats,
+            )
             
             if len(frames) == 0:
                 pb_utils.Logger.log_warning("No frames generated")
