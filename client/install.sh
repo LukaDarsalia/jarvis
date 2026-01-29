@@ -56,14 +56,48 @@ if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
   AVATAR_DEVICE="${AVATAR_DEVICE:-cpu}"
   AVATAR_TORCH_DEVICE="${AVATAR_TORCH_DEVICE:-$AVATAR_DEVICE}"
   AVATAR_PYTHON_BIN="${AVATAR_PYTHON_BIN:-}"
-  if [ -z "$AVATAR_PYTHON_BIN" ]; then
+  AUTO_INSTALL_PY310="${AUTO_INSTALL_PY310:-1}"
+  SUDO=""
+  if [ "$(id -u)" -ne 0 ]; then
+    SUDO="sudo"
+  fi
+
+  ensure_python310() {
     if command -v python3.10 >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$AUTO_INSTALL_PY310" != "1" ] || [ "${SKIP_APT:-0}" = "1" ]; then
+      return 1
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+      return 1
+    fi
+    echo "Python 3.10 not found; attempting to install via apt..."
+    $SUDO apt-get update -y
+    if ! command -v add-apt-repository >/dev/null 2>&1; then
+      $SUDO apt-get install -y --no-install-recommends software-properties-common
+    fi
+    if ! grep -q "deadsnakes" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; then
+      $SUDO add-apt-repository -y ppa:deadsnakes/ppa
+    fi
+    $SUDO apt-get update -y
+    $SUDO apt-get install -y --no-install-recommends python3.10 python3.10-venv python3.10-dev
+    command -v python3.10 >/dev/null 2>&1
+  }
+
+  if [ -z "$AVATAR_PYTHON_BIN" ]; then
+    if ensure_python310; then
       AVATAR_PYTHON_BIN="python3.10"
     elif command -v python3.11 >/dev/null 2>&1; then
       AVATAR_PYTHON_BIN="python3.11"
     else
       AVATAR_PYTHON_BIN="$PYTHON_BIN"
     fi
+  fi
+  if ! command -v "$AVATAR_PYTHON_BIN" >/dev/null 2>&1; then
+    echo "Avatar venv requires python3.10 for torch==2.0.1."
+    echo "Install python3.10 or set AVATAR_PYTHON_BIN to a compatible Python."
+    exit 1
   fi
   if [ ! -d "$AVATAR_VENV_DIR" ]; then
     echo "Creating avatar venv at $AVATAR_VENV_DIR"
