@@ -31,6 +31,13 @@ if [ ! -x "$VENV_PY" ]; then
     exit 1
 fi
 
+# Load avatar env if present (sets AVATAR_PYTHON, paths, etc.)
+AVATAR_ENV_FILE="${AVATAR_ENV_FILE:-avatar_env.sh}"
+if [ -f "$AVATAR_ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$AVATAR_ENV_FILE"
+fi
+
 # Check if Triton server is available
 echo -e "${YELLOW}Checking Triton server connection...${NC}"
 if curl -s http://localhost:8000/v2/health/ready > /dev/null 2>&1; then
