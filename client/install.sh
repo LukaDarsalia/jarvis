@@ -53,7 +53,13 @@ echo "Client venv ready: $SCRIPT_DIR/$VENV_DIR"
 # Avatar venv (older torch stack) — enabled by default to match docker-compose
 if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
   AVATAR_VENV_DIR="${AVATAR_VENV_DIR:-avatar_venv}"
-  AVATAR_DEVICE="${AVATAR_DEVICE:-cpu}"
+  if [ -z "${AVATAR_DEVICE:-}" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1 || [ -e /dev/nvidia0 ]; then
+      AVATAR_DEVICE="cuda"
+    else
+      AVATAR_DEVICE="cpu"
+    fi
+  fi
   AVATAR_TORCH_DEVICE="${AVATAR_TORCH_DEVICE:-$AVATAR_DEVICE}"
   AVATAR_PYTHON_BIN="${AVATAR_PYTHON_BIN:-}"
   AUTO_INSTALL_PY310="${AUTO_INSTALL_PY310:-1}"
