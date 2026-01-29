@@ -13,11 +13,19 @@ VENV_DIR="${VENV_DIR:-venv}"
 if command -v apt-get >/dev/null 2>&1 && [ "${SKIP_APT:-0}" != "1" ]; then
   echo "Installing system dependencies (you can skip with SKIP_APT=1)..."
   sudo apt-get update -y
+  PY_VER="$($PYTHON_BIN -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  PY_VENV_PKG="python${PY_VER}-venv"
+  EXTRA_VENV_PKG=""
+  if apt-cache show "$PY_VENV_PKG" >/dev/null 2>&1; then
+    EXTRA_VENV_PKG="$PY_VENV_PKG"
+  fi
   sudo apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     libglib2.0-0 \
-    libgl1
+    libgl1 \
+    python3-venv \
+    $EXTRA_VENV_PKG
 fi
 
 if [ ! -d "$VENV_DIR" ]; then
