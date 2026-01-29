@@ -184,7 +184,10 @@ AVATAR_SCRIPT = os.environ.get("AVATAR_CREATE_SCRIPT", "/app/musetalk/create_ava
 AVATAR_MODEL_ROOT = os.environ.get("AVATAR_MODEL_ROOT", "/local_models/musetalk_model")
 AVATAR_DEFAULT_VERSION = os.environ.get("AVATAR_VERSION", "v15")
 AVATAR_DEVICE = os.environ.get("AVATAR_DEVICE", "cuda")
-AVATAR_MAX_SIDE = os.environ.get("AVATAR_MAX_SIDE", "0")
+AVATAR_MAX_SIDE = os.environ.get("AVATAR_MAX_SIDE", "512")
+AVATAR_CREATE_FPS = int(os.environ.get("AVATAR_CREATE_FPS", "25"))
+AVATAR_CREATE_DURATION_S = float(os.environ.get("AVATAR_CREATE_DURATION_S", "0.25"))
+AVATAR_CREATE_BATCH_SIZE = int(os.environ.get("AVATAR_CREATE_BATCH_SIZE", "24"))
 
 # Fallback to local paths when running without docker or env exports.
 if not os.path.exists(AVATAR_PYTHON) and LOCAL_AVATAR_PYTHON.exists():
@@ -319,9 +322,10 @@ async def create_avatar(
     image: UploadFile = File(...),
     avatar_id: str = Form(...),
     force_recreate: bool = Form(False),
-    fps: int = Form(25),
+    fps: int = Form(AVATAR_CREATE_FPS),
+    batch_size: int = Form(AVATAR_CREATE_BATCH_SIZE),
     version: str = Form(AVATAR_DEFAULT_VERSION),
-    duration_s: float = Form(1.0),
+    duration_s: float = Form(AVATAR_CREATE_DURATION_S),
 ):
     """Create a MuseTalk avatar from an uploaded image."""
     safe_avatar_id = _sanitize_avatar_id(avatar_id)
@@ -369,7 +373,7 @@ async def create_avatar(
             "--fps",
             str(fps),
             "--batch_size",
-            "8",
+            str(batch_size),
             "--avatar_id",
             safe_avatar_id,
             "--force_recreate" if force_recreate else "",

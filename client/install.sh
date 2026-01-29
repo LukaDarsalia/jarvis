@@ -204,6 +204,9 @@ export AVATAR_ROOT="$SCRIPT_DIR/../local_models/musetalk_model/testing_avatar_cr
 export AVATAR_VERSION="v15"
 export AVATAR_DEVICE="$AVATAR_DEVICE"
 export AVATAR_MAX_SIDE="\${AVATAR_MAX_SIDE:-512}"
+export AVATAR_CREATE_FPS="\${AVATAR_CREATE_FPS:-25}"
+export AVATAR_CREATE_DURATION_S="\${AVATAR_CREATE_DURATION_S:-0.25}"
+export AVATAR_CREATE_BATCH_SIZE="\${AVATAR_CREATE_BATCH_SIZE:-24}"
 EOF
   echo "Avatar env file written: $SCRIPT_DIR/$AVATAR_ENV_FILE"
 fi
