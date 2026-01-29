@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Voice Assistant Client Startup Script
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -13,19 +13,23 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}🎤 Voice Assistant Client${NC}"
 echo "=========================="
 
-# Check if virtual environment exists
-if [ ! -d "venv" ]; then
-    echo -e "${YELLOW}Creating virtual environment...${NC}"
-    python3 -m venv venv
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+VENV_DIR="${VENV_DIR:-venv}"
+VENV_PY="$VENV_DIR/bin/python"
+
+# Ensure venv exists
+if [ ! -x "$VENV_PY" ]; then
+    echo -e "${YELLOW}Client venv not found. Running install.sh...${NC}"
+    bash ./install.sh
 fi
 
-# Activate virtual environment
-echo -e "${YELLOW}Activating virtual environment...${NC}"
-source venv/bin/activate
-
-# Install dependencies
-echo -e "${YELLOW}Installing dependencies...${NC}"
-pip install -r requirements.txt -q
+VENV_PY="$VENV_DIR/bin/python"
+if [ ! -x "$VENV_PY" ]; then
+    echo -e "${RED}✗ venv python not found at $VENV_PY${NC}"
+    exit 1
+fi
 
 # Check if Triton server is available
 echo -e "${YELLOW}Checking Triton server connection...${NC}"
@@ -45,5 +49,4 @@ echo -e "${GREEN}Starting Voice Assistant Client...${NC}"
 echo -e "Web UI will be available at: ${GREEN}http://localhost:8080${NC}"
 echo ""
 
-python main.py
-
+"$VENV_PY" main.py
