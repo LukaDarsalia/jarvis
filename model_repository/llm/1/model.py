@@ -37,10 +37,9 @@ class TritonPythonModel:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # Load model with 8-bit quantization for memory efficiency
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            device_map="cpu",
+            device_map="cuda",
             torch_dtype=torch.float16,
         )
         if getattr(self.model.config, "pad_token_id", None) is None:
