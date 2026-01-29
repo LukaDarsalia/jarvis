@@ -33,12 +33,20 @@ if [ ! -d "$VENV_DIR" ]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-# Activate main venv
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
+  echo "Venv activation script missing; recreating venv..."
+  rm -rf "$VENV_DIR"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
 
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
+VENV_PY="$VENV_DIR/bin/python"
+if [ ! -x "$VENV_PY" ]; then
+  echo "Venv python not found at $VENV_PY"
+  exit 1
+fi
+
+"$VENV_PY" -m pip install --upgrade pip setuptools wheel
+"$VENV_PY" -m pip install -r requirements.txt
 
 echo "Client venv ready: $SCRIPT_DIR/$VENV_DIR"
 
@@ -86,4 +94,4 @@ if [ "${INSTALL_AVATAR_VENV:-0}" = "1" ]; then
 fi
 
 echo "Done. You can run the client with:"
-echo "  source $VENV_DIR/bin/activate && python main.py"
+echo "  $VENV_PY main.py"
