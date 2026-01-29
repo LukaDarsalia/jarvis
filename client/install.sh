@@ -55,32 +55,60 @@ if [ "${SKIP_AVATAR_VENV:-0}" != "1" ]; then
   AVATAR_VENV_DIR="${AVATAR_VENV_DIR:-avatar_venv}"
   AVATAR_DEVICE="${AVATAR_DEVICE:-cpu}"
   AVATAR_TORCH_DEVICE="${AVATAR_TORCH_DEVICE:-$AVATAR_DEVICE}"
+  AVATAR_PYTHON_BIN="${AVATAR_PYTHON_BIN:-}"
+  if [ -z "$AVATAR_PYTHON_BIN" ]; then
+    if command -v python3.10 >/dev/null 2>&1; then
+      AVATAR_PYTHON_BIN="python3.10"
+    elif command -v python3.11 >/dev/null 2>&1; then
+      AVATAR_PYTHON_BIN="python3.11"
+    else
+      AVATAR_PYTHON_BIN="$PYTHON_BIN"
+    fi
+  fi
   if [ ! -d "$AVATAR_VENV_DIR" ]; then
     echo "Creating avatar venv at $AVATAR_VENV_DIR"
-    "$PYTHON_BIN" -m venv "$AVATAR_VENV_DIR"
+    "$AVATAR_PYTHON_BIN" -m venv "$AVATAR_VENV_DIR"
   fi
 
-  AVATAR_PIP="$AVATAR_VENV_DIR/bin/pip"
-  "$AVATAR_PIP" install --upgrade pip setuptools wheel
+  AVATAR_PY="$AVATAR_VENV_DIR/bin/python"
+  if [ ! -x "$AVATAR_PY" ]; then
+    echo "Avatar venv python not found at $AVATAR_PY"
+    exit 1
+  fi
+
+  AVATAR_PY_VER="$("$AVATAR_PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  AVATAR_TORCH_VERSION="${AVATAR_TORCH_VERSION:-2.0.1}"
+  if [ "$AVATAR_PY_VER" = "3.12" ] && [ "$AVATAR_TORCH_VERSION" = "2.0.1" ]; then
+    echo "Avatar venv uses Python $AVATAR_PY_VER, but torch==$AVATAR_TORCH_VERSION wheels are not available."
+    echo "Install python3.10 (recommended) or set AVATAR_PYTHON_BIN to a compatible Python (3.10/3.11)."
+    exit 1
+  fi
+
+  "$AVATAR_PY" -m pip install --upgrade pip setuptools wheel
 
   if [ "$AVATAR_TORCH_DEVICE" = "cpu" ]; then
-    "$AVATAR_PIP" install \
-      torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+    "$AVATAR_PY" -m pip install \
+      torch=="$AVATAR_TORCH_VERSION" torchvision==0.15.2 torchaudio==2.0.2 \
       --index-url https://download.pytorch.org/whl/cpu
   else
-    "$AVATAR_PIP" install \
-      torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+    "$AVATAR_PY" -m pip install \
+      torch=="$AVATAR_TORCH_VERSION" torchvision==0.15.2 torchaudio==2.0.2 \
       --index-url https://download.pytorch.org/whl/cu118
   fi
 
-  "$AVATAR_PIP" install -r avatar_requirements.txt
+  "$AVATAR_PY" -m pip install -r avatar_requirements.txt
 
   if [ "${INSTALL_MMLAB:-0}" = "1" ]; then
-    "$AVATAR_PIP" install -U openmim
+    "$AVATAR_PY" -m pip install -U openmim
     "$AVATAR_VENV_DIR/bin/mim" install mmengine
     "$AVATAR_VENV_DIR/bin/mim" install "mmcv==2.0.1"
     "$AVATAR_VENV_DIR/bin/mim" install "mmdet==3.1.0"
     "$AVATAR_VENV_DIR/bin/mim" install "mmpose==1.1.0"
+  fi
+
+  if ! "$AVATAR_PY" -c "import torch; print(torch.__version__)" >/dev/null 2>&1; then
+    echo "Torch is not available in the avatar venv. Please check the install output."
+    exit 1
   fi
 
   echo "Avatar venv ready: $SCRIPT_DIR/$AVATAR_VENV_DIR"
