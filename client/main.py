@@ -164,6 +164,13 @@ static_path = Path(__file__).parent / "static"
 if static_path.exists():
     app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_MODELS_ROOT = REPO_ROOT / "local_models" / "musetalk_model"
+LOCAL_AVATAR_ROOT = LOCAL_MODELS_ROOT / "testing_avatar_creation" / "v15" / "avatars"
+LOCAL_AVATAR_RESULT_DIR = LOCAL_MODELS_ROOT / "testing_avatar_creation"
+LOCAL_AVATAR_SCRIPT = REPO_ROOT / "model_repository" / "musetalk" / "create_avatar.py"
+LOCAL_AVATAR_PYTHON = REPO_ROOT / "client" / "avatar_venv" / "bin" / "python"
+
 AVATAR_ROOT = os.environ.get(
     "AVATAR_ROOT",
     "/local_models/musetalk_model/testing_avatar_creation/v15/avatars",
@@ -178,6 +185,18 @@ AVATAR_MODEL_ROOT = os.environ.get("AVATAR_MODEL_ROOT", "/local_models/musetalk_
 AVATAR_DEFAULT_VERSION = os.environ.get("AVATAR_VERSION", "v15")
 AVATAR_DEVICE = os.environ.get("AVATAR_DEVICE", "cuda")
 AVATAR_MAX_SIDE = os.environ.get("AVATAR_MAX_SIDE", "0")
+
+# Fallback to local paths when running without docker or env exports.
+if not os.path.exists(AVATAR_PYTHON) and LOCAL_AVATAR_PYTHON.exists():
+    AVATAR_PYTHON = str(LOCAL_AVATAR_PYTHON)
+if not os.path.exists(AVATAR_SCRIPT) and LOCAL_AVATAR_SCRIPT.exists():
+    AVATAR_SCRIPT = str(LOCAL_AVATAR_SCRIPT)
+if not os.path.isdir(AVATAR_MODEL_ROOT) and LOCAL_MODELS_ROOT.exists():
+    AVATAR_MODEL_ROOT = str(LOCAL_MODELS_ROOT)
+if not os.path.isdir(AVATAR_RESULT_DIR) and LOCAL_AVATAR_RESULT_DIR.exists():
+    AVATAR_RESULT_DIR = str(LOCAL_AVATAR_RESULT_DIR)
+if not os.path.isdir(AVATAR_ROOT) and LOCAL_AVATAR_ROOT.exists():
+    AVATAR_ROOT = str(LOCAL_AVATAR_ROOT)
 
 
 def _sanitize_avatar_id(raw: str) -> Optional[str]:
