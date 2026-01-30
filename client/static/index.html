@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="ka">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ხმოვანი ასისტენტი | Voice Assistant</title>
+    <title>Voice Assistant</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Georgian:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -20,14 +20,14 @@
                         <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
                         <line x1="12" y1="19" x2="12" y2="22"/>
                     </svg>
-                    <h1>ხმოვანი ასისტენტი</h1>
+                    <h1>Voice Assistant</h1>
                 </div>
                 <div class="header-controls">
                     <div class="connection-status" id="connectionStatus">
                         <span class="status-dot"></span>
-                        <span class="status-text">კავშირის დამყარება...</span>
+                        <span class="status-text">Connecting...</span>
                     </div>
-                    <button class="settings-btn" id="settingsBtn" title="პარამეტრები">
+                    <button class="settings-btn" id="settingsBtn" title="Settings">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <circle cx="12" cy="12" r="3"/>
                             <path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72 1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
@@ -48,18 +48,18 @@
                             <img id="avatarImage" class="avatar-image" alt="Avatar" />
                             <div class="avatar-loading" id="avatarLoading">
                                 <div class="avatar-spinner"></div>
-                                <span>ავატარის ჩატვირთვა...</span>
+                                <span>Loading avatar...</span>
                             </div>
                             <div class="avatar-status" id="avatarStatus">
                                 <span class="status-indicator"></span>
-                                <span class="status-text">მოლოდინი</span>
+                                <span class="status-text">Idle</span>
                             </div>
                         </div>
                         <div class="avatar-info">
-                            <div class="avatar-name">ციფრული ასისტენტი</div>
+                            <div class="avatar-name">Digital Assistant</div>
                             <div class="avatar-metrics" id="avatarMetrics">
                                 <span class="video-fps" id="videoFps">- FPS</span>
-                                <span class="video-frames" id="videoFrames">0 კადრი</span>
+                                <span class="video-frames" id="videoFrames">0 frames</span>
                             </div>
                         </div>
                     </div>
@@ -77,8 +77,8 @@
                                     <line x1="15" y1="9" x2="15.01" y2="9"/>
                                 </svg>
                             </div>
-                            <h2>გამარჯობა!</h2>
-                            <p>მე ვარ თქვენი ციფრული ასისტენტი. როგორ შემიძლია დაგეხმაროთ?</p>
+                            <h2>Hello!</h2>
+                            <p>I'm your digital assistant. How can I help?</p>
                         </div>
                     </div>
 
@@ -91,7 +91,7 @@
                                 <path d="M13 17V5"/>
                                 <path d="M8 17v-3"/>
                             </svg>
-                            <span>TTS მეტრიკები</span>
+                            <span>TTS metrics</span>
                         </div>
                         <div class="metrics-content">
                             <div class="metric">
@@ -99,15 +99,15 @@
                                 <span class="metric-value" id="rtfValue">-</span>
                             </div>
                             <div class="metric">
-                                <span class="metric-label">გენერაცია</span>
+                                <span class="metric-label">Generation</span>
                                 <span class="metric-value" id="genTimeValue">- ms</span>
                             </div>
                             <div class="metric">
-                                <span class="metric-label">აუდიო</span>
+                                <span class="metric-label">Audio</span>
                                 <span class="metric-value" id="audioDurValue">- ms</span>
                             </div>
                             <div class="metric current-word">
-                                <span class="metric-label">მიმდინარე სიტყვა</span>
+                                <span class="metric-label">Current word</span>
                                 <span class="metric-value" id="currentWordValue">-</span>
                             </div>
                         </div>
@@ -117,6 +117,68 @@
 
             <!-- Input Area -->
             <div class="input-area">
+                <!-- Quick setup controls -->
+                <div class="quick-panel" id="quickPanel">
+                    <div class="settings-section">
+                        <h3>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                                <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                            </svg>
+                            Voice
+                        </h3>
+                        <div class="setting-item">
+                            <label for="voiceId">Voice</label>
+                            <select id="voiceId">
+                                <option value="alba">Alba</option>
+                                <option value="marius">Marius</option>
+                                <option value="javert">Javert</option>
+                                <option value="jean">Jean</option>
+                                <option value="fantine">Fantine</option>
+                                <option value="cosette">Cosette</option>
+                                <option value="eponine">Eponine</option>
+                                <option value="azelma">Azelma</option>
+                            </select>
+                            <span class="setting-hint">Preset or custom</span>
+                        </div>
+                        <div class="setting-item full-width">
+                            <label>Voice cloning (optional)</label>
+                            <div class="setting-row">
+                                <input type="text" id="voicePromptName" class="voice-prompt-name" placeholder="Custom voice name">
+                                <button class="btn btn-secondary btn-sm" id="voicePromptBtn">Record sample</button>
+                                <input type="file" id="voicePromptFile" class="voice-prompt-file" accept=".wav,audio/wav">
+                                <button class="btn btn-secondary btn-sm" id="voicePromptUploadBtn">Upload WAV</button>
+                            </div>
+                            <span class="setting-hint" id="voicePromptStatus">No sample</span>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="8" r="4"/>
+                                <path d="M4 20c1.5-4 6.5-6 8-6s6.5 2 8 6"/>
+                            </svg>
+                            Avatar
+                        </h3>
+                        <div class="setting-item">
+                            <label for="avatarId">Avatar</label>
+                            <select id="avatarId"></select>
+                            <span class="setting-hint">Active avatar</span>
+                        </div>
+                        <div class="setting-item full-width">
+                            <label>Create new avatar (image)</label>
+                            <div class="setting-row">
+                                <input type="text" id="avatarName" class="avatar-name-input" placeholder="New avatar name">
+                                <input type="file" id="avatarImageUpload" class="avatar-file" accept="image/*">
+                                <button class="btn btn-secondary btn-sm" id="avatarUploadBtn">Upload image</button>
+                                <button class="btn btn-secondary btn-sm" id="avatarCaptureBtn">Use camera</button>
+                            </div>
+                            <span class="setting-hint" id="avatarUploadStatus">No upload</span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Voice Input (for voice_to_voice mode) -->
                 <div class="voice-input" id="voiceInput">
                     <div class="vad-indicator" id="vadIndicator">
@@ -133,7 +195,7 @@
                             </svg>
                         </button>
                     </div>
-                    <div class="vad-status" id="vadStatus">დააჭირეთ მიკროფონს საუბრის დასაწყებად</div>
+                    <div class="vad-status" id="vadStatus">Press the microphone to start talking</div>
                 </div>
 
                 <!-- Stop Button -->
@@ -141,7 +203,7 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="6" y="6" width="12" height="12" rx="2"/>
                     </svg>
-                    <span>შეწყვიტე</span>
+                    <span>Stop</span>
                 </button>
 
                 <button class="replay-btn hidden" id="replayBtn" disabled>
@@ -149,7 +211,7 @@
                         <polyline points="1 4 1 10 7 10"/>
                         <path d="M3.51 15a9 9 0 1 0 .49-5H1"/>
                     </svg>
-                    <span>გამეორება</span>
+                    <span>Replay</span>
                 </button>
             </div>
         </main>
@@ -159,7 +221,7 @@
             <div class="settings-overlay" id="settingsOverlay"></div>
             <div class="settings-content">
                 <div class="settings-header">
-                    <h2>პარამეტრები</h2>
+                    <h2>Settings</h2>
                     <button class="close-btn" id="closeSettingsBtn">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <line x1="18" y1="6" x2="6" y2="18"/>
@@ -176,20 +238,20 @@
                                 <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
                                 <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
                             </svg>
-                            VAD (ხმის აღმოჩენა)
+                            VAD (Voice Activity Detection)
                         </h3>
                         <div class="setting-item">
-                            <label for="speechThreshold">მინ. საუბრის ხანგრძლივობა (ms)</label>
+                            <label for="speechThreshold">Min speech duration (ms)</label>
                             <input type="range" id="speechThreshold" min="100" max="1000" value="200" step="50">
                             <span class="setting-value" id="speechThresholdValue">200</span>
                         </div>
                         <div class="setting-item">
-                            <label for="silenceThreshold">სიჩუმის ზღვარი (ms)</label>
+                            <label for="silenceThreshold">Silence threshold (ms)</label>
                             <input type="range" id="silenceThreshold" min="500" max="3000" value="1500" step="100">
                             <span class="setting-value" id="silenceThresholdValue">1500</span>
                         </div>
                         <div class="setting-item">
-                            <label for="earlySilenceThreshold">ადრეული გაშვების ზღვარი (ms)</label>
+                            <label for="earlySilenceThreshold">Early trigger threshold (ms)</label>
                             <input type="range" id="earlySilenceThreshold" min="100" max="1500" value="500" step="50">
                             <span class="setting-value" id="earlySilenceThresholdValue">500</span>
                         </div>
@@ -203,10 +265,10 @@
                                 <path d="M3 9h18"/>
                                 <path d="M9 21V9"/>
                             </svg>
-                            LLM (ენის მოდელი)
+                            LLM (Language Model)
                         </h3>
                         <div class="setting-item">
-                            <label for="llmTemperature">ტემპერატურა</label>
+                            <label for="llmTemperature">Temperature</label>
                             <input type="range" id="llmTemperature" min="0" max="2" value="0.7" step="0.1">
                             <span class="setting-value" id="llmTemperatureValue">0.7</span>
                         </div>
@@ -216,12 +278,12 @@
                             <span class="setting-value" id="llmTopPValue">0.9</span>
                         </div>
                         <div class="setting-item">
-                            <label for="llmMaxTokens">მაქს. ტოკენები</label>
+                            <label for="llmMaxTokens">Max tokens</label>
                             <input type="range" id="llmMaxTokens" min="64" max="1024" value="512" step="64">
                             <span class="setting-value" id="llmMaxTokensValue">512</span>
                         </div>
                         <div class="setting-item full-width">
-                            <label for="systemPrompt">სისტემური პრომპტი</label>
+                            <label for="systemPrompt">System prompt</label>
                             <textarea id="systemPrompt" rows="3">You are the TBC Bank digital assistant. Help users with banking questions. Keep responses concise.</textarea>
                         </div>
                     </div>
@@ -233,10 +295,10 @@
                                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
                                 <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
                             </svg>
-                            TTS (ტექსტიდან ხმა)
+                            TTS (Text-to-Speech)
                         </h3>
                         <div class="setting-item">
-                            <label for="ttsBackboneTemp">Backbone ტემპერატურა</label>
+                            <label for="ttsBackboneTemp">Backbone temperature</label>
                             <input type="range" id="ttsBackboneTemp" min="0.01" max="1.5" value="0.01" step="0.01">
                             <span class="setting-value" id="ttsBackboneTempValue">0.01</span>
                         </div>
@@ -246,7 +308,7 @@
                             <span class="setting-value" id="ttsBackboneTopPValue">0.999</span>
                         </div>
                         <div class="setting-item">
-                            <label for="ttsDepthTemp">Depth ტემპერატურა</label>
+                            <label for="ttsDepthTemp">Depth temperature</label>
                             <input type="range" id="ttsDepthTemp" min="0.01" max="1.5" value="0.01" step="0.01">
                             <span class="setting-value" id="ttsDepthTempValue">0.01</span>
                         </div>
@@ -254,30 +316,6 @@
                             <label for="ttsDepthTopP">Depth Top P</label>
                             <input type="range" id="ttsDepthTopP" min="0.1" max="1" value="0.999" step="0.001">
                             <span class="setting-value" id="ttsDepthTopPValue">0.999</span>
-                        </div>
-                        <div class="setting-item">
-                            <label for="voiceId">Voice preset</label>
-                            <select id="voiceId">
-                                <option value="alba">Alba</option>
-                                <option value="marius">Marius</option>
-                                <option value="javert">Javert</option>
-                                <option value="jean">Jean</option>
-                                <option value="fantine">Fantine</option>
-                                <option value="cosette">Cosette</option>
-                                <option value="eponine">Eponine</option>
-                                <option value="azelma">Azelma</option>
-                            </select>
-                            <span class="setting-hint">Preset voice</span>
-                        </div>
-                        <div class="setting-item full-width">
-                            <label>Voice cloning (optional)</label>
-                            <div class="setting-row">
-                                <input type="text" id="voicePromptName" class="voice-prompt-name" placeholder="Custom voice name">
-                                <button class="btn btn-secondary" id="voicePromptBtn">Record voice sample</button>
-                                <input type="file" id="voicePromptFile" class="voice-prompt-file" accept=".wav,audio/wav">
-                                <button class="btn btn-secondary" id="voicePromptUploadBtn">Upload WAV</button>
-                                <span class="setting-hint" id="voicePromptStatus">No sample</span>
-                            </div>
                         </div>
                     </div>
 
@@ -290,10 +328,10 @@
                                 <path d="M7 12h10"/>
                                 <path d="M7 16h10"/>
                             </svg>
-                            MuseTalk (ავატარი)
+                            MuseTalk (Avatar)
                         </h3>
                         <div class="setting-item">
-                            <label for="musetalkBatchSize">Batch Size (ფრეიმები)</label>
+                            <label for="musetalkBatchSize">Batch size (frames)</label>
                             <input type="range" id="musetalkBatchSize" min="1" max="24" value="8" step="1">
                             <span class="setting-value" id="musetalkBatchSizeValue">8</span>
                         </div>
@@ -302,33 +340,7 @@
                             <input type="range" id="musetalkLookaheadChunks" min="0" max="10" value="2" step="1">
                             <span class="setting-value" id="musetalkLookaheadChunksValue">2</span>
                         </div>
-                        <div class="setting-hint">Batch: ფრეიმები Triton-ზე (1=40ms). Lookahead: TTS chunk-ები (1=80ms)</div>
-                    </div>
-
-                    <!-- Avatar Selection / Creation -->
-                    <div class="settings-section">
-                        <h3>
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <circle cx="12" cy="8" r="4"/>
-                                <path d="M4 20c1.5-4 6.5-6 8-6s6.5 2 8 6"/>
-                            </svg>
-                            Avatar (dynamic)
-                        </h3>
-                        <div class="setting-item">
-                            <label for="avatarId">Choose avatar</label>
-                            <select id="avatarId"></select>
-                            <span class="setting-hint">Active avatar</span>
-                        </div>
-                        <div class="setting-item full-width">
-                            <label>Create new avatar (image)</label>
-                            <div class="setting-row">
-                                <input type="text" id="avatarName" class="avatar-name-input" placeholder="Avatar name">
-                                <input type="file" id="avatarImageUpload" class="avatar-file" accept="image/*">
-                                <button class="btn btn-secondary" id="avatarUploadBtn">Upload image</button>
-                                <button class="btn btn-secondary" id="avatarCaptureBtn">Use camera</button>
-                                <span class="setting-hint" id="avatarUploadStatus">No upload</span>
-                            </div>
-                        </div>
+                        <div class="setting-hint">Batch: frames on Triton (1=40ms). Lookahead: TTS chunks (1=80ms)</div>
                     </div>
 
                     <!-- Buffer / Sync Settings -->
@@ -340,24 +352,24 @@
                                 <path d="M13 17V5"/>
                                 <path d="M8 17v-3"/>
                             </svg>
-                            ბუფერი (აუდიო/ვიდეო სინქი)
+                            Buffer (Audio/Video Sync)
                         </h3>
                         <div class="setting-item full-width buffer-setting">
                             <div class="setting-row">
-                                <label for="bufferFrames">საჭირო ფრეიმების რაოდენობა</label>
+                                <label for="bufferFrames">Frames to buffer before playback</label>
                             </div>
                             <div class="buffer-controls">
                                 <input type="number" id="bufferFrames" min="1" max="100" step="1" value="5">
-                                <span class="setting-hint">რამდენი ფრეიმი უნდა დაგროვდეს დაწყებამდე (1 ფრეიმი = 40ms @ 25fps)</span>
+                                <span class="setting-hint">1 frame = 40ms @ 25fps</span>
                             </div>
-                            <div class="setting-hint" id="bufferCurrent">ბუფერი: 24 ფრეიმი = 960ms</div>
+                            <div class="setting-hint" id="bufferCurrent">Buffer: 24 frames = 960ms</div>
                         </div>
                     </div>
                 </div>
 
                 <div class="settings-footer">
-                    <button class="btn btn-secondary" id="resetSettingsBtn">ნაგულისხმევი</button>
-                    <button class="btn btn-primary" id="saveSettingsBtn">შენახვა</button>
+                    <button class="btn btn-secondary" id="resetSettingsBtn">Defaults</button>
+                    <button class="btn btn-primary" id="saveSettingsBtn">Save</button>
                 </div>
             </div>
         </div>

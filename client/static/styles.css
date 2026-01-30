@@ -745,6 +745,28 @@ input:focus + .toggle-slider {
     gap: var(--spacing-md);
 }
 
+/* ===== Quick Panel (Main Page Controls) ===== */
+.quick-panel {
+    width: min(420px, 100%);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-xl);
+    padding: var(--spacing-lg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-xl);
+}
+
+.quick-panel .setting-row {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+}
+
+.btn.btn-sm {
+    padding: var(--spacing-xs) var(--spacing-md);
+    font-size: 0.8125rem;
+}
+
 /* Voice Input */
 .voice-input {
     display: flex;

@@ -380,7 +380,7 @@ class VoiceAssistant {
         if (this.elements.bufferCurrent) {
             const frames = this.bufferConfig.minFrames;
             const ms = frames * this.frameInterval;
-            this.elements.bufferCurrent.textContent = `ბუფერი: ${frames} ფრეიმი = ${ms}ms`;
+            this.elements.bufferCurrent.textContent = `Buffer: ${frames} frames = ${ms}ms`;
         }
     }
 
@@ -640,7 +640,7 @@ class VoiceAssistant {
             case 'musetalk_ready':
                 this.videoEnabled = data.success;
                 if (data.success) {
-                    this.updateAvatarStatus('ready', 'მზადაა');
+                    this.updateAvatarStatus('ready', 'Ready');
                     this.elements.avatarContainer?.classList.remove('disabled');
                     if (data.idle_frame) {
                         this.idleFrame = data.idle_frame;
@@ -648,7 +648,7 @@ class VoiceAssistant {
                     }
                     this.elements.avatarLoading?.classList.add('hidden');
                 } else {
-                    this.updateAvatarStatus('unavailable', 'მიუწვდომელია');
+                    this.updateAvatarStatus('unavailable', 'Unavailable');
                     this.elements.avatarContainer?.classList.add('disabled');
                 }
                 break;
@@ -673,7 +673,7 @@ class VoiceAssistant {
                     this.elements.voicePromptStatus.textContent = `Voice prompt error: ${data.message || 'unknown'}`;
                 }
                 if (this.elements.voicePromptBtn) {
-                    this.elements.voicePromptBtn.textContent = 'Record voice sample';
+                    this.elements.voicePromptBtn.textContent = 'Record sample';
                 }
                 break;
 
@@ -698,7 +698,7 @@ class VoiceAssistant {
                 this.runMetrics.vadUtteranceAt = savedVadUtteranceAt;
                 this.runMetrics.sttStartAt = performance.now();
                 this.updateVadStatus('processing');
-                this.setVadStatusText('ტრანსკრიფცია...');
+                this.setVadStatusText('Transcribing...');
                 break;
 
             case 'stt_complete':
@@ -708,7 +708,7 @@ class VoiceAssistant {
                     : null;
                 this.metricLog(`STT complete in ${this.formatMs(sttLatencyMs)}`);
                 this.addMessage('user', data.text);
-                this.setVadStatusText(this.isRecording ? 'მოსმენა...' : 'დააჭირეთ მიკროფონს საუბრის დასაწყებად');
+                this.setVadStatusText(this.isRecording ? 'Listening...' : 'Press the microphone to start talking');
                 break;
 
             case 'llm_start':
@@ -735,7 +735,7 @@ class VoiceAssistant {
                 this.runMetrics.musetalkFirstFrameIndex = null;
                 this.runMetrics.musetalkLastFrameIndex = null;
                 this.applyInitialBufferConfig();
-                this.updateAvatarStatus('loading', 'იტვირთება...');
+                this.updateAvatarStatus('loading', 'Loading...');
                 break;
 
             case 'llm_token':
@@ -772,7 +772,7 @@ class VoiceAssistant {
 
             case 'tts_start':
                 this.runMetrics.ttsStartAt = performance.now();
-                this.updateAvatarStatus('speaking', 'საუბრობს');
+                this.updateAvatarStatus('speaking', 'Speaking');
                 break;
 
             case 'synced_av_frame':
@@ -863,7 +863,7 @@ class VoiceAssistant {
                 this.hideStopButton();
                 this.stopPlayback();
                 this.clearSpeculativeBuffer();
-                this.updateAvatarStatus('listening', 'მოსმენა');
+                this.updateAvatarStatus('listening', 'Listening');
                 break;
 
             case 'error':
@@ -873,7 +873,7 @@ class VoiceAssistant {
                 this.hideStopButton();
                 this.stopPlayback();
                 this.clearSpeculativeBuffer();
-                this.updateAvatarStatus('error', 'შეცდომა');
+                this.updateAvatarStatus('error', 'Error');
                 break;
         }
     }
@@ -902,7 +902,7 @@ class VoiceAssistant {
     async startRecording() {
         try {
             if (!navigator.mediaDevices?.getUserMedia) {
-                this.setVadStatusText('ბრაუზერი ვერ ხსნის მიკროფონს');
+                this.setVadStatusText('Browser microphone access unavailable');
                 return;
             }
 
@@ -947,7 +947,7 @@ class VoiceAssistant {
             this.sendMessage('recording_start');
         } catch (e) {
             console.error('Failed to start recording:', e);
-            this.setVadStatusText('მიკროფონზე წვდომა უარყოფილია');
+            this.setVadStatusText('Microphone access denied');
         }
     }
 
@@ -1065,7 +1065,7 @@ class VoiceAssistant {
             this.elements.voicePromptStatus.textContent = 'Uploading...';
         }
         if (this.elements.voicePromptBtn) {
-            this.elements.voicePromptBtn.textContent = 'Record voice sample';
+            this.elements.voicePromptBtn.textContent = 'Record sample';
         }
     }
 
@@ -1312,7 +1312,7 @@ class VoiceAssistant {
         // Reset all VAD-related visual elements
         this.elements.vadIndicator?.classList.remove('speaking', 'processing');
         this.elements.vadStatus?.classList.remove('speaking', 'processing');
-        this.setVadStatusText('დააჭირეთ მიკროფონს საუბრის დასაწყებად');
+        this.setVadStatusText('Press the microphone to start talking');
     }
 
     async toggleRecording() {
@@ -1325,7 +1325,7 @@ class VoiceAssistant {
             }
             await this.startRecording();
             this.elements.micBtn?.classList.add('active');
-            this.setVadStatusText('მოსმენა...');
+            this.setVadStatusText('Listening...');
         }
     }
 
@@ -1703,7 +1703,7 @@ class VoiceAssistant {
             : null;
         this.metricLog(`⚡ FIRST AV FRAME (from buffer): ${this.formatMs(utteranceToFirstAV)} after utterance end`);
 
-        this.updateAvatarStatus('speaking', 'საუბრობს');
+        this.updateAvatarStatus('speaking', 'Speaking');
         this.startPlayback();
     }
 
@@ -1786,7 +1786,7 @@ class VoiceAssistant {
         this.runMetrics.ttsStartAt = performance.now();
         this.runMetrics.firstAVFrameAt = performance.now();
 
-        this.updateAvatarStatus('speaking', 'საუბრობს');
+        this.updateAvatarStatus('speaking', 'Speaking');
         this.startPlayback();
     }
 
@@ -1821,7 +1821,7 @@ class VoiceAssistant {
         this.log(
             `Starting playback | Buffer: ${bufferedTotal} total, ${contiguous} contiguous | Min: ${this.bufferConfig.minFrames} | Next index: ${this.nextFrameIndex}`
         );
-        this.updateAvatarStatus('speaking', 'საუბრობს');
+        this.updateAvatarStatus('speaking', 'Speaking');
         this.updateReplayButtonState();
 
         this.playNextFrame();
@@ -1886,7 +1886,7 @@ class VoiceAssistant {
             const totalTime = (performance.now() - this.playbackStats.startTime) / 1000;
             this.log(`Playback complete | Played: ${this.framesPlayed} frames | Time: ${totalTime.toFixed(2)}s | Received: ${this.framesReceived}`);
             this.stopPlayback();
-            this.updateAvatarStatus('ready', 'მზადაა');
+            this.updateAvatarStatus('ready', 'Ready');
             this.emitFinalSummary();
 
             // Show idle frame
@@ -1987,7 +1987,7 @@ class VoiceAssistant {
             this.startPlayback();
         } else {
             this.stopPlayback();
-            this.updateAvatarStatus('ready', 'მზადაა');
+            this.updateAvatarStatus('ready', 'Ready');
             
             // Show idle frame
             if (this.idleFrame) {
@@ -2107,7 +2107,7 @@ class VoiceAssistant {
         statusEl.className = 'connection-status ' + status;
         const textEl = statusEl.querySelector('.status-text');
         if (textEl) {
-            textEl.textContent = status === 'connected' ? 'დაკავშირებულია' : 'გათიშულია';
+            textEl.textContent = status === 'connected' ? 'Connected' : 'Disconnected';
         }
     }
 
@@ -2121,12 +2121,12 @@ class VoiceAssistant {
         statusEl?.classList.remove('speaking', 'processing');
 
         const statusTexts = {
-            'listening': 'მოსმენა...',
-            'speech_start': 'საუბარი...',
-            'speech_continue': 'საუბარი...',
-            'speaking': 'საუბარი...',
-            'utterance_complete': 'დამუშავება...',
-            'processing': 'ტრანსკრიფცია...'
+            'listening': 'Listening...',
+            'speech_start': 'Speaking...',
+            'speech_continue': 'Speaking...',
+            'speaking': 'Speaking...',
+            'utterance_complete': 'Processing...',
+            'processing': 'Transcribing...'
         };
 
         const isSpeaking = ['speaking', 'speech_start', 'speech_continue'].includes(status);
@@ -2156,7 +2156,7 @@ class VoiceAssistant {
             this.setVadStatusText(statusTexts[status]);
         } else if (status === 'listening' && !this.isRecording) {
             // If listening but not recording, show default text
-            this.setVadStatusText('დააჭირეთ მიკროფონს საუბრის დასაწყებად');
+            this.setVadStatusText('Press the microphone to start talking');
         }
 
         if (status === 'utterance_complete') {
@@ -2200,7 +2200,7 @@ class VoiceAssistant {
 
     updateVideoMetrics() {
         if (this.elements.videoFrames) {
-            this.elements.videoFrames.textContent = `${this.framesReceived} კადრი`;
+            this.elements.videoFrames.textContent = `${this.framesReceived} frames`;
         }
         if (this.elements.videoFps && this.framesPlayed > 0) {
             this.elements.videoFps.textContent = `${this.videoFps} FPS`;
@@ -2306,7 +2306,7 @@ class VoiceAssistant {
         this.hideStopButton();
         this.isGenerating = false;
         this.streamComplete = true;
-        this.updateAvatarStatus('ready', 'მზადაა');
+        this.updateAvatarStatus('ready', 'Ready');
     }
 
     // ============ Settings ============
