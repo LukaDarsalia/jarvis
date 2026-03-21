@@ -203,15 +203,14 @@ class TTSSession:
         start_time = time.time()
         total_samples = 0
 
-        # Build word list for tracking
+        # Build word list for tracking (one entry per chunk, matching word_audio_index)
         all_words = []
         for i, chunk in enumerate(text_chunks):
             stripped = chunk.strip()
             if stripped:
-                if i == 0:
-                    all_words.extend(stripped.split())
-                else:
-                    all_words.append(stripped)
+                all_words.append(stripped)
+            else:
+                all_words.append("")
 
         logger.info(
             f"TTS session {self.session_id}: generating {len(all_words)} words "

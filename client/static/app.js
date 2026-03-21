@@ -250,6 +250,7 @@ class VoiceAssistant {
             musetalkLookaheadChunksValue: document.getElementById('musetalkLookaheadChunksValue'),
             bufferFrames: document.getElementById('bufferFrames'),
             bufferCurrent: document.getElementById('bufferCurrent'),
+            liveCaption: document.getElementById('liveCaption'),
         };
     }
 
@@ -606,22 +607,26 @@ class VoiceAssistant {
                 this.currentAssistantMessage = this.addMessage('assistant', '', true);
                 this.wordsSpoken = [];
                 this.lastLoggedWord = null;
-                this.resetPlaybackState();
-                this.prepareReplayCapture();
-                this.startNewStreamMetrics();
+                // Skip reset if speculative playback is already running -
+                // frames are already in frameBuffer and playing
+                if (!this.isPlaying) {
+                    this.resetPlaybackState();
+                    this.prepareReplayCapture();
+                    this.startNewStreamMetrics();
+                    this.applyInitialBufferConfig();
+                    this.updateAvatarStatus('loading', 'იტვირთება...');
+                }
                 this.runMetrics.llmStartAt = performance.now();
                 this.runMetrics.llmFirstTokenAt = null;
                 this.runMetrics.llmLastTokenAt = null;
                 this.runMetrics.llmTokenCount = 0;
-                this.runMetrics.ttsStartAt = null;
-                this.runMetrics.ttsFirstAudioAt = null;
-                this.runMetrics.ttsFirstFrameIndex = null;
-                this.runMetrics.musetalkFirstFrameAt = null;
-                this.runMetrics.musetalkLastFrameAt = null;
-                this.runMetrics.musetalkFirstFrameIndex = null;
-                this.runMetrics.musetalkLastFrameIndex = null;
-                this.applyInitialBufferConfig();
-                this.updateAvatarStatus('loading', 'იტვირთება...');
+                this.runMetrics.ttsStartAt = this.runMetrics.ttsStartAt || null;
+                this.runMetrics.ttsFirstAudioAt = this.runMetrics.ttsFirstAudioAt || null;
+                this.runMetrics.ttsFirstFrameIndex = this.runMetrics.ttsFirstFrameIndex || null;
+                this.runMetrics.musetalkFirstFrameAt = this.runMetrics.musetalkFirstFrameAt || null;
+                this.runMetrics.musetalkLastFrameAt = this.runMetrics.musetalkLastFrameAt || null;
+                this.runMetrics.musetalkFirstFrameIndex = this.runMetrics.musetalkFirstFrameIndex || null;
+                this.runMetrics.musetalkLastFrameIndex = this.runMetrics.musetalkLastFrameIndex || null;
                 break;
 
             case 'llm_token':
@@ -1403,8 +1408,8 @@ class VoiceAssistant {
                 this.displayFrame(this.lastVideoFrame);
             }
 
-            // Update word highlighting
-            if (frame.word && this.currentAssistantMessage) {
+            // Update word highlighting and live caption
+            if (frame.word) {
                 if (this.lastLoggedWord !== frame.word) {
                     const elapsedMs = this.playbackStats.startTime
                         ? performance.now() - this.playbackStats.startTime
@@ -1413,6 +1418,7 @@ class VoiceAssistant {
                     this.lastLoggedWord = frame.word;
                 }
                 this.highlightWord(frame.word);
+                this.updateLiveCaption(frame.word);
             }
 
             // Log every 25 frames (1 second of playback)
@@ -1680,6 +1686,7 @@ class VoiceAssistant {
         const isSpeaking = ['speaking', 'speech_start', 'speech_continue'].includes(status);
         if (isSpeaking && this.runMetrics.vadSpeechStartAt === null && !this.isGenerating) {
             this.resetRunMetrics();
+            this.clearLiveCaption();
         }
 
         // If user starts speaking again while speculative is active, clear the buffer
@@ -1737,6 +1744,7 @@ class VoiceAssistant {
 
         if (statusText) statusText.textContent = text;
 
+        // Update avatar wrapper speaking state (glow rings)
         if (this.elements.avatarContainer) {
             if (status === 'speaking') {
                 this.elements.avatarContainer.classList.add('speaking');
@@ -1832,6 +1840,24 @@ class VoiceAssistant {
         });
 
         textEl.innerHTML = highlightedWords.join(' ');
+    }
+
+    updateLiveCaption(word) {
+        if (!this.elements.liveCaption || !word) return;
+        // Only append when the word actually changes (many frames share the same word)
+        if (word === this._lastCaptionWord) return;
+        this._lastCaptionWord = word;
+        if (!this._captionWords) this._captionWords = [];
+        this._captionWords.push(word);
+        this.elements.liveCaption.textContent = this._captionWords.join(' ');
+    }
+
+    clearLiveCaption() {
+        this._captionWords = [];
+        this._lastCaptionWord = null;
+        if (this.elements.liveCaption) {
+            this.elements.liveCaption.textContent = '';
+        }
     }
 
     scrollToBottom() {
